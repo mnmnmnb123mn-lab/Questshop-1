@@ -1,0 +1,64 @@
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ${{ github.run_id }}_${{ github.run_attempt }}
+          POSTGRES_DB: questshop_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d questshop_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:${{ github.run_id }}_${{ github.run_attempt }}@127.0.0.1:5432/questshop_ci
+      QUESTSHOP_ALLOW_TEST_DATABASE_RESET: 'true'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.22.0
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Check pull-request patch whitespace
+        if: ${{ github.event_name == 'pull_request' }}
+        run: git diff --check "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+      - name: Check main-push patch whitespace
+        if: >-
+          ${{ github.event_name == 'push' &&
+          github.event.before != '0000000000000000000000000000000000000000' }}
+        run: git diff --check "${{ github.event.before }}...${{ github.sha }}"
+      - run: npm run check
+      - run: npm run lint
+      - run: npm run test:coverage
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() && hashFiles('coverage/lcov.info') != '' }}
+        with:
+          name: lcov-${{ github.sha }}
+          path: coverage/lcov.info
+          if-no-files-found: error
+      - run: >-
+          node --input-type=module -e "import pg from 'pg'; const client = new pg.Client({ connectionString: process.env.TEST_DATABASE_URL }); await client.connect(); await client.query('CREATE DATABASE questshop_loadtest'); await client.end();"
+      - run: npm run load:test
+        env:
+          LOAD_TEST_DATABASE_URL: postgresql://postgres:${{ github.run_id }}_${{ github.run_attempt }}@127.0.0.1:5432/questshop_loadtest
+      - run: npm audit --audit-level=high
+      - run: docker build -t questshop:${{ github.sha }} .

@@ -1,0 +1,10 @@
+---
+# Questshop migrations are PostgreSQL and are protected by immutable checksums.
+# Codacy's TSQLLint analyzer applies SQL Server's QUOTED_IDENTIFIER requirement
+# to PostgreSQL files. That syntax is invalid in PostgreSQL, so keep migration
+# verification in PostgreSQL integration tests and exclude only the SQL Server
+# analyzer from this directory.
+engines:
+  tsqllint:
+    exclude_paths:
+      - "migrations/**"

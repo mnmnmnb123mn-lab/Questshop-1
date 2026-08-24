@@ -1,0 +1,227 @@
+# Questshop
+
+Questshop คือบอท Discord สำหรับรับทำ Discord Quest อัตโนมัติใน Guild เดียว โดยใช้ Node.js 22,
+`discord.js` และ PostgreSQL 16+ เป็น durable source of truth. ลูกค้าเติมเครดิตด้วย TrueMoney Gift,
+ส่ง Discord Token แบบ Ephemeral, เลือก Quest, ยืนยัน Order และติดตามผลจนถึง `READY_TO_CLAIM`.
+ระบบ **ไม่มี Automatic Claim**; ลูกค้ากดรับรางวัลเองเสมอ.
+
+> [!IMPORTANT]
+> สถานะ release ปัจจุบันคือ **implemented-but-unverified** จนกว่า Discord, TrueMoney, Quest,
+> Aiven/inwcloud และ Owner UAT จะผ่านบน Git SHA เดียวกันตาม [Pre-launch UAT](docs/uat/prelaunch.md).
+
+> [!WARNING]
+> Quest Engine ใช้ Discord user token / self-bot behavior ซึ่งอาจขัดเงื่อนไขของ Discord และทำให้บัญชี
+> ถูกจำกัดหรือปิดได้ เจ้าของระบบต้องยอมรับและทบทวนความเสี่ยงนี้ก่อนใช้งานจริง.
+
+## หน้าร้าน Quest Auto ปัจจุบัน
+
+`/quest-auto` ติดตั้ง Surface ถาวรหนึ่งข้อความ และการเรียกซ้ำจะ update/move ข้อความเดิมแทนการสร้าง panel ซ้อน.
+หน้าร้านใช้หัวข้อ **Discord Quest • Auto** พร้อมปุ่ม **เริ่มทำเควส** และ **เติมเงิน**.
+
+ข้อความหลัก:
+
+```text
+ทำ Quest เพื่อสะสม Discord Orbs ด้วยระบบอัตโนมัติ
+ค่าบริการ <ราคาปัจจุบัน> บาท / เควสสำเร็จ
+ใช้ Discord Token เพื่อให้ระบบเข้าไปทำ Quest ให้โดยอัตโนมัติ
+เลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ
+```
+
+ราคาหน้าร้านไม่ hardcode 5 บาท. Runtime อ่าน active `TYPE` price rules ของ Quest ทั้ง 4 task types:
+
+- ถ้า GAME/VIDEO เท่ากัน เช่น 500 สตางค์ทั้งหมด → แสดง `5 บาท`
+- ถ้าต่างกัน เช่น 500–700 สตางค์ → แสดง `5-7 บาท`
+- ถ้าราคา supported TYPE ไม่ครบ → แสดง `ค่าบริการยังไม่พร้อม`
+
+การเปลี่ยนราคาโดย Admin จะถูกตรวจพบจาก Discord Surface reconciliation แม้ config version ไม่เปลี่ยน.
+Maintenance worker ปัจจุบันรันประมาณทุก **60 วินาที** ดังนั้นการแก้ราคาบนข้อความเดิมเป็น automatic eventual refresh,
+ไม่ใช่ synchronous update ณ จังหวะกดปุ่มยืนยันราคา.
+
+### GIF หน้าร้านภายใน Embed
+
+Quest Auto ใช้ GIF ที่แปลงจากวิดีโอเดโมที่ Owner ให้มาและเก็บไว้ตรงนี้:
+
+```text
+src/discord/assets/quest-auto-demo.gif
+```
+
+Source contract:
+
+```text
+Size    9,190,692 bytes
+SHA-256 c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
+```
+
+ก่อนส่งเข้า Discord บอทตรวจ size, GIF signature และ SHA-256. จากนั้นแนบไฟล์ไว้กับข้อความและให้ Rich Embed
+อ้างผ่าน `attachment://quest-auto-demo.gif` ทำให้ภาพเคลื่อนไหวอยู่ **ภายในกรอบ Embed** แทนการแสดง MP4
+เป็นก้อนวิดีโอแยกด้านบน.
+
+ถ้าข้อความเดิมยังมี MP4/attachment รุ่นเก่า ระบบจะ clear attachment เก่าแล้วแทนด้วย GIF บน **ข้อความเดิม**.
+Quest Auto ยังเอา footer เทคนิค `Questshop Surface • QUEST_AUTO` ออกจากหน้าที่ลูกค้าเห็น และใช้ stable
+Discord nonce เป็นตัวช่วยกู้ anchor; footer แบบเก่ายังคงเป็น migration fallback สำหรับข้อความรุ่นก่อนเท่านั้น.
+
+ถ้าอนาคตเปลี่ยน bytes ของ GIF อย่างตั้งใจ ควรเปลี่ยน filename/version ด้วยเพื่อให้ Discord-side drift detection
+บังคับแทน attachment เดิมได้ชัดเจน.
+
+## กฎธุรกิจหลัก
+
+```text
+Confirm Order
+→ Available ลด / Reserved เพิ่มต่อ Order Item
+→ Verified success: Capture ราคา snapshot
+→ Definite failure / safe external completion: Release คืน Wallet
+→ Ambiguous completion: Reserved คงอยู่ + Manual Review
+```
+
+- เงินใช้ integer satang (`BIGINT`) เท่านั้น
+- Wallet ห้ามติดลบ; ไม่มีถอน/โอน; Refund เป็น Wallet credit
+- Ledger / Admin audit / release evidence เป็น append-only ตาม contract
+- TrueMoney หลัง request อาจส่งสำเร็จแล้วห้าม blind retry
+- หนึ่ง Quest account มี active job ได้ไม่เกินหนึ่งงานทั่วระบบ
+- Monitor ทุกบัญชีทำ Scan + Test; Monitor-discovered Quest ยัง private จน test ผ่านหรือ Admin ใช้ audited **ส่งเลย**
+- customer-discovered Quest อาจถูกเสนอเฉพาะ account นั้นตาม policy แต่ไม่ประกาศ `quest-new` อัตโนมัติ:
+  Admin ตัดสินใจจาก `LOG_QUEST_OPERATIONS` ว่า **ส่งประกาศ** (audited override) หรือ **ทดสอบก่อน**;
+  public announcement ห้ามระบุตัวลูกค้า
+
+## Discord และสิทธิ์หลังบ้าน
+
+Owner ใช้ `OWNER_ID`; Admin คนอื่นต้องมี Discord `Administrator` ณ เวลาที่กดแต่ละ interaction.
+บอทตรวจ Administrator ตอน startup แต่ **ไม่** ทำ runtime permission-drift auto-repair.
+
+ตาม Owner policy บอทไม่ตรวจ human visibility/privacy ของห้องหลังบ้าน. `LOG_PAYMENTS` อาจมี full TrueMoney voucher link;
+Owner ต้องตั้ง channel visibility เอง. Discord 403 ถูกบันทึกเป็น incident แต่บอทไม่เปลี่ยน permission ให้เอง.
+
+การติดตั้งครั้งแรกยังเปิดบอทและแผง Owner ได้แม้ยังไม่มี TrueMoney receiver: Health จะแสดง
+`MISSING_RECEIVER` และระบบรับซองจะปฏิเสธอย่างปลอดภัยจนกว่าจะเพิ่ม receiver ที่ Active. หาก Provider รับซองสำเร็จ
+แล้วพบยอดเกินเพดานต่อซอง ระบบจะเครดิตยอดเต็ม สร้างคำเตือนหลังบ้าน และล็อกการเติมเพิ่มจนสิ้นรอบวัน Bangkok.
+
+## Environment Variables หลัก
+
+| Variable | หน้าที่ |
+|---|---|
+| `NODE_ENV` | production ใช้ `production` |
+| `DISCORD_BOT_TOKEN` | Bot secret |
+| `DISCORD_CLIENT_ID` | Discord Application ID |
+| `DISCORD_GUILD_ID` | Production Guild ID |
+| `OWNER_ID` | Discord User ID ของ Owner |
+| `DATABASE_POOL_URL` | Runtime URL ของ `questshop_runtime`, ต้อง `sslmode=verify-full` |
+| `DATABASE_DIRECT_URL` | Migrator URL ของ `questshop_migrator`, ต้อง `sslmode=verify-full` |
+| `DATABASE_SSL_CA_BASE64` | Aiven CA PEM แบบ Base64 เมื่อจำเป็น |
+| `STATUS_TOKEN` | Bearer token ของ `/statusz`, อย่างน้อย 32 ตัวอักษร |
+| `DATA_ENCRYPTION_KEYS_JSON` | Data encryption keyring |
+| `VOUCHER_HMAC_KEYS_JSON` | Voucher HMAC keyring |
+| `BACKUP_MODE` | Aiven ใช้ `AIVEN_MANAGED` |
+| `GIT_SHA` | SHA เต็ม 40 ตัวของ source ที่ deploy |
+| `PRELAUNCH` | UAT ใช้ `true` |
+| `TIMEZONE` | `Asia/Bangkok` |
+| `RUNNER_CONCURRENCY` | ค่าเริ่มต้น `2` |
+| `RUNNER_CONCURRENCY_HARD_MAX` | เพดานสูงสุด `5` |
+| `PORT` | health server, ค่าเริ่มต้น `3000` |
+
+ห้าม commit `.env` หรือ paste Bot/User token, database URL/password, keyring, cookie, voucher secret หรือ private key
+ลง GitHub, Discord, ticket, log หรือ screenshot.
+
+## PostgreSQL role contract
+
+- `questshop_migrator`: `USAGE, CREATE` บน `public`, ใช้เฉพาะ deploy/migration
+- `questshop_runtime`: `USAGE` บน `public`, ไม่มี `CREATE`, ใช้ตอน runtime
+- URL สองตัวต้องเป็นคนละ role
+- ทุก migration loop รวม `applied: 0` จะ synchronize และ validate object privileges
+- Runtime ไม่มี DDL และไม่มี `UPDATE/DELETE` บน protected append-only tables
+
+ดู [PostgreSQL role contract](docs/architecture/postgresql-roles.md).
+
+## Deploy บน inwcloud + Aiven
+
+Runtime: **Node.js 22.x LTS**
+
+Custom Command:
+
+```bash
+npm ci --omit=dev && npm run deploy && npm start
+```
+
+`npm run deploy` = `setup:verify → migrate → register`.
+อย่าใช้ workaround เก่า `/tmp/aiven-ca.pem` หรือ `NODE_EXTRA_CA_CERTS`; source ปัจจุบันจัดการ Aiven CA ใน process.
+
+หลัง deploy ควรเห็น:
+
+```text
+setup:verify  → ok
+migrate       → privilegeSynchronization: PASS
+register      → Registered 8 guild commands
+start         → Questshop ready
+```
+
+`Questshop ready` เป็นเพียง runtime readiness ไม่ใช่หลักฐาน TrueMoney/Quest live success.
+
+## Slash commands สำหรับ Surface
+
+```text
+/quest-auto
+/quest-new
+/quest-history
+/admin-panel
+/log-payments
+/log-quest-operations
+/log-admin
+/log-system
+```
+
+## Health endpoints
+
+| Path | Auth | ความหมาย |
+|---|---|---|
+| `/livez` | ไม่ต้อง | process ยังตอบได้ |
+| `/readyz` | ไม่ต้อง | runtime พร้อมรับงานหรือไม่ |
+| `/statusz` | Bearer `STATUS_TOKEN` | worker/gate/incident summary แบบจำกัด |
+
+## Source verification
+
+ก่อนส่ง PR/release evidence ให้รันอย่างน้อย:
+
+```bash
+npm run check
+npm run lint
+TEST_DATABASE_URL='postgresql://.../questshop_test' \
+QUESTSHOP_ALLOW_TEST_DATABASE_RESET=true npm test
+git diff --check
+```
+
+Full gate:
+
+```bash
+TEST_DATABASE_URL='postgresql://.../questshop_ci' \
+QUESTSHOP_ALLOW_TEST_DATABASE_RESET=true npm run test:coverage
+LOAD_TEST_DATABASE_URL='postgresql://.../questshop_loadtest' npm run load:test
+npm audit --audit-level=high
+docker build -t questshop:local .
+```
+
+ห้ามชี้ test/load-test URL ไป production/Aiven database.
+
+## เอกสารอ้างอิง
+
+- [System architecture](docs/architecture/system.md)
+- [Completion audit](docs/architecture/completion-audit.md)
+- [Requirement traceability](docs/architecture/traceability.md)
+- [Definition of Done](docs/architecture/definition-of-done.md)
+- [Deploy on inwcloud + Aiven](docs/deployment/inwcloud-aiven.md)
+- [PostgreSQL role contract](docs/architecture/postgresql-roles.md)
+- [State-machine contracts](docs/state-machines/contracts.md)
+- [Emergency runbooks](docs/runbooks/README.md)
+- [Pre-launch UAT](docs/uat/prelaunch.md)
+- [Evidence template](docs/uat/evidence-template.md)
+- [Security policy](SECURITY.md)
+- [Engineering contract](AGENTS.md)
+
+## Live boundaries ที่ยังต้องพิสูจน์
+
+- Discord desktop/mobile rendering ของ `quest-auto-demo.gif` **ภายใน Embed**, panel persistence, removal of the old
+  technical footer และ price refresh จริง
+- TrueMoney success / ambiguous-after-send / schema drift
+- Video/Desktop Quest execution กับ Discord account จริง
+- Aiven TLS/role provisioning, inwcloud restart และ health endpoint
+- Owner pre-launch closeout, rollback rehearsal และ external alert delivery
+
+ห้ามเรียกโปรเจกต์นี้ว่า production-ready ก่อนหลักฐานเหล่านี้ผ่านบน Git SHA เดียวกัน.

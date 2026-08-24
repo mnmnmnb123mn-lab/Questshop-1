@@ -1,0 +1,14 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+node_modules
+npm-debug.log*
+coverage
+*.zip
+Questbotdiscord
+ตัวอย่างบอทร้านค้าขายเเอพพรีเมี่ยม
+test
+docs
+
