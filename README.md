@@ -154,7 +154,7 @@ Top-up ID”; Owner ยืนยัน Manual Review แบบนี้ได้
 
 ดู [PostgreSQL role contract](docs/architecture/postgresql-roles.md).
 
-## Deploy บน inwcloud + Aiven
+## Deploy 
 
 Runtime: **Node.js 22.x LTS**
 
