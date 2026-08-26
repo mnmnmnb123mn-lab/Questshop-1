@@ -7,7 +7,7 @@ keyrings or a full voucher URL in UAT evidence.
 
 - [ ] `PRELAUNCH=true`; customer routes are restricted to Owner/Admin for this round.
 - [ ] inwcloud runs Node 22.x and the intended branch/commit is deployed; no `GIT_SHA` Environment Variable is required.
-- [ ] inwcloud Root Directory is explicitly `Questshop-WWW`; the root GitHub Actions workflow passed for this build.
+- [ ] inwcloud Root Directory is explicitly the repository root; the GitHub Actions workflow passed for this build.
 - [ ] `questshop_migrator` and `questshop_runtime` are different effective roles.
 - [ ] Production DB URLs use `sslmode=verify-full`; Runtime has no DDL and protected append-only tables deny update/delete.
 - [ ] Bot has Discord `Administrator`.

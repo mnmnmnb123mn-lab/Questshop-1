@@ -111,8 +111,7 @@ There is no production release/tag evidence yet; current work remains under `[Un
 
 - TrueMoney payment intent is durably checkpointed before `request.end()` begins dispatch. Any later transport,
   timeout or incomplete-response failure is contained as ambiguous/manual review rather than retried automatically.
-- The GitHub Actions workflow now lives at the repository root and explicitly runs the `Questshop-WWW` project with
-  its own cache, artifact and Docker context.
+- The GitHub Actions workflow now runs from the repository root with its own cache, artifact and Docker context.
 
 - Quest History cards now keep the account profile thumbnail, link the `Quest — progress%` line to the matching
   Discord Quest URL, and render the bundled `quest-history-banner.png` image below every status card. Internal Account

@@ -29,7 +29,7 @@ Configure inwcloud:
 Language: Node.js
 Version: 22.x LTS
 Run mode: Custom Command
-Root Directory: Questshop-WWW
+Root Directory: .
 ```
 
 Use:
@@ -45,7 +45,7 @@ setup:verify → migrate → register
 ```
 
 Run migration every deploy even when `applied: 0`, because object privilege synchronization and validation still run.
-Do not run this command from the repository root: its `package.json` is inside `Questshop-WWW`.
+Run this command from the repository root, where `package.json` is located.
 
 ## 3. Environment Variables
 
