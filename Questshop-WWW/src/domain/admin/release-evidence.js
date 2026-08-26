@@ -1,12 +1,12 @@
 import { v7 as uuidv7 } from 'uuid';
 import { QuestshopError } from '../../shared/errors.js';
 
-const GIT_SHA = /^[0-9a-f]{7,64}$/;
+const RELEASE_REVISION = /^(?:untracked|[0-9a-f]{7,64})$/;
 const TYPES = new Set(['PRELAUNCH_GATE', 'PRELAUNCH_CLOSEOUT']);
 
 export function assertReleaseIdentity(release) {
-  if (!release?.prelaunch || !GIT_SHA.test(String(release.gitSha ?? ''))) {
-    throw new QuestshopError('RELEASE_SHA_REQUIRED', 'Pre-launch ต้องระบุ Git SHA ที่ตรวจสอบได้ก่อนทำรายการ');
+  if (!release?.prelaunch || !RELEASE_REVISION.test(String(release.gitSha ?? ''))) {
+    throw new QuestshopError('RELEASE_REVISION_REQUIRED', 'ไม่พบข้อมูลเวอร์ชันสำหรับบันทึกผล Pre-launch');
   }
   if (!release.appVersion || !release.engineVersion) {
     throw new QuestshopError('RELEASE_VERSION_REQUIRED', 'Pre-launch ต้องระบุ App และ Engine version');

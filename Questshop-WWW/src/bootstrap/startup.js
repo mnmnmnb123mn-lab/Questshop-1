@@ -20,6 +20,7 @@ import { validateRuntimeRole } from '../db/role-contract.js';
 import { processOutbox } from '../workers/outbox-worker.js';
 import { verifyConfiguredSourceSha } from '../config/source-version.js';
 import { reconcileIncident } from '../domain/incidents/service.js';
+import { recomputeHealthStatus } from './health-status.js';
 
 export async function openRuntimeDatabase(env, health, dependencies = {}) {
   const pool = (dependencies.getRuntimePool ?? getRuntimePool)(env);
@@ -30,7 +31,7 @@ export async function openRuntimeDatabase(env, health, dependencies = {}) {
   try {
     observeErrors(pool, (error) => {
       health.checks.database = 'DEGRADED';
-      health.status = health.ready ? 'DEGRADED' : health.status;
+      health.status = recomputeHealthStatus({ health });
       health.lastError = error;
     });
   } catch (error) {
@@ -158,7 +159,8 @@ export function startRuntimeHeartbeat({ abortController, env, holder, pool, runt
         if (!renewed) break;
         lease = renewed;
       } catch (error) {
-        health.ready = false; health.status = 'INCIDENT'; health.lastError = error;
+        health.ready = false; health.operationalStatus = 'INCIDENT';
+        health.status = recomputeHealthStatus({ health }); health.lastError = error;
         abortController.abort(error);
         Promise.resolve(onRuntimeLeaseLost?.(error)).catch((callbackError) => {
           logger.error({ error: callbackError }, 'runtime lease-loss shutdown failed');
@@ -190,9 +192,8 @@ async function markRuntimeReady({ env, health, logger, pool }) {
     .rows[0]?.enabled === true;
   health.checks.bootstrap = 'READY';
   health.ready = true;
-  health.status = health.checks.payments === 'MISSING_RECEIVER'
-    ? 'DEGRADED'
-    : storeOpen ? 'HEALTHY' : 'MAINTENANCE';
+  health.operationalStatus = storeOpen ? 'HEALTHY' : 'MAINTENANCE';
+  health.status = recomputeHealthStatus({ health });
   logger.info({ guildId: env.DISCORD_GUILD_ID }, 'Questshop ready');
 }
 
@@ -225,7 +226,7 @@ async function cleanupFailedStartup({ abortController, client, error, health, he
 export async function startup({ health = createHealthState(), server: existingServer = null,
   onRuntimeLeaseLost = null, onRuntimePrepared = null, signal: startupSignal = null } = {}) {
   const bootstrapPort = resolveBootstrapPort(process.env.PORT);
-  const logger = createLogger({ gitSha: process.env.GIT_SHA ?? 'bootstrap' });
+  const logger = createLogger({ gitSha: 'untracked' });
   const server = existingServer ?? await startHealthServer({ port: bootstrapPort,
     statusToken: process.env.STATUS_TOKEN ?? 'unconfigured', state: health });
   const abortController = new AbortController();
@@ -256,7 +257,7 @@ export async function startup({ health = createHealthState(), server: existingSe
     runtime = { env, logger, health, server, pool, client: null, config, workers: null, abortController,
       heartbeat: null, runtimeLease, runtimeHolder: holder, acceptingInteractions: false, shutdownPromise: null };
     health.checks.sourceSha = source.verified ? 'OK' : 'UNVERIFIED';
-    logger.info({ configuredGitSha: env.GIT_SHA, sourceSha: source.sourceSha, sourceShaVerified: source.verified },
+    logger.info({ sourceSha: source.sourceSha, sourceShaVerified: source.verified },
       'Questshop source revision');
     // A lease acquired before Discord login must remain owned during recovery.
     // Components observe this same object and remain closed until Ready.

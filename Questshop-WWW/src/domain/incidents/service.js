@@ -23,9 +23,10 @@ async function recordIncidentTransition(client, before, after, context) {
 
 async function reconcileWithClient(client, { code, scope, active, severity, evidence }, context) {
     const current = (await client.query(`SELECT * FROM incidents
-      WHERE incident_code=$1 AND scope=$2 AND state<>'RESOLVED' FOR UPDATE`, [code, scope])).rows[0] ?? null;
+      WHERE incident_code=$1 AND scope=$2
+      ORDER BY (state<>'RESOLVED') DESC,updated_at DESC,id DESC LIMIT 1 FOR UPDATE`, [code, scope])).rows[0] ?? null;
     if (!active) {
-      if (!current) return { incident: null, changed: false };
+      if (!current || current.state === 'RESOLVED') return { incident: current, changed: false };
       const resolved = (await client.query(`UPDATE incidents SET state='RESOLVED',state_version=state_version+1,
         resolved_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1 AND state_version=$2 RETURNING *`,
       [current.id, current.state_version])).rows[0];
@@ -45,6 +46,16 @@ async function reconcileWithClient(client, { code, scope, active, severity, evid
       [uuidv7(), code, scope, severity, evidence, context.traceId])).rows[0];
       await enqueueIncidentProjection(client, created, context);
       return { incident: created, changed: true };
+    }
+    if (current.state === 'RESOLVED') {
+      const reopened = (await client.query(`UPDATE incidents SET state='OPEN',severity=$2,evidence=$3,
+        trace_id=$4,state_version=state_version+1,resolved_at=NULL,updated_at=clock_timestamp()
+        WHERE id=$1 AND state_version=$5 RETURNING *`,
+      [current.id, severity, evidence, context.traceId, current.state_version])).rows[0] ?? null;
+      if (!reopened) return { incident: current, changed: false };
+      await recordIncidentTransition(client, current, reopened, context);
+      await enqueueIncidentProjection(client, reopened, context);
+      return { incident: reopened, changed: true };
     }
     const updated = (await client.query(`UPDATE incidents SET severity=$2,evidence=$3,state_version=state_version+1,
       updated_at=clock_timestamp() WHERE id=$1 AND state_version=$4

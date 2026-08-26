@@ -7,7 +7,7 @@ import { sumCents } from '../../shared/money.js';
 import { createQuestApiClient, profileFromEnv } from '../../quest-engine/api/client.js';
 import { getPersistentDiscordRateLimitCoordinator } from '../../quest-engine/rate-limits/coordinator.js';
 import { ingestDiscovery, resolveSaleEligibility } from '../catalog/service.js';
-import { resolvePrice } from '../pricing/resolver.js';
+import { recordCustomerDiscoveryCase } from '../catalog/customer-discovery-case-service.js';
 import { evaluateExpiryAdmission } from '../catalog/expiry.js';
 import { enqueueProjection } from '../outbox/service.js';
 import { recordTransition } from '../shared/transition.js';
@@ -82,6 +82,13 @@ async function activeConfigVersion(client) {
   return Number((await client.query(
     'SELECT COALESCE(MAX(version), 1)::bigint AS version FROM config_versions',
   )).rows[0].version);
+}
+
+async function enqueueCheckoutAudit(client, session, context) {
+  await enqueueProjection(client, {
+    projectionType: 'CHECKOUT_AUDIT', aggregateType: 'INTERACTION_SESSION', aggregateId: session.id,
+    aggregateVersion: session.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context,
+  });
 }
 
 export async function createSession({
@@ -172,16 +179,9 @@ export async function createSession({
         String(profile.id), profile.global_name ?? profile.username ?? String(profile.id),
         avatarUrl(profile), context.traceId,
       ])).rows[0];
-      if (customerDiscovery) await enqueueProjection(client, {
-        projectionType: 'CUSTOMER_QUEST_DISCOVERY', aggregateType: 'CUSTOMER_QUEST_DISCOVERY',
-        aggregateId: customerDiscovery.id, aggregateVersion: 1,
-        surfaceKey: 'LOG_QUEST_OPERATIONS', context,
-      });
+      if (customerDiscovery) await recordCustomerDiscoveryCase(client, customerDiscovery, context);
     }
-    await enqueueProjection(client, {
-      projectionType: 'CHECKOUT_AUDIT', aggregateType: 'INTERACTION_SESSION', aggregateId: sessionId,
-      aggregateVersion: session.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context,
-    });
+    await enqueueCheckoutAudit(client, session, context);
     return { session, profile, optionsCount: candidates.length };
   });
 }
@@ -281,10 +281,11 @@ export async function updateSelection({ sessionId, actorId, guildId, channelId =
       UPDATE checkout_quest_options SET selected = $3
       WHERE session_id = $1 AND line_id = ANY($2::text[]) RETURNING *
     `, [sessionId, lineIds, selected]);
-    await client.query(`
+    const updated = (await client.query(`
       UPDATE interaction_sessions SET state_version = state_version + 1,
-        updated_at = transaction_timestamp() WHERE id = $1
-    `, [sessionId]);
+        updated_at = transaction_timestamp() WHERE id = $1 RETURNING *
+    `, [sessionId])).rows[0];
+    await enqueueCheckoutAudit(client, updated, context);
     return { session, changed: result.rowCount };
   });
 }
@@ -330,12 +331,15 @@ export async function selectAll({ sessionId, actorId, guildId, channelId = null,
     const result = await client.query(`
       UPDATE checkout_quest_options SET selected = true WHERE session_id = $1 RETURNING id
     `, [sessionId]);
+    const updated = (await client.query(`UPDATE interaction_sessions SET state_version=state_version+1,
+      updated_at=transaction_timestamp() WHERE id=$1 RETURNING *`, [sessionId])).rows[0];
+    await enqueueCheckoutAudit(client, updated, context);
     return { session, changed: result.rowCount };
   });
 }
 
 export async function buildQuote({ sessionId, actorId, guildId, channelId = null,
-  messageId = null, runnerConcurrency = 2 }, _context, options = {}) {
+  messageId = null, runnerConcurrency = 2 }, context, options = {}) {
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const session = await lockAuthorizedSession(client, { sessionId, actorId, guildId, channelId, messageId });
     const items = (await client.query(`
@@ -344,13 +348,25 @@ export async function buildQuote({ sessionId, actorId, guildId, channelId = null
       WHERE option.session_id = $1 AND option.selected = true ORDER BY option.created_at,option.id
     `, [sessionId])).rows;
     if (!items.length) throw new QuestshopError('NO_QUEST_SELECTED', 'กรุณาเลือก Quest อย่างน้อยหนึ่งรายการ');
+    const questIds = [...new Set(items.map((item) => item.quest_id))];
+    const questRows = (await client.query(
+      'SELECT * FROM quests WHERE quest_id = ANY($1::text[]) FOR SHARE', [questIds],
+    )).rows;
+    const questsById = new Map(questRows.map((quest) => [quest.quest_id, quest]));
+    const taskTypes = [...new Set(questRows.map((quest) => quest.task_type).filter(Boolean))];
+    const priceRows = taskTypes.length ? (await client.query(`
+      SELECT DISTINCT ON (task_type) * FROM price_rules
+      WHERE enabled=true AND rule_type='TYPE' AND task_type=ANY($1::text[])
+      ORDER BY task_type, created_at DESC
+    `, [taskTypes])).rows : [];
+    const pricesByTaskType = new Map(priceRows.map((price) => [price.task_type, price]));
     for (const item of items) {
-      const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR SHARE', [item.quest_id])).rows[0];
+      const quest = questsById.get(item.quest_id);
       if (!quest || !item.contract_hash || item.contract_hash !== quest.current_contract_hash) {
         throw new QuestshopError('QUEST_CONTRACT_CHANGED', 'รูปแบบ Quest เปลี่ยนไป กรุณาเริ่มเลือกใหม่');
       }
       await validateOptionAdmission(client, item, quest);
-      const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });
+      const price = pricesByTaskType.get(quest.task_type);
       if (!price || price.id !== item.price_rule_id || BigInt(price.amount_cents) !== BigInt(item.price_cents)) {
         throw new QuestshopError('QUOTE_EXPIRED', 'ราคามีการเปลี่ยนแปลง กรุณาเริ่ม Quote ใหม่');
       }
@@ -370,6 +386,7 @@ export async function buildQuote({ sessionId, actorId, guildId, channelId = null
       payload=payload||jsonb_build_object('quoteHash',$2::text,'quotedAt',transaction_timestamp()),
       state_version=state_version+1,updated_at=transaction_timestamp() WHERE id=$1 RETURNING *`,
     [sessionId, quoteHash])).rows[0];
+    await enqueueCheckoutAudit(client, updated, context);
     return { session: updated, items, quoteHash, totalCents,
       walletAvailableCents: wallet.available_cents, walletReservedCents: wallet.reserved_cents };
   });
@@ -454,20 +471,30 @@ function withSessionTrace(context, session) {
 
 async function validateSelectedOptions(client, selected, freshById, runnerConcurrency) {
   const validated = [];
+  const questIds = [...new Set(selected.map((option) => option.quest_id))];
+  const questRows = (await client.query(
+    'SELECT * FROM quests WHERE quest_id = ANY($1::text[]) FOR SHARE', [questIds],
+  )).rows;
+  const questsById = new Map(questRows.map((quest) => [quest.quest_id, quest]));
+  const taskTypes = [...new Set(questRows.map((quest) => quest.task_type).filter(Boolean))];
+  const priceRows = taskTypes.length ? (await client.query(`
+    SELECT DISTINCT ON (task_type) * FROM price_rules
+    WHERE enabled=true AND rule_type='TYPE' AND task_type=ANY($1::text[])
+    ORDER BY task_type, created_at DESC
+  `, [taskTypes])).rows : [];
+  const pricesByTaskType = new Map(priceRows.map((price) => [price.task_type, price]));
   for (const option of selected) {
       const fresh = freshById.get(option.quest_id);
       if (!fresh || fresh.completed) {
         throw new QuestshopError('QUEST_EXTERNALLY_COMPLETED', `Quest ${option.quest_name} ทำเสร็จจากที่อื่นแล้ว`);
       }
-      const quest = (await client.query(
-        'SELECT * FROM quests WHERE quest_id = $1 FOR SHARE', [option.quest_id],
-      )).rows[0];
+      const quest = questsById.get(option.quest_id);
       if (!quest || !option.contract_hash || option.contract_hash !== quest.current_contract_hash
         || option.contract_hash !== fresh.contractHash) {
         throw new QuestshopError('QUEST_CONTRACT_CHANGED', 'รูปแบบ Quest เปลี่ยนไป กรุณาตรวจรายการใหม่');
       }
       await validateOptionAdmission(client, option, quest);
-      const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });
+      const price = pricesByTaskType.get(quest.task_type);
       if (!price || BigInt(price.amount_cents) !== BigInt(option.price_cents) || price.id !== option.price_rule_id) {
         throw new QuestshopError('QUOTE_EXPIRED', 'ราคามีการเปลี่ยนแปลง กรุณาตรวจ Quote ใหม่');
       }
@@ -598,12 +625,11 @@ async function queueFirstOrderItem(client, itemRows, actorId, preflight, context
 }
 
 async function enqueueOrderHistory(client, itemRows, context) {
+  const baseNow = (await client.query('SELECT clock_timestamp() AS value')).rows[0].value;
+  const baseMs = new Date(baseNow).getTime();
   for (let index = 0; index < itemRows.length; index += 1) {
       const item = itemRows[index];
-      const notBefore = (await client.query(
-        "SELECT clock_timestamp() + make_interval(secs => $1) AS value",
-        [Math.floor(index / 5) * 10],
-      )).rows[0].value;
+      const notBefore = new Date(baseMs + Math.floor(index / 5) * 10_000);
     await enqueueProjection(client, {
         projectionType: 'QUEST_HISTORY', aggregateType: 'ORDER_ITEM', aggregateId: item.id,
         aggregateVersion: item.state_version + (index === 0 ? 1 : 0),
@@ -613,12 +639,13 @@ async function enqueueOrderHistory(client, itemRows, context) {
 }
 
 async function finishCheckout(client, sessionId, orderId) {
-  await client.query(`
+  const updated = (await client.query(`
     UPDATE interaction_sessions SET state = 'CONFIRMED', state_version = state_version + 1,
         payload = payload || jsonb_build_object('orderId', $2::text),
-        updated_at = transaction_timestamp() WHERE id = $1
-  `, [sessionId, orderId]);
+        updated_at = transaction_timestamp() WHERE id = $1 RETURNING *
+  `, [sessionId, orderId])).rows[0];
   await client.query('DELETE FROM checkout_credentials WHERE session_id = $1', [sessionId]);
+  return updated;
 }
 
 export async function confirmOrder({ sessionId, actorId, guildId, channelId = null,
@@ -653,12 +680,13 @@ export async function confirmOrder({ sessionId, actorId, guildId, channelId = nu
     }, correlatedContext);
     await queueFirstOrderItem(client, itemRows, actorId, preflight, correlatedContext);
     await enqueueOrderHistory(client, itemRows, correlatedContext);
-    await finishCheckout(client, sessionId, orderId);
+    const completedSession = await finishCheckout(client, sessionId, orderId);
+    await enqueueCheckoutAudit(client, completedSession, correlatedContext);
     return orderResult(client, orderId);
   });
 }
 
-export async function expireSessions(_input, _context, options = {}) {
+export async function expireSessions(_input, context, options = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
     const result = await client.query(`
       WITH expired AS (
@@ -668,11 +696,12 @@ export async function expireSessions(_input, _context, options = {}) {
       )
       UPDATE interaction_sessions AS session SET state = 'EXPIRED', state_version = session.state_version + 1,
         updated_at = clock_timestamp()
-      FROM expired WHERE session.id = expired.id RETURNING session.id
+      FROM expired WHERE session.id = expired.id RETURNING session.*
     `);
     if (result.rows.length) {
       await client.query('DELETE FROM checkout_credentials WHERE session_id=ANY($1::uuid[])',
         [result.rows.map((row) => row.id)]);
+      for (const session of result.rows) await enqueueCheckoutAudit(client, session, context);
     }
     await client.query(`
       WITH stale AS (

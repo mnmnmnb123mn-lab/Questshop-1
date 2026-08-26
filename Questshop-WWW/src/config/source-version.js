@@ -13,8 +13,9 @@ export function inspectSourceSha({ cwd = process.cwd(), execute = execFileSync }
 
 export function verifyConfiguredSourceSha(env, options = {}) {
   const sourceSha = inspectSourceSha(options);
-  if (sourceSha && sourceSha !== String(env.GIT_SHA).toLowerCase()) {
+  const configuredSha = SHA.test(String(env?.GIT_SHA ?? '')) ? String(env.GIT_SHA).toLowerCase() : null;
+  if (sourceSha && configuredSha && sourceSha !== configuredSha) {
     throw new Error(`GIT_SHA does not match checked-out source (${sourceSha})`);
   }
-  return Object.freeze({ sourceSha, verified: sourceSha !== null });
+  return Object.freeze({ sourceSha, verified: sourceSha !== null && (!configuredSha || sourceSha === configuredSha) });
 }

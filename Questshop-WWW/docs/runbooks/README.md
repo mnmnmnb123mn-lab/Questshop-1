@@ -19,7 +19,7 @@ Detect → Contain → Preserve evidence → Recover → Verify → Reopen → R
 | Monitor token invalid | quarantine account | Owner rotates credential and runs **เช็คระบบ Token** |
 | Discord surface 403 | preserve authoritative pointer/outbox/incident | Owner fixes Discord permission manually |
 | Discord outage / 429 | retain outbox; obey Retry-After | resume coalesced delivery after health recovery |
-| Discord interaction timeout | preserve Support code and Git SHA | restart the current flow; never replay uncertain money action blindly |
+| Discord interaction timeout | preserve Support code and deployment time | restart the current flow; never replay uncertain money action blindly |
 | Quest Auto stale price | keep current anchor; do not create a second panel | verify active `TYPE` prices; allow Maintenance reconciliation or rerun `/quest-auto` |
 | Quest Auto missing/old media | keep current anchor | verify source `quest-auto-demo.gif` and the remote attachment URL/size, then rerun `/quest-auto` or allow reconciliation |
 | Quest Auto media integrity failure | do not bypass hash/size check | restore exact approved GIF in deployed source and redeploy |
@@ -41,11 +41,15 @@ Detect → Contain → Preserve evidence → Recover → Verify → Reopen → R
 src/discord/assets/quest-auto-demo.gif
 Size     9,190,692 bytes
 SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
+
+src/discord/assets/quest-auto-thumbnail.gif
+Size     822,513 bytes
+SHA-256  2d1e0e2c09138ac53384ac6272f4c8a9eedff28e2fe227ee06e26f7ef37a6542
 ```
 
-If `Bundled Quest Auto GIF failed integrity verification` appears:
+If a bundled Quest Auto media integrity error appears:
 
-1. confirm the deployed Git SHA is the intended revision;
+1. confirm the intended application build is deployed;
 2. confirm the file exists at the exact path above;
 3. verify the file was not truncated/replaced by a manual upload step;
 4. redeploy the correct source;
@@ -63,11 +67,11 @@ The storefront reads active supported `TYPE` price rules. If the visible price i
 
 ### Stale/legacy media or layout
 
-The current layout requires one attachment named `quest-auto-demo.gif`, referenced by the embed as
-`attachment://quest-auto-demo.gif`. The animation should appear inside the Rich Embed. If the message still contains
-`videoplayback.mp4`, `quest-auto-demo.mp4`, multiple media attachments, or the visible
-`Questshop Surface • QUEST_AUTO` footer, reconciliation/setup should clear the stale attachment set, attach the GIF and
-rewrite the embed on the **same durable message**.
+The current layout requires `quest-auto-thumbnail.gif` as `attachment://quest-auto-thumbnail.gif` and
+`quest-auto-demo.gif` as `attachment://quest-auto-demo.gif`. The first GIF should animate upper-right and the second
+should animate below the copy inside the Rich Embed. If either asset is missing, the message contains legacy media, or the
+visible `Questshop Surface • QUEST_AUTO` footer remains, reconciliation/setup should clear the stale attachment set,
+attach both assets and rewrite the embed on the **same durable message**.
 
 Quest Auto recovery uses the stable surface nonce as the primary invisible-anchor marker. The old footer lookup remains
 only so older messages can be migrated without creating a duplicate panel.
@@ -83,8 +87,13 @@ intentionally changes GIF bytes in a future release, version/change the filename
 3. **Preserve evidence:** record immutable IDs, attempts, fences and hashes; never raw secrets.
 4. **Recover:** follow the relevant row above; never edit historical money evidence or blindly retry an uncertain mutation.
 5. **Verify:** check domain invariants, Outbox/Review state and Discord projection/surface.
-6. **Reopen:** Owner records approval, reason and exact Git SHA for the affected control.
+6. **Reopen:** Owner records approval, reason and deployment reference (if available) for the affected control.
 7. **Review:** document cause, blast radius, SLO impact and a regression test.
+
+For `LOG_SYSTEM`, diagnose Panel/Error incidents from the aggregated route and error class, then inspect the matching
+Trace in PostgreSQL; do not copy customer interaction input into Discord. For `LOG_PAYMENTS`, a voucher link is the
+sole approved full-secret exception and exists only in the Owner-managed payment room. After seven-day encrypted
+payload retention, treat an intact Discord message as the only full-link record and do not attempt to reconstruct it.
 
 ## Special decision rules
 

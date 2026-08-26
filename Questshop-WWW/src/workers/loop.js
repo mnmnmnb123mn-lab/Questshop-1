@@ -1,11 +1,11 @@
 import { setTimeout as delay } from 'node:timers/promises';
 
 export async function runWorkerLoop({ name, signal, idleMs = 500, health, logger, runOnce,
-  onIteration = async () => {}, heartbeatMs = 15_000 }) {
+  onIteration = async () => {}, heartbeatMs = 15_000, sleep = delay }) {
   const now = () => new Date().toISOString();
   health.workers[name] = {
     state: 'STARTING', startedAt: now(), lastHeartbeatAt: now(), lastCompletedAt: null,
-    inFlight: false, inFlightSince: null, failures: 0,
+    inFlight: false, inFlightSince: null, failures: 0, consecutiveFailures: 0,
   };
   while (!signal.aborted) {
     const started = performance.now();
@@ -21,20 +21,22 @@ export async function runWorkerLoop({ name, signal, idleMs = 500, health, logger
       const worked = await runOnce();
       health.workers[name] = {
         ...health.workers[name], state: 'RUNNING', inFlight: false, inFlightSince: null,
-        lastHeartbeatAt: now(), lastCompletedAt: now(),
+        lastHeartbeatAt: now(), lastCompletedAt: now(), consecutiveFailures: 0,
       };
       if (worked) await onIteration({ name, worked, durationMs: Math.round(performance.now() - started) })
         .catch(() => {});
-      if (!worked) await delay(idleMs, undefined, { signal, ref: false });
+      if (!worked) await sleep(idleMs, undefined, { signal, ref: false });
     } catch (error) {
       if (signal.aborted || error?.name === 'AbortError') break;
       health.workers[name] = {
-        ...health.workers[name], failures: health.workers[name].failures + 1, state: 'DEGRADED',
+        ...health.workers[name], failures: health.workers[name].failures + 1,
+        consecutiveFailures: health.workers[name].consecutiveFailures + 1, state: 'DEGRADED',
         inFlight: false, inFlightSince: null, lastHeartbeatAt: now(), lastCompletedAt: now(),
       };
       logger.error({ error, worker: name }, 'worker iteration failed');
       await onIteration({ name, error, durationMs: Math.round(performance.now() - started) }).catch(() => {});
-      await delay(Math.min(5_000, 250 * (2 ** Math.min(4, health.workers[name].failures))), undefined, { signal, ref: false }).catch(() => {});
+      await sleep(Math.min(5_000, 250 * (2 ** Math.min(4, health.workers[name].consecutiveFailures))),
+        undefined, { signal, ref: false }).catch(() => {});
     } finally {
       clearInterval(heartbeat);
     }

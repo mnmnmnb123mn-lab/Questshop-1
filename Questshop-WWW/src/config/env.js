@@ -67,7 +67,9 @@ const environmentFields = {
   S3_FORCE_PATH_STYLE: booleanText.default('true'),
   RUNNER_CONCURRENCY: z.coerce.number().int().min(1).max(5).default(2),
   RUNNER_CONCURRENCY_HARD_MAX: z.coerce.number().int().min(1).max(5).default(5),
-  GIT_SHA: z.string().min(1).default('unknown'),
+  // Kept as an internal compatibility value for existing database evidence.
+  // Operators no longer need to configure a deployment SHA.
+  GIT_SHA: z.string().optional().transform(() => 'untracked'),
   DISCORD_CLIENT_VERSION: z.string().regex(/^\d+(?:\.\d+)+$/).default('1.0.9267'),
   DISCORD_CHROME_VERSION: z.string().regex(/^\d+(?:\.\d+)+$/).default('138.0.7204.251'),
   DISCORD_ELECTRON_VERSION: z.string().regex(/^\d+(?:\.\d+)+$/).default('37.6.0'),
@@ -100,9 +102,6 @@ export function usesApplicationBackup(value) {
 function validateRuntimeLimits(value, ctx) {
   if (value.RUNNER_CONCURRENCY > value.RUNNER_CONCURRENCY_HARD_MAX) {
     addEnvironmentIssue(ctx, 'RUNNER_CONCURRENCY exceeds hard max');
-  }
-  if (value.NODE_ENV === 'production' && !/^[0-9a-f]{40}$/i.test(value.GIT_SHA)) {
-    addEnvironmentIssue(ctx, 'GIT_SHA must be the 40-character deployment commit SHA in production');
   }
 }
 

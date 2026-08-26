@@ -149,3 +149,27 @@ test('payment attempts retain retry ancestry and normalized error metadata', asy
   const secondAttempt = await createPaymentAttempt({ topup: secondTopup }, context(trace, 'attempt-2'), { pool });
   assert.equal(secondAttempt.parent_attempt_id, firstAttempt.id);
 });
+
+test('verified SUCCESS without a provider transaction ID becomes redeemable exactly once', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const trace = uuidv7(); const receiver = await createReceiver(trace); const topupId = uuidv7();
+  await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
+    receiver_version_id,receiver_phone_last4,trace_id)
+    VALUES($1,'missing-provider-id-user','PAYMENT_QUEUED',1,$2,$3,'1234',$4)`,
+  [topupId, Buffer.alloc(32, 95), receiver, trace]);
+  const topup = await acquirePaymentJob({ holder: uuidv7() }, { pool });
+  const attempt = await createPaymentAttempt({ topup }, context(trace, 'missing-provider-id-attempt'), { pool });
+  const updated = await recordProviderResult({ topup, attemptId: attempt.id, result: {
+    outcome: 'REDEEMED', providerCode: 'SUCCESS', httpStatus: 200, amountCents: 1_000n, currency: 'THB',
+    receiverConfirmation: 'REQUEST_BOUND_SUCCESS', providerTransactionId: null,
+    providerEvidence: { receiverConfirmation: 'REQUEST_BOUND_SUCCESS', settlementIdentity: 'VOUCHER_HMAC',
+      providerTransactionIdPresent: false, bodyLength: 100, bodySha256: 'a'.repeat(64), topLevelKeys: ['status', 'data'] },
+  } }, context(trace, 'missing-provider-id-result'), { pool });
+  assert.equal(updated.status, 'REDEEMED');
+  const saved = (await pool.query(`SELECT provider_transaction_id,amount_cents,currency FROM topups WHERE id=$1`, [topupId])).rows[0];
+  assert.deepEqual(saved, { provider_transaction_id: null, amount_cents: '1000', currency: 'THB' });
+  const evidence = (await pool.query('SELECT dispatch_state,provider_evidence FROM payment_attempts WHERE id=$1', [attempt.id])).rows[0];
+  assert.equal(evidence.dispatch_state, 'VERIFIED');
+  assert.equal(evidence.provider_evidence.settlementIdentity, 'VOUCHER_HMAC');
+  assert.equal(evidence.provider_evidence.providerTransactionIdPresent, false);
+});

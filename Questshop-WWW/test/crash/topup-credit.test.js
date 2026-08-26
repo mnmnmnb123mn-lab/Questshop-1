@@ -130,6 +130,33 @@ test('owner manual review maps duplicate provider transaction id to a safe busin
   assert.equal((await pool.query('SELECT state FROM manual_reviews WHERE id=$1', [review])).rows[0].state, 'OPEN');
 });
 
+test('owner may confirm a no-transaction-ID settlement only with complete TrueMoney evidence', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const receiver = (await pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1")).rows[0].id;
+  const trace = uuidv7(); const topup = uuidv7(); const review = uuidv7();
+  await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
+    receiver_version_id,receiver_phone_last4,amount_cents,currency,trace_id)
+    VALUES($1,'fallback-settlement-user','MANUAL_REVIEW',1,$2,$3,'1234',1000,'THB',$4)`,
+  [topup, Buffer.alloc(32, 54), receiver, trace]);
+  await pool.query(`INSERT INTO payment_attempts(id,topup_id,attempt_number,dispatch_state,provider_status_code,
+    provider_http_status,provider_evidence,trace_id)
+    VALUES($1,$2,1,'VERIFIED','SUCCESS',200,$3,$4)`, [uuidv7(), topup,
+    { receiverConfirmation: 'REQUEST_BOUND_SUCCESS', settlementIdentity: 'VOUCHER_HMAC' }, trace]);
+  await pool.query(`INSERT INTO manual_reviews(id,subject_type,subject_id,state,financial,owner_only,
+    opened_reason,trace_id) VALUES($1,'TOPUP',$2,'OPEN',true,true,'AMOUNT_OUTSIDE_AUTOCREDIT_RANGE',$3)`,
+  [review, topup, trace]);
+  const input = { reviewId: review, decision: 'CREDIT', reason: 'confirmed provider settlement evidence',
+    isOwner: true, amountCents: 1_000n, providerTransactionId: null };
+  const prepared = await resolveSubjectReview(input, ownerContext(trace, 'fallback-credit-prepare'), { pool });
+  assert.equal(prepared.applied.confirmationRequired, true);
+  const completed = await resolveSubjectReview(input, ownerContext(trace, 'fallback-credit-confirm'), { pool });
+  assert.equal(completed.applied.status, 'CREDITED');
+  const settled = (await pool.query('SELECT status,provider_transaction_id FROM topups WHERE id=$1', [topup])).rows[0];
+  assert.deepEqual(settled, { status: 'CREDITED', provider_transaction_id: null });
+  assert.equal(BigInt((await pool.query("SELECT available_cents FROM wallets WHERE discord_user_id='fallback-settlement-user'"))
+    .rows[0].available_cents), 1_000n);
+});
+
 test('daily top-up limit credits the full received amount and redeemed-day reconciliation locks later intake', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const receiver = (await pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1")).rows[0].id;

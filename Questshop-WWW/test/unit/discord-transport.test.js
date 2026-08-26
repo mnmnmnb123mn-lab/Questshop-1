@@ -40,6 +40,18 @@ test('outbox sends the normalized payload rather than raw projection content', a
   assert.equal(delivered.enforceNonce, true);
 });
 
+test('outbox edit replaces old attachments with the renderer attachment set', async () => {
+  let edited;
+  const message = { edit: async (payload) => { edited = payload; return { id: 'existing' }; } };
+  const channel = { messages: { fetch: async (input) => input?.message === 'existing' ? message : [] } };
+  const files = [{ attachment: Buffer.from('banner'), name: 'backoffice-log-banner.webp' }];
+  await publishProjection(channel, { nonce: 'nonce', message_id: 'existing' }, {
+    embeds: [], attachments: [], files,
+  });
+  assert.deepEqual(edited.attachments, []);
+  assert.deepEqual(edited.files, files);
+});
+
 test('nonce scan preserves transient failures instead of claiming no message exists', async () => {
   const channel = { messages: { fetch: async () => { throw Object.assign(new Error('unavailable'), { status: 503 }); } } };
   await assert.rejects(() => findDiscordMessageByNonce(channel, 'nonce'));

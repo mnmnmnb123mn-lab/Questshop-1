@@ -261,22 +261,30 @@ async function applyTopupDecision(client, review, decision, input, context) {
     await enqueueProjection(client, { projectionType: 'PAYMENT_LOG', aggregateType: 'TOPUP',
       aggregateId: topup.id, aggregateVersion: updated.state_version,
       surfaceKey: 'LOG_PAYMENTS', context });
+    await enqueueProjection(client, { projectionType: 'TOPUP_STATUS_DM', aggregateType: 'TOPUP',
+      aggregateId: topup.id, aggregateVersion: updated.state_version, surfaceKey: `DM:${updated.discord_user_id}`,
+      topic: 'TOPUP_STATUS_DM', context });
     return { topupId: topup.id, status: updated.status };
   }
   if (decision !== 'CREDIT') throw new TypeError('invalid top-up review decision');
   const amount = BigInt(input.amountCents ?? topup.amount_cents ?? 0);
-  if (amount <= 0n || !input.providerTransactionId?.trim()) {
-    throw new TypeError('confirmed amount and provider transaction id are required');
+  const providerTransactionId = input.providerTransactionId?.trim() || null;
+  const alternateSettlementEvidence = await hasVoucherSettlementEvidence(client, topup);
+  if (amount <= 0n || (!providerTransactionId && !alternateSettlementEvidence)) {
+    throw new TypeError('confirmed amount and provider transaction id are required unless TrueMoney settlement evidence is complete');
+  }
+  if (!providerTransactionId && amount !== BigInt(topup.amount_cents ?? 0)) {
+    throw new QuestshopError('STALE_STATE', 'ยอดที่ยืนยันต้องตรงกับยอดที่ TrueMoney ตอบกลับมา');
   }
   assertTransition(TOPUP_TRANSITIONS, topup.status, 'REDEEMED');
   let redeemed;
   try {
     redeemed = (await client.query(`UPDATE topups SET status='REDEEMED',state_version=state_version+1,
-      amount_cents=$2,currency='THB',provider_transaction_id=$3,
+      amount_cents=$2,currency='THB',provider_transaction_id=COALESCE($3,provider_transaction_id),
       redeemed_at=COALESCE(redeemed_at,transaction_timestamp()),
       failure_code=NULL,updated_at=transaction_timestamp()
       WHERE id=$1 AND status='MANUAL_REVIEW' RETURNING *`,
-    [topup.id, amount, input.providerTransactionId.trim()])).rows[0];
+    [topup.id, amount, providerTransactionId])).rows[0];
   } catch (error) {
     if (error?.code === '23505') {
       throw new QuestshopError('STALE_STATE', 'เลขธุรกรรม TrueMoney นี้ถูกใช้กับรายการเติมเงินอื่นแล้ว');
@@ -290,6 +298,22 @@ async function applyTopupDecision(client, review, decision, input, context) {
   const credited = await creditRedeemedTopupInTransaction(client, { topupId: topup.id }, context);
   return { topupId: topup.id, status: credited.topup.status,
     transactionId: credited.transaction.id };
+}
+
+async function hasVoucherSettlementEvidence(client, topup) {
+  if (topup.provider_transaction_id || BigInt(topup.amount_cents ?? 0) <= 0n || topup.currency !== 'THB') return false;
+  const attempt = (await client.query(`SELECT provider_http_status,provider_evidence,error_code
+    FROM payment_attempts WHERE topup_id=$1 ORDER BY attempt_number DESC LIMIT 1`, [topup.id])).rows[0];
+  if (!attempt || attempt.provider_http_status < 200 || attempt.provider_http_status >= 300) return false;
+  const evidence = attempt.provider_evidence ?? {};
+  const currentEvidence = evidence.receiverConfirmation === 'REQUEST_BOUND_SUCCESS'
+    && evidence.settlementIdentity === 'VOUCHER_HMAC';
+  // Compatibility for a pre-fix review: it recorded the confirmation and
+  // amount but labelled the missing transaction ID as ambiguous.
+  const legacyEvidence = evidence.receiverConfirmation === 'REQUEST_BOUND_SUCCESS'
+    && (attempt.error_code === 'PROVIDER_TRANSACTION_ID_MISSING'
+      || topup.failure_code === 'PROVIDER_TRANSACTION_ID_MISSING');
+  return currentEvidence || legacyEvidence;
 }
 
 async function loadReviewedOrderItem(client, review) {
@@ -443,22 +467,23 @@ async function applyQuestDecision(client, review, decision, context) {
     batchId: seeded.batch?.id ?? null, testRunId: seeded.queued?.id ?? null };
 }
 
-function topupCreditFingerprint({ reviewId, reason, amountCents, providerTransactionId }) {
+function topupCreditFingerprint({ reviewId, reason, amountCents, providerTransactionId, settlementIdentity }) {
   return createHash('sha256').update(JSON.stringify({
     reviewId,
     reason: reason.trim(),
     amountCents: String(amountCents),
-    providerTransactionId: providerTransactionId.trim(),
+    providerTransactionId: providerTransactionId ?? null,
+    settlementIdentity,
   })).digest('hex');
 }
 
 async function prepareOrConfirmTopupCredit({ reviewId, reason, amountCents, providerTransactionId,
   expectedVersion, isOwner }, context, options) {
   if (!isOwner) throw new AuthorizationError('Top-up ที่ผลไม่ชัดเจนให้ Owner ตัดสินเท่านั้น');
-  if (amountCents == null || BigInt(amountCents) <= 0n || !providerTransactionId?.trim()) {
-    throw new TypeError('confirmed amount and provider transaction id are required');
+  if (amountCents == null || BigInt(amountCents) <= 0n) {
+    throw new TypeError('confirmed amount is required');
   }
-  const fingerprint = topupCreditFingerprint({ reviewId, reason, amountCents, providerTransactionId });
+  const normalizedProviderTransactionId = providerTransactionId?.trim() || null;
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const review = (await client.query('SELECT * FROM manual_reviews WHERE id=$1 FOR UPDATE', [reviewId])).rows[0];
     if (!review || review.state === 'RESOLVED') throw new StaleStateError('manual_review', reviewId);
@@ -467,6 +492,26 @@ async function prepareOrConfirmTopupCredit({ reviewId, reason, amountCents, prov
       throw new StaleStateError('manual_review', reviewId);
     }
     if (review.owner_only && !isOwner) throw new AuthorizationError('รายการนี้ให้ Owner ตัดสินเท่านั้น');
+    const topup = (await client.query('SELECT * FROM topups WHERE id=$1 FOR SHARE', [review.subject_id])).rows[0];
+    if (!topup) throw new StaleStateError('topup', review.subject_id);
+    const reversalReview = review.opened_reason === 'REVERSAL_INSUFFICIENT_AVAILABLE';
+    let settlementIdentity = 'PROVIDER_TRANSACTION_ID';
+    if (reversalReview) {
+      if (!normalizedProviderTransactionId) throw new TypeError('provider transaction id is required for reversal');
+    } else {
+      if (topup.status !== 'MANUAL_REVIEW') throw new StaleStateError('topup', review.subject_id);
+      const alternateSettlementEvidence = await hasVoucherSettlementEvidence(client, topup);
+      if (!normalizedProviderTransactionId && !alternateSettlementEvidence) {
+        throw new QuestshopError('TOPUP_SETTLEMENT_EVIDENCE_INCOMPLETE',
+          'ยังต้องระบุเลขธุรกรรม TrueMoney เพราะหลักฐานยืนยันการรับเงินยังไม่ครบ');
+      }
+      if (!normalizedProviderTransactionId && BigInt(amountCents) !== BigInt(topup.amount_cents ?? 0)) {
+        throw new QuestshopError('STALE_STATE', 'ยอดที่ยืนยันต้องตรงกับยอดที่ TrueMoney ตอบกลับมา');
+      }
+      settlementIdentity = normalizedProviderTransactionId ? 'PROVIDER_TRANSACTION_ID' : 'VOUCHER_HMAC';
+    }
+    const fingerprint = topupCreditFingerprint({ reviewId, reason, amountCents,
+      providerTransactionId: normalizedProviderTransactionId, settlementIdentity });
     const evidence = (await client.query(`SELECT payload FROM review_evidence
       WHERE review_id=$1 AND evidence_type='CREDIT_CONFIRMATION_PREPARED' AND actor_id=$2
         AND created_at>=clock_timestamp()-interval '5 minutes'
@@ -481,13 +526,14 @@ async function prepareOrConfirmTopupCredit({ reviewId, reason, amountCents, prov
     }
     await client.query(`INSERT INTO review_evidence(id,review_id,evidence_type,payload,actor_type,actor_id,trace_id)
       VALUES($1,$2,'CREDIT_CONFIRMATION_PREPARED',$3,$4,$5,$6)`, [uuidv7(), reviewId,
-      redact({ fingerprint, amountCents: String(amountCents), providerTransactionId: providerTransactionId.trim(),
+      redact({ fingerprint, amountCents: String(amountCents), providerTransactionId: normalizedProviderTransactionId,
+        settlementIdentity,
         reason: reason.trim(), expiresInSeconds: 300, preparedByIdempotencyKey: context.idempotencyKey }),
       context.actorType, context.actorId, context.traceId]);
     await appendAdminAudit(client, { action: 'TOPUP_MANUAL_CREDIT_CONFIRMATION_PREPARED',
       targetType: 'TOPUP', targetId: review.subject_id, actorId: context.actorId,
       before: { reviewState: review.state }, after: { amountCents: String(amountCents),
-        providerTransactionId: providerTransactionId.trim() }, reason: reason.trim(), context });
+        providerTransactionId: normalizedProviderTransactionId, settlementIdentity }, reason: reason.trim(), context });
     return { confirmed: false, review };
   });
 }

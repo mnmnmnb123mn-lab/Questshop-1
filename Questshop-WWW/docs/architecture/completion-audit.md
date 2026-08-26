@@ -20,8 +20,9 @@ Current completion label is **implemented-but-unverified**.
 
 ## Later Owner storefront decision — Quest Auto
 
-`QUEST_AUTO` is one durable Discord storefront message with fixed title **Discord Quest • Auto**, approved Thai copy,
-buttons **เริ่มทำเควส** / **เติมเงิน**, dynamic price summary and one exact Owner-approved GIF rendered inside the embed.
+`QUEST_AUTO` is one durable Discord storefront message with fixed title **Discord Quest Auto**, approved Thai copy,
+buttons **เริ่มทำเควส** / **เติมเงิน**, dynamic price summary, an animated GIF thumbnail and one exact Owner-approved GIF rendered
+inside the embed.
 The customer-facing Quest Auto embed does not display the technical `Questshop Surface • QUEST_AUTO` footer.
 
 ### Price contract
@@ -57,19 +58,23 @@ Source asset:
 src/discord/assets/quest-auto-demo.gif
 Size     9,190,692 bytes
 SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
+
+src/discord/assets/quest-auto-thumbnail.gif
+Size     822,513 bytes
+SHA-256  2d1e0e2c09138ac53384ac6272f4c8a9eedff28e2fe227ee06e26f7ef37a6542
 ```
 
-Runtime verifies exact size, GIF signature and SHA-256 before upload. The message attachment is referenced by the Rich
-Embed as `attachment://quest-auto-demo.gif`, so the customer sees the animation inside the embed instead of a standalone
-MP4/video block. A stale or legacy attachment is cleared and replaced on the same durable anchor. An already-correct
-`quest-auto-demo.gif` attachment is preserved to avoid duplicate upload.
+Runtime verifies exact size, signature and SHA-256 before upload. The Rich Embed references the animated GIF as its
+upper-right thumbnail and the demo GIF as its lower image, so the customer sees the animation inside the embed instead of a standalone
+MP4/video block. Stale or legacy attachments are cleared and replaced on the same durable anchor. An already-correct
+asset pair is preserved to avoid duplicate uploads.
 
 Quest Auto recovery prefers the stable surface nonce so the technical footer can remain hidden. Legacy footer lookup is
 retained only as a migration fallback for older storefront messages.
 
 The reconciliation contract compares the complete customer-visible structure: empty message content, one Embed with the
 approved title/copy/color and no legacy fields, one Action Row containing only the **เริ่มทำเควส** / **เติมเงิน** button
-contracts, and the expected GIF attachment/image. Opaque component UUIDs may rotate; their routes and visible semantics
+contracts, and the expected GIF attachments with embed image/thumbnail. Opaque component UUIDs may rotate; their routes and visible semantics
 must remain exact. Drift edits the existing anchor instead of creating a second storefront.
 
 Important future-change rule: Discord-side drift detection identifies the expected GIF by filename. If the GIF bytes
@@ -77,7 +82,7 @@ intentionally change later, version/change the filename or add an explicit attac
 
 Live boundary: real Discord desktop/mobile GIF rendering inside the embed, removal of the old visible technical footer,
 visible price refresh immediately after Admin confirmation plus Maintenance fallback repair, restart/setup repair and no
-duplicate panel must still be verified on one exact Git SHA.
+duplicate panel must still be verified on one deployed build.
 
 ## Quest announcement contract
 
@@ -130,7 +135,7 @@ available, verify the displayed range against its payload. Missing assets must r
 
 | Area | Primary implementation | Automated evidence | Live boundary |
 |---|---|---|---|
-| Runtime / source identity | config, bootstrap, `GIT_SHA`, Node 22 | env/source-version/startup tests | exact inwcloud checkout + restart |
+| Runtime / build identity | config, bootstrap, Node 22 | env/setup/startup tests | intended inwcloud build + restart |
 | PostgreSQL TLS / roles | pools, migrations, role sync/validator | PostgreSQL 16 role/TLS tests | Aiven role + CA verification |
 | Wallet / Ledger | wallet services, reservations, append-only tables | concurrency/settlement/refund tests | Owner compensation sign-off |
 | TrueMoney | adapter, payment worker/service | canonical URL/schema/ambiguity/crash tests | real low-value + ambiguous UAT |
@@ -144,12 +149,12 @@ available, verify the displayed range against its payload. Missing assets must r
 | Admin / Review | Admin router + domain services | authorization/session/review tests | Owner/Admin workflow UAT |
 | Health / alerts | health server, worker manager, alerts | status/auth/SLO tests | external alert delivery |
 | Aiven backup policy | env/deployment policy | Aiven-managed skip/audit tests | Aiven Console recovery evidence |
-| Deployment / rollback | Docker, CI, deploy scripts | coverage/load/audit/Docker | same-SHA deploy + rollback rehearsal |
+| Deployment / rollback | Docker, CI, deploy scripts | coverage/load/audit/Docker | same-build UAT + rollback rehearsal |
 | UAT / release | prelaunch scripts/docs | source gates only | all rows in UAT evidence template |
 
 ## Automated evidence status
 
-Every candidate source SHA must pass the same repository gate before its automated evidence is current:
+Every candidate build must pass the same repository gate before its automated evidence is current:
 
 - `npm run check`
 - `npm run lint`
@@ -159,8 +164,8 @@ Every candidate source SHA must pass the same repository gate before its automat
 - `npm audit --audit-level=high`
 - Docker build
 
-The exact passing Git SHA and workflow run belong in release/UAT evidence. A previous green SHA never substitutes for the
-candidate being deployed. These results prove source contracts only; they do not prove provider/live behavior.
+The passing workflow run or deployment ID may be recorded in release/UAT evidence when available. A previous green build
+never substitutes for the candidate being deployed. These results prove source contracts only; they do not prove provider/live behavior.
 
 ## Explicit non-claims
 
@@ -172,9 +177,9 @@ Do not represent these as completed without controlled live evidence:
 3. real TrueMoney redemption and post-send ambiguous resolution;
 4. real supported Video/Desktop Quest execution;
 5. managed PostgreSQL TLS/least-privilege provisioning and recovery operation;
-6. same-SHA Owner closeout, rollback rehearsal and alert delivery.
+6. same-build Owner closeout, rollback rehearsal and alert delivery.
 
 ## Release state
 
-`done` requires every applicable automated and live boundary to pass on the same Git SHA.
+`done` requires every applicable automated and live boundary to pass on the same deployed build.
 Until then the correct label is **implemented-but-unverified**, never production-ready.

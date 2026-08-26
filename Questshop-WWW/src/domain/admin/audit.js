@@ -1,12 +1,29 @@
 import { v7 as uuidv7 } from 'uuid';
 import { enqueueProjection } from '../outbox/service.js';
 
+const SENSITIVE_AUDIT_KEY = /(?:token|cookie|secret|credential|ciphertext|auth(?:entication)?[_-]?tag|nonce|voucher|password|authorization|session)/i;
+const REDACTED = '[REDACTED]';
+
+// Admin evidence is append-only, but it must never become a second storage
+// path for secrets.  Domain callers may pass full database rows, so enforce a
+// defensive recursive scrub at the common persistence boundary.
+export function redactAuditState(value, key = '', depth = 0) {
+  if (SENSITIVE_AUDIT_KEY.test(key)) return REDACTED;
+  if (depth >= 12) return '[TRUNCATED]';
+  if (Array.isArray(value)) return value.map((item) => redactAuditState(item, '', depth + 1));
+  if (value && typeof value === 'object' && !(value instanceof Date) && !Buffer.isBuffer(value)) {
+    return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [childKey,
+      redactAuditState(child, childKey, depth + 1)]));
+  }
+  return value;
+}
+
 // node-postgres treats JavaScript arrays as PostgreSQL arrays, while audit
-// columns are JSONB.  Serialize the full value here so arrays remain JSON and
+// columns are JSONB.  Serialize the safe value here so arrays remain JSON and
 // integer satang values are represented without losing precision.
 export function serializeAuditState(value) {
   if (value == null) return null;
-  return JSON.stringify(value, (_key, child) => (typeof child === 'bigint' ? child.toString() : child));
+  return JSON.stringify(redactAuditState(value), (_key, child) => (typeof child === 'bigint' ? child.toString() : child));
 }
 
 export async function appendAdminAudit(client, {

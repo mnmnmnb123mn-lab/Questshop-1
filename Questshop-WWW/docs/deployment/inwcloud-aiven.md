@@ -1,7 +1,7 @@
 # Deploy Questshop on inwcloud + Aiven PostgreSQL
 
 This guide applies to the exact branch/commit selected for deployment. Passing deployment does not make the system
-production-ready; live TrueMoney, Quest, Discord and Owner UAT still require evidence on the same Git SHA.
+production-ready; live TrueMoney, Quest, Discord and Owner UAT still require evidence on the same deployed build.
 
 ## Requirements
 
@@ -16,11 +16,10 @@ production-ready; live TrueMoney, Quest, Discord and Owner UAT still require evi
 Aiven/Admin owns role creation, `CONNECT`, membership and schema grants. Questshop synchronizes only object privileges
 owned by the effective Migrator after migration.
 
-## 1. Select source and `GIT_SHA`
+## 1. Select source
 
-Select the intended branch/commit in inwcloud and set `GIT_SHA` to the exact 40-character commit SHA.
-If Git metadata exists in the checkout, `setup:verify` compares `git rev-parse HEAD` against `GIT_SHA` and fails on
-mismatch.
+Select the intended branch/commit in inwcloud. `GIT_SHA` is no longer an Environment Variable that must be entered;
+when Git metadata exists the runtime may show it for diagnostics, otherwise it uses the internal value `untracked`.
 
 ## 2. Runtime command
 
@@ -30,6 +29,7 @@ Configure inwcloud:
 Language: Node.js
 Version: 22.x LTS
 Run mode: Custom Command
+Root Directory: Questshop-WWW
 ```
 
 Use:
@@ -45,6 +45,7 @@ setup:verify → migrate → register
 ```
 
 Run migration every deploy even when `applied: 0`, because object privilege synchronization and validation still run.
+Do not run this command from the repository root: its `package.json` is inside `Questshop-WWW`.
 
 ## 3. Environment Variables
 
@@ -62,7 +63,6 @@ Run migration every deploy even when `applied: 0`, because object privilege sync
 | `DATA_ENCRYPTION_KEYS_JSON` | persistent Data keyring |
 | `VOUCHER_HMAC_KEYS_JSON` | persistent Voucher HMAC keyring |
 | `BACKUP_MODE` | `AIVEN_MANAGED` |
-| `GIT_SHA` | exact 40-char source SHA |
 | `PRELAUNCH` | `true` during UAT |
 | `TIMEZONE` | `Asia/Bangkok` |
 | `RUNNER_CONCURRENCY` | default `2` |
@@ -86,7 +86,7 @@ export NODE_EXTRA_CA_CERTS=/tmp/aiven-ca.pem
 
 Do not write a temporary CA file in the inwcloud startup command for the current source.
 
-## 5. Quest Auto bundled GIF deployment
+## 5. Quest Auto bundled media deployment
 
 The repository must contain the exact source asset:
 
@@ -94,17 +94,21 @@ The repository must contain the exact source asset:
 src/discord/assets/quest-auto-demo.gif
 Size     9,190,692 bytes
 SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
+
+src/discord/assets/quest-auto-thumbnail.gif
+Size     822,513 bytes
+SHA-256  2d1e0e2c09138ac53384ac6272f4c8a9eedff28e2fe227ee06e26f7ef37a6542
 ```
 
-No build-time conversion or Base64 reconstruction is used. Runtime reads this GIF directly from `src`, verifies
-size + GIF signature + SHA-256 and attaches it when the persistent `QUEST_AUTO` message does not already contain the
-expected `quest-auto-demo.gif` attachment.
+No build-time conversion or Base64 reconstruction is used. Runtime reads both assets directly from `src`, verifies
+size + signature + SHA-256 and attaches them when the persistent `QUEST_AUTO` message does not already contain the
+expected asset pair.
 
-The Rich Embed references `attachment://quest-auto-demo.gif`, so the intended layout is the animation **inside the
-embed**. The old standalone MP4/video block is not part of the current storefront layout.
+The Rich Embed references `attachment://quest-auto-thumbnail.gif` as its animated upper-right thumbnail and
+`attachment://quest-auto-demo.gif` as its lower image. The old standalone MP4/video block is not part of the layout.
 
-If startup/runtime reports `Bundled Quest Auto GIF failed integrity verification`, do not bypass the check.
-Confirm the deployed checkout contains the exact Git-tracked GIF and that inwcloud did not fetch an older revision.
+If startup/runtime reports a bundled Quest Auto integrity failure, do not bypass the check. Confirm the deployed
+checkout contains both exact Git-tracked assets and that inwcloud did not fetch an older revision.
 
 The 9.19 MB asset is included by the normal `COPY src ./src` Docker/build/deploy source path; no extra media service is
 required.
@@ -176,7 +180,6 @@ Re-running setup updates/moves the durable surface instead of intentionally crea
 | Error / symptom | Action |
 |---|---|
 | `DATABASE_DIRECT_URL ... undefined` | add the separate Migrator URL |
-| `GIT_SHA ...` invalid/mismatch | set the exact deployed 40-char SHA |
 | `POSTGRES_RUNTIME_ROLE_CONTRACT_FAILED` | fix Aiven role/bootstrap grants; do not broaden Runtime permissions |
 | Bot Administrator error | grant Discord `Administrator`, then restart |
 | TLS/CA error | verify both URLs use `verify-full` and CA Base64 is complete |
@@ -193,7 +196,7 @@ backup in this mode and does not claim a local restore drill.
 
 Rollback:
 
-- if schema remains compatible, select the prior app commit, update `GIT_SHA`, deploy again;
+- if schema remains compatible, select the prior app commit and deploy again;
 - there are no automatic down migrations;
 - if schema cannot support the older app, forward-fix instead of editing applied migrations;
 - production DB recovery is an Aiven disaster-recovery action followed by Ledger/state reconciliation.
@@ -210,8 +213,8 @@ Discord 403 is recorded as an incident but bot does not change permission overwr
 2. Source SHA evidence matches the intended commit when Git metadata is available.
 3. Eight surfaces are installed.
 4. `PRELAUNCH=true` during UAT.
-5. `QUEST_AUTO` shows **Discord Quest • Auto**, expected price text and `quest-auto-demo.gif` animated inside the embed,
+5. `QUEST_AUTO` shows **Discord Quest Auto**, expected price text and `quest-auto-demo.gif` animated inside the embed,
    with no standalone MP4 block and no `Questshop Surface • QUEST_AUTO` footer.
 6. Change one Admin Quest price and verify the **same message** refreshes within the Maintenance window.
-7. Restart once and confirm no duplicate Quest Auto panel or duplicate GIF attachment.
+7. Restart once and confirm no duplicate Quest Auto panel or duplicate media attachments.
 8. Continue the full checklist in `docs/uat/prelaunch.md` on the same SHA.

@@ -197,11 +197,8 @@ test('pricing route sends an intact ModalBuilder and prepares its durable sessio
   assert.equal(modalData.components[0].type, 18);
   assert.deepEqual(replies, []);
 
-  let session;
-  for (let attempt = 0; attempt < 20 && !session; attempt += 1) {
-    await setImmediate();
-    session = (await pool.query('SELECT * FROM interaction_sessions WHERE id=$1', [route.sessionId])).rows[0];
-  }
+  await runtime.pendingModalPreparations?.get(route.sessionId)?.promise;
+  const session = (await pool.query('SELECT * FROM interaction_sessions WHERE id=$1', [route.sessionId])).rows[0];
   assert.equal(session?.operation, 'PRICE_CATEGORY_PREPARE');
   assert.equal(session?.actor_id, 'owner');
 });

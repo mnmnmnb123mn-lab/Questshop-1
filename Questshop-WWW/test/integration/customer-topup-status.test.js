@@ -44,6 +44,8 @@ test('customer top-up status is ownership-bound and returns a credited result wi
     client: { users: { fetch: async () => null } },
   });
   assert.match(paymentLog.embeds[0].data.description, /gift\.truemoney\.com/);
+  assert.match(paymentLog.embeds[0].data.description, /••••1234/);
+  assert.doesNotMatch(paymentLog.embeds[0].data.description, /0812341234|Voucher Sender|0812345678/);
   await assert.rejects(() => loadCustomerTopup({ topupId, discordUserId: 'other' }, { pool }),
     (error) => error.code === 'NOT_AUTHORIZED');
 });

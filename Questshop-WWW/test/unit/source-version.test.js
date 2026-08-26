@@ -12,4 +12,8 @@ test('source revision verification compares a checked-out Git SHA without requir
   assert.deepEqual(verifyConfiguredSourceSha({ GIT_SHA: SHA }, { execute: () => { throw new Error('no git'); } }),
     { sourceSha: null, verified: false });
   assert.throws(() => verifyConfiguredSourceSha({ GIT_SHA: SHA }, { execute: () => 'b'.repeat(40) }), /does not match/);
+  assert.deepEqual(verifyConfiguredSourceSha({ GIT_SHA: 'untracked' }, { execute: () => `${SHA}\n` }),
+    { sourceSha: SHA, verified: true });
+  assert.deepEqual(verifyConfiguredSourceSha({ GIT_SHA: 'untracked' }, { execute: () => { throw new Error('no git'); } }),
+    { sourceSha: null, verified: false });
 });

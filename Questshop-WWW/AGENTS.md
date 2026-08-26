@@ -53,11 +53,12 @@ Primary references:
 
 `QUEST_AUTO` is one durable Discord message with:
 
-- fixed title **Discord Quest • Auto**;
+- fixed title **Discord Quest Auto**;
 - Owner-approved Thai copy mentioning Discord Orbs and Discord Token;
 - buttons **เริ่มทำเควส** and **เติมเงิน**;
 - dynamic active price summary derived from all four supported `TYPE` rules;
 - one exact bundled Owner-approved GIF at `src/discord/assets/quest-auto-demo.gif` rendered **inside the embed** via `attachment://quest-auto-demo.gif`;
+- one Owner-approved animated GIF at `src/discord/assets/quest-auto-thumbnail.gif` rendered as the embed thumbnail;
 - no customer-visible `Questshop Surface • QUEST_AUTO` technical footer.
 
 Price presentation:
@@ -72,13 +73,17 @@ Media source contract:
 Filename quest-auto-demo.gif
 Size     9,190,692 bytes
 SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
+
+Filename quest-auto-thumbnail.gif
+Size     822,513 bytes
+SHA-256  2d1e0e2c09138ac53384ac6272f4c8a9eedff28e2fe227ee06e26f7ef37a6542
 ```
 
-The runtime verifies size, GIF signature and SHA-256 before upload. The GIF is attached to the message only so the embed
-can reference it; it must not be presented as a separate MP4/video block above the storefront. Surface reconciliation
-edits/recovers the same durable message when price text, title/description, expected GIF attachment, embed image or the
-legacy visible technical footer drifts. Quest Auto recovery uses the stable surface nonce first and retains the old
-footer lookup only as a migration fallback for older messages.
+The runtime verifies each asset's size, signature and SHA-256 before upload. Both are attached to the message only so the
+embed can reference the animated GIF as its upper-right thumbnail and the demo GIF as its lower image; the demo GIF must not be presented as
+a separate MP4/video block above the storefront. Surface reconciliation edits/recovers the same durable message when
+price text, title/description, expected attachments, embed image/thumbnail or the legacy visible technical footer drifts.
+Quest Auto recovery uses the stable surface nonce first and retains the old footer lookup only as a migration fallback.
 
 The current Maintenance cadence is approximately 60 seconds, so Admin price changes are automatic eventual storefront
 updates, not a synchronous same-click guarantee. Do not reintroduce the standalone MP4 storefront layout or invent a

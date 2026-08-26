@@ -3,6 +3,7 @@ import { v7 as uuidv7 } from 'uuid';
 import { withTransaction } from '../../db/transaction.js';
 import { FencingLostError } from '../../shared/errors.js';
 import { recordTransition } from '../shared/transition.js';
+import { markCustomerDiscoveryAnnouncementDelivered } from '../catalog/customer-discovery-case-service.js';
 
 function projectionNonce(id) {
   return createHash('sha256').update(String(id)).digest('base64url').slice(0, 25);
@@ -56,16 +57,31 @@ export async function enqueueProjection(client, {
     RETURNING *
   `, [projectionId, projectionType, String(aggregateId), surfaceKey, projectionNonce(projectionId), notBefore])).rows[0];
 
+  const obsolete = (await client.query(`WITH candidates AS (
+      SELECT id,state,state_version FROM outbox_events
+      WHERE projection_id=$1 AND state IN ('PENDING','RETRY_WAIT')
+        AND (projection_version IS NULL OR projection_version < $2) FOR UPDATE
+    ) UPDATE outbox_events event SET state='DELIVERED',state_version=event.state_version+1,
+      delivered_at=clock_timestamp(),lease_owner=NULL,lease_expires_at=NULL
+    FROM candidates WHERE event.id=candidates.id
+    RETURNING event.*,candidates.state AS previous_state`, [projection.id, projection.desired_version])).rows;
+  for (const event of obsolete) await recordTransition(client, {
+    aggregateType: 'OUTBOX_EVENT', aggregateId: event.id, fromState: event.previous_state,
+    toState: 'DELIVERED', stateVersion: event.state_version,
+    reasonCode: 'COALESCED_BY_NEWER_PROJECTION', context: outboxContext({ trace_id: context.traceId,
+      causation_id: context.causationId }, context.actorId),
+  });
+
   await client.query(`
     INSERT INTO outbox_events(
       id, topic, aggregate_type, aggregate_id, aggregate_version,
-      projection_id, state, available_at, trace_id, causation_id
-    ) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING',
-      COALESCE($7, transaction_timestamp()), $8, $9)
-    ON CONFLICT (topic, aggregate_type, aggregate_id, aggregate_version) DO NOTHING
+      projection_id, projection_version, state, available_at, trace_id, causation_id
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING',
+      COALESCE($8, transaction_timestamp()), $9, $10)
+    ON CONFLICT (projection_id, projection_version) WHERE projection_id IS NOT NULL DO NOTHING
   `, [
     uuidv7(), topic, aggregateType, String(aggregateId), aggregateVersion,
-    projection.id, notBefore, context.traceId, context.causationId,
+    projection.id, projection.desired_version, notBefore, context.traceId, context.causationId,
   ]);
   return projection;
 }
@@ -140,16 +156,17 @@ export async function recordDelivery({
       projection = (await client.query(`
         UPDATE message_projections
         SET message_id = COALESCE($2, message_id),
-            delivered_version = desired_version,
+            delivered_version = GREATEST(delivered_version,$5),
             ping_sent_at = CASE
-              WHEN $5 AND ping_sent_at IS NULL THEN clock_timestamp()
+              WHEN $6 AND ping_sent_at IS NULL THEN clock_timestamp()
               ELSE ping_sent_at
             END,
             last_error_code = NULL, lease_owner=NULL, lease_expires_at=NULL,
             updated_at = clock_timestamp()
         WHERE id = $1 AND lease_owner=$3 AND fencing_token=$4 AND lease_expires_at>clock_timestamp()
         RETURNING *
-      `, [event.projection_id, messageId, holder, event.projection_fencing_token, pingSent])).rows[0];
+      `, [event.projection_id, messageId, holder, event.projection_fencing_token,
+        event.projection_version ?? 1, pingSent])).rows[0];
       // The projection lease is part of the same ownership contract.  If it
       // was renewed/taken by another worker, leave the event untouched for
       // that worker instead of acknowledging a stale delivery.
@@ -173,9 +190,6 @@ export async function recordDelivery({
       VALUES($1,$2,$3,'DELIVERED',$4) ON CONFLICT(outbox_id,attempt_number) DO NOTHING`,
     [uuidv7(), event.id, event.attempt_count,
       suppressQuestAnnouncement ? { suppressed: 'QUEST_EXPIRED' } : {}]);
-    await client.query(`INSERT INTO operation_metrics(id,operation,outcome,duration_ms,trace_id)
-      VALUES($1,'OUTBOX_DELIVERY','SUCCESS',GREATEST(0,floor(extract(epoch FROM clock_timestamp()-$2::timestamptz)*1000))::integer,$3)`,
-    [uuidv7(), event.created_at, event.trace_id]);
     if (projection) {
       if (projection?.projection_type === 'PAYMENT_LOG') {
         await client.query(`UPDATE topup_sensitive_payloads SET log_delivered_at=clock_timestamp()
@@ -185,18 +199,20 @@ export async function recordDelivery({
         await client.query(`UPDATE quests SET announcement_state='ANNOUNCED',
           announcement_version=announcement_version+CASE WHEN announcement_state='NOT_ANNOUNCED' THEN 1 ELSE 0 END,
           updated_at=clock_timestamp() WHERE quest_id=$1`, [projection.aggregate_id]);
+        await markCustomerDiscoveryAnnouncementDelivered(client, projection.aggregate_id, context);
       }
       // One successful render is the latest state of the projection. Older
       // queued notifications for the same message must not edit that message
       // again; they are durably coalesced rather than silently discarded.
       const coalesced = await client.query(`WITH obsolete AS (
         SELECT id,state AS previous_state FROM outbox_events
-        WHERE projection_id=$1 AND id<>$2 AND state IN ('PENDING','RETRY_WAIT') FOR UPDATE
+        WHERE projection_id=$1 AND id<>$2 AND state IN ('PENDING','RETRY_WAIT')
+          AND (projection_version IS NULL OR projection_version <= $3) FOR UPDATE
       ) UPDATE outbox_events SET state='DELIVERED',state_version=outbox_events.state_version+1,
         delivered_at=clock_timestamp(),lease_owner=NULL,lease_expires_at=NULL
         FROM obsolete WHERE outbox_events.id=obsolete.id
         RETURNING outbox_events.*,obsolete.previous_state`,
-      [event.projection_id, event.id]);
+      [event.projection_id, event.id, event.projection_version ?? projection.delivered_version]);
       for (const obsolete of coalesced.rows) await recordTransition(client, {
         aggregateType: 'OUTBOX_EVENT', aggregateId: obsolete.id, fromState: obsolete.previous_state,
         toState: 'DELIVERED', stateVersion: obsolete.state_version,

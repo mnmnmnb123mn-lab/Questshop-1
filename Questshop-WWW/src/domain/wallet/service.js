@@ -86,17 +86,26 @@ async function finalizeOrderIfTerminal(client, orderId, context) {
 export async function reserveOrderItemsInTransaction(client, { discordUserId, items }, context) {
   if (!items.length) throw new TypeError('at least one item is required');
   const total = sumCents(items.map((item) => item.amountCents));
-  let wallet = await lockWallet(client, discordUserId);
+  const wallet = await lockWallet(client, discordUserId);
   if (BigInt(wallet.available_cents) < total) {
     throw new QuestshopError('INSUFFICIENT_BALANCE', 'ยอดเงินไม่พอสำหรับจองรายการ', {
       category: 'BUSINESS',
     });
   }
   const groupId = uuidv7();
+  const originalWallet = wallet;
+  let balances = {
+    availableBefore: BigInt(wallet.available_cents),
+    reservedBefore: BigInt(wallet.reserved_cents),
+    availableAfter: BigInt(wallet.available_cents),
+    reservedAfter: BigInt(wallet.reserved_cents),
+  };
   for (const item of items) {
     const amount = BigInt(item.amountCents);
-    const balances = walletBalances(wallet, -amount, amount);
-    wallet = await updateWallet(client, wallet, balances);
+    balances = walletBalances({
+      available_cents: balances.availableAfter,
+      reserved_cents: balances.reservedAfter,
+    }, -amount, amount);
     await client.query(`
       INSERT INTO wallet_reservations(id, order_item_id, discord_user_id, amount_cents, state)
       VALUES ($1, $2, $3, $4, 'RESERVED')
@@ -125,7 +134,9 @@ export async function reserveOrderItemsInTransaction(client, { discordUserId, it
       context,
     });
   }
-  return wallet;
+  const updatedWallet = await updateWallet(client, originalWallet, balances);
+  if (!updatedWallet) throw new QuestshopError('WALLET_STATE_CONFLICT', 'ยอดเครดิตเปลี่ยนระหว่างจองรายการ');
+  return updatedWallet;
 }
 
 export async function reserveOrderItems(input, context, options = {}) {

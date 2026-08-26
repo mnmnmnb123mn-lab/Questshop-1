@@ -33,7 +33,6 @@ const external = Object.freeze({
   OWNER_ID: '123456789012345680',
   DATABASE_POOL_URL: databaseUrl('runtime'),
   DATABASE_DIRECT_URL: databaseUrl('migrator'),
-  GIT_SHA: 'a'.repeat(40),
   DATABASE_SSL_CA_INPUT: certificate,
 });
 

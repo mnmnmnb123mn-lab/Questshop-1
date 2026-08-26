@@ -18,10 +18,11 @@ after(async () => { await pool?.end(); });
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
-test('large checkout reserves all items but materializes one account job', async (t) => {
+test('large checkout reserves 100 items but materializes one account job', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
-  const trace = uuidv7(); const user = 'checkout-user';
-  const quests = Array.from({ length: 5 }, (_, index) => ({ id: `checkout-${index}`, name: `Quest ${index}`,
+  const trace = uuidv7(); const user = 'checkout-user'; const questCount = 100;
+  const totalPrice = BigInt(questCount * 500); const initialBalance = totalPrice * 2n;
+  const quests = Array.from({ length: questCount }, (_, index) => ({ id: `checkout-${index}`, name: `Quest ${index}`,
     eventName: 'WATCH_VIDEO', secondsNeeded: 60, progressSecs: 0, progress: 0, completed: false,
     completedAt: null, enrolled: true, enrolledAt: new Date().toISOString(), autoSupported: true,
     executorId: 'video', startsAt: new Date().toISOString(),
@@ -42,19 +43,19 @@ test('large checkout reserves all items but materializes one account job', async
   const options = { pool, questApiFactory: () => api };
   const context = (keyName) => createContext({ traceId: trace, actorType: 'CUSTOMER', actorId: user,
     guildId: '10000000000000002', idempotencyKey: keyName });
-  await adjustBalance({ discordUserId: user, amountCents: 5_000n, reason: 'seed' }, context('seed'), { pool });
+  await adjustBalance({ discordUserId: user, amountCents: initialBalance, reason: 'seed' }, context('seed'), { pool });
   const created = await createSession({ discordUserId: user, guildId: '10000000000000002',
     channelId: '10000000000000003', messageId: null, token: 'test-token-value', env }, context('session'), options);
   assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM checkout_quest_options
-    WHERE session_id=$1 AND admission_scope='CUSTOMER_ACCOUNT'`, [created.session.id])).rows[0].count), 5);
+    WHERE session_id=$1 AND admission_scope='CUSTOMER_ACCOUNT'`, [created.session.id])).rows[0].count), questCount);
   assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM message_projections
     WHERE projection_type='QUEST_NEW' AND aggregate_id LIKE 'checkout-%'`)).rows[0].count), 0);
   assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM message_projections
-    WHERE projection_type='CUSTOMER_QUEST_DISCOVERY' AND aggregate_id IN (
-      SELECT id::text FROM customer_quest_discoveries WHERE quest_id LIKE 'checkout-%'
-    )`)).rows[0].count), 5);
+    WHERE projection_type='CUSTOMER_QUEST_DISCOVERY_CASE' AND aggregate_id IN (
+      SELECT id::text FROM customer_quest_discovery_cases WHERE quest_id LIKE 'checkout-%'
+    )`)).rows[0].count), questCount);
   assert.equal(Number((await pool.query("SELECT count(*)::integer AS count FROM quests WHERE sale_state='CLOSED'"))
-    .rows[0].count), 5);
+    .rows[0].count), questCount);
   await assert.rejects(() => getSelectionPage({ sessionId: created.session.id, actorId: user,
     guildId: '10000000000000002', channelId: 'wrong-channel' }, context('wrong-channel'), options),
   (error) => error.code === 'NOT_AUTHORIZED');
@@ -64,7 +65,7 @@ test('large checkout reserves all items but materializes one account job', async
   const order = await confirmOrder({ sessionId: created.session.id, actorId: user,
     guildId: '10000000000000002', env }, createContext({ traceId: confirmationTrace,
     actorType: 'CUSTOMER', actorId: user, guildId: '10000000000000002', idempotencyKey: 'confirm' }), options);
-  assert.equal(order.items.length, 5);
+  assert.equal(order.items.length, questCount);
   const duplicateOrder = await confirmOrder({ sessionId: created.session.id, actorId: user,
     guildId: '10000000000000002', env }, createContext({ traceId: uuidv7(),
     actorType: 'CUSTOMER', actorId: user, guildId: '10000000000000002', idempotencyKey: 'confirm-duplicate' }), options);
@@ -82,10 +83,10 @@ test('large checkout reserves all items but materializes one account job', async
   assert.notEqual(persistedOrder.trace_id, confirmationTrace);
   assert.equal(Number((await pool.query('SELECT count(*) AS count FROM runner_jobs')).rows[0].count), 1);
   const wallet = (await pool.query('SELECT * FROM wallets WHERE discord_user_id=$1', [user])).rows[0];
-  assert.equal(BigInt(wallet.available_cents), 2_500n);
-  assert.equal(BigInt(wallet.reserved_cents), 2_500n);
+  assert.equal(BigInt(wallet.available_cents), initialBalance - totalPrice);
+  assert.equal(BigInt(wallet.reserved_cents), totalPrice);
   const secondUser = 'checkout-user-two';
-  await adjustBalance({ discordUserId: secondUser, amountCents: 5_000n, reason: 'seed' },
+  await adjustBalance({ discordUserId: secondUser, amountCents: initialBalance, reason: 'seed' },
     createContext({ traceId: trace, actorType: 'CUSTOMER', actorId: secondUser,
       guildId: '10000000000000002', idempotencyKey: 'seed-two' }), { pool });
   const secondContext = (keyName) => createContext({ traceId: trace, actorType: 'CUSTOMER', actorId: secondUser,
@@ -107,8 +108,8 @@ test('large checkout reserves all items but materializes one account job', async
     guildId: '10000000000000002', idempotencyKey: 'admin-review-stop' }), { pool });
   assert.equal(resolution.applied.status, 'STOPPED_RELEASED');
   const afterStop = (await pool.query('SELECT * FROM wallets WHERE discord_user_id=$1', [user])).rows[0];
-  assert.equal(BigInt(afterStop.available_cents), 3_000n);
-  assert.equal(BigInt(afterStop.reserved_cents), 2_000n);
+  assert.equal(BigInt(afterStop.available_cents), initialBalance - totalPrice + 500n);
+  assert.equal(BigInt(afterStop.reserved_cents), totalPrice - 500n);
   // Later lazy items do not have Runner jobs yet.  Admin decisions must still
   // work atomically: RETRY returns one to the lazy queue, while CAPTURE is an
   // explicit financial decision that does not depend on a Runner job existing.
@@ -129,12 +130,12 @@ test('large checkout reserves all items but materializes one account job', async
     guildId: '10000000000000002', idempotencyKey: 'admin-review-capture-lazy' }), { pool });
   assert.equal(captureResolution.applied.status, 'READY_TO_CLAIM');
   const afterCapture = (await pool.query('SELECT * FROM wallets WHERE discord_user_id=$1', [user])).rows[0];
-  assert.equal(BigInt(afterCapture.available_cents), 3_000n);
-  assert.equal(BigInt(afterCapture.reserved_cents), 1_500n);
+  assert.equal(BigInt(afterCapture.available_cents), initialBalance - totalPrice + 500n);
+  assert.equal(BigInt(afterCapture.reserved_cents), totalPrice - 1_000n);
   const priceChangeUser = 'checkout-user-price-change';
   const priceContext = (keyName) => createContext({ traceId: trace, actorType: 'CUSTOMER', actorId: priceChangeUser,
     guildId: '10000000000000002', idempotencyKey: keyName });
-  await adjustBalance({ discordUserId: priceChangeUser, amountCents: 5_000n, reason: 'seed' },
+  await adjustBalance({ discordUserId: priceChangeUser, amountCents: initialBalance, reason: 'seed' },
     priceContext('seed-price'), { pool });
   const priceSession = await createSession({ discordUserId: priceChangeUser, guildId: '10000000000000002',
     channelId: '10000000000000003', messageId: null, token: 'price-token', env },

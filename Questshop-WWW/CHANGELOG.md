@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added durable customer Quest discovery cases with automatic Monitor visibility checks before tests, one backoffice card per Quest, safe retry, and informational announcements decoupled from customer checkout.
+
 Questshop follows Keep a Changelog conventions while the package remains in development `0.1.x`.
 There is no production release/tag evidence yet; current work remains under `[Unreleased]`.
 
@@ -15,11 +19,28 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - `LOG_PAYMENTS` may render a full voucher link by Owner policy. Backoffice human visibility is Owner-managed;
   runtime neither performs a privacy preflight nor changes Discord permissions.
 - No Automatic Claim; successful Quest work ends at `READY_TO_CLAIM` with customer-side claim URL.
-- Release state remains **implemented-but-unverified** until live UAT passes on one exact Git SHA.
+- Release state remains **implemented-but-unverified** until live UAT passes on one deployed build.
 
 ### Added
 
-- Persistent Quest Auto storefront copy with fixed title **Discord Quest • Auto**, Discord Orbs / Discord Token guidance,
+- `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` and `LOG_SYSTEM` now attach the verified shared
+  `backoffice-log-banner.webp` beneath every event card. `LOG_SYSTEM` and system-authored Admin Audit cards use the
+  verified animated Questshop GIF thumbnail; operational cards use safe Quest artwork or global Discord avatars.
+- Durable `LOG_SYSTEM` incident stabilization: recurring code/scope pairs reopen and edit one message, operational
+  alerts require consecutive evidence, and Discord connectivity failures are grouped across affected surfaces.
+- Historical Outbox projection backlog repair with transition evidence. A deployment keeps any active lease, retains
+  only the newest queued projection refresh and normalizes its version so an old backlog cannot hold `delivered_version` behind.
+- Payment Logs now begin at `PAYMENT_QUEUED`, so a provider-worker delay remains visible and later outcomes update the
+  same durable message rather than appearing as a separate record.
+- Payment Logs render the payer's Discord profile as the upper-right thumbnail and attach the supplied
+  `payment-log-banner.webp` as one verified lower embed image on every current-state update.
+- Backoffice renderers now carry durable Trace/correlation context. Admin Audit before/after snapshots are allowlisted
+  for Discord and recursively redact credential-shaped fields before append-only persistence.
+
+- Customer-only top-up status DMs for `MANUAL_REVIEW` and an Owner's terminal `REJECTED` decision, so a delayed
+  interaction does not leave the customer without a result.
+
+- Persistent Quest Auto storefront copy with fixed title **Discord Quest Auto**, Discord Orbs / Discord Token guidance,
   and the existing **เริ่มทำเควส** / **เติมเงิน** controls.
 - Dynamic storefront price resolver for the four supported Quest task types. Equal active prices render one amount;
   differing GAME/VIDEO prices render a min-max range; incomplete configuration renders a not-ready price message.
@@ -31,6 +52,8 @@ There is no production release/tag evidence yet; current work remains under `[Un
   races and stopping an active test batch without cycling to another Monitor Token.
 - Owner-approved `src/discord/assets/quest-auto-demo.gif` generated from the supplied Quest demo video and rendered
   inside the Quest Auto embed through `attachment://quest-auto-demo.gif`.
+- Owner-approved animated `src/discord/assets/quest-auto-thumbnail.gif` displayed in the upper-right of the Quest
+  Auto embed, with bundled GIF integrity verification and surface drift repair.
 - Runtime GIF integrity verification using exact file size `9,190,692` bytes, GIF signature and SHA-256
   `c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1`.
 - Surface regression coverage for stale price detection, stale/legacy attachment replacement, invisible nonce-based
@@ -58,6 +81,42 @@ There is no production release/tag evidence yet; current work remains under `[Un
 
 ### Changed
 
+- `GIT_SHA` is no longer a required deployment Environment Variable. Production starts without it, setup does not
+  import or request it, and pre-launch evidence uses the internal `untracked` marker when no source revision is available.
+
+- TrueMoney success handling now accepts a verified `HTTP 2xx` / `SUCCESS` settlement without a provider transaction
+  ID when the exact positive THB amount and one intended receiver are confirmed. Voucher HMAC plus Top-up ID is the
+  internal settlement identity, while the nullable provider transaction column remains truthful. Error envelopes with
+  `data: null` or omitted `data` now map proven voucher outcomes safely; diagnostics retain only HTTP/content metadata,
+  body hash/length, top-level keys and a safe provider code, never the response body or PII.
+- Payment review keeps its two Owner confirmations. A blank provider transaction ID is accepted only when the stored
+  `HTTP 2xx` / amount / receiver-confirmation / voucher-HMAC evidence is complete, and the confirmed amount must match
+  the provider amount. Payment Log and customer DM now use Thai status/reason copy and state-specific colors.
+
+- `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` and `LOG_SYSTEM` now render a readable Thai event card: what happened,
+  current impact/status, a safe reason, an `ข้อมูลอ้างอิง` section, and a final `สรุป:` line.  Raw enums, JSON and
+  credential-shaped values are not main-card content.
+- Checkout audit projections now refresh the same `LOG_QUEST_OPERATIONS` message after selection, quote creation,
+  Order confirmation and expiry; the card includes up to ten selected Quest names and the current Order reference.
+- Quest-run cards now include the related Order, Quest, item and job references, while System cards translate every
+  incident code emitted by source and show operator guidance only for events that need human action.
+- Outbox delivery SLO now measures one delivery attempt instead of queue age. Pending/retry projection updates are
+  versioned and coalesced before delivery, preventing a Discord outage from amplifying its own incident backlog.
+- System incident embeds use Thai summaries, meaningful severity/resolution colors and compact diagnostics; technical
+  surface footers are no longer visible on durable anchors outside legacy marker recovery.
+- Panel/Error incidents now identify only the slowest route and error-class aggregates, never interaction input.
+- Payment, Quest-operation and Admin Log cards use Thai status summaries, safe identifiers and trace references instead
+  of raw evidence blobs. Full voucher-link recovery follows the Owner-approved Discord-only policy after encrypted
+  payload retention expires.
+
+- TrueMoney payment intent is durably checkpointed before `request.end()` begins dispatch. Any later transport,
+  timeout or incomplete-response failure is contained as ambiguous/manual review rather than retried automatically.
+- The GitHub Actions workflow now lives at the repository root and explicitly runs the `Questshop-WWW` project with
+  its own cache, artifact and Docker context.
+
+- Quest History cards now keep the account profile thumbnail, link the `Quest — progress%` line to the matching
+  Discord Quest URL, and render the bundled `quest-history-banner.png` image below every status card. Internal Account
+  ID and Support code are no longer customer-facing; the Order and credit/service details remain visible.
 - `QUEST_AUTO` no longer hardcodes `5 บาท`; it reads active supported `TYPE` price rules from PostgreSQL.
 - Quest Auto media now appears **inside the embed** as an animated GIF instead of a standalone MP4/video attachment
   block above the storefront.
@@ -65,8 +124,8 @@ There is no production release/tag evidence yet; current work remains under `[Un
   with the old footer lookup retained only as a migration fallback for older messages.
 - Quest Auto surface reconciliation detects presentation drift independently of runtime config version and edits the
   existing durable message when content, title/description, color, fields, button routes/labels/styles/emojis,
-  price text, expected GIF attachment, embed image or legacy footer is stale.
-- A missing or legacy Quest Auto attachment is cleared and replaced with `quest-auto-demo.gif` on the same surface.
+  price text, expected GIF attachments, embed image/thumbnail or legacy footer is stale.
+- Missing or legacy Quest Auto attachments are cleared and replaced with the bundled GIF and thumbnail on the same surface.
 - Admin GAME/VIDEO price changes now trigger immediate background reconciliation after the database commit instead of
   waiting for the next ~60-second Maintenance pass. Maintenance remains the fallback if immediate Discord delivery fails.
 - Monitor discovery now reconciles `expires_at` before creating a test batch. Already-expired Quest is marked `EXPIRED`,
@@ -123,6 +182,9 @@ There is no production release/tag evidence yet; current work remains under `[Un
 
 ### Security
 
+- `LOG_PAYMENTS` no longer decrypts or displays the receiver's full phone number, voucher sender name or sender phone;
+  it retains only the receiver last four digits and the Owner-approved full voucher-link exception.
+
 - Quest Auto media bytes fail closed on size/GIF-signature/hash mismatch before upload.
 - Money remains integer satang; Wallet/Ledger settlement paths retain serializable/idempotent/fencing protections.
 - Logger/Discord boundaries retain secret redaction and deny-by-default mentions; TrueMoney voucher URLs are redacted
@@ -133,7 +195,7 @@ There is no production release/tag evidence yet; current work remains under `[Un
 
 ### Automated evidence
 
-Every candidate Git SHA must freshly pass syntax/check, lint, PostgreSQL-backed coverage, LCOV upload,
+Every candidate build must freshly pass syntax/check, lint, PostgreSQL-backed coverage, LCOV upload,
 fake-adapter load test, `npm audit --audit-level=high` and Docker build. Record the exact passing workflow run with UAT;
 a previous green SHA is not evidence for a newer candidate.
 

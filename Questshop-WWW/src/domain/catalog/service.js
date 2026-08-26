@@ -201,6 +201,7 @@ export async function ingestDiscovery({
   source,
   redactedRaw = null,
   runnerConcurrency = 2,
+  skipMonitorTest = false,
 }, context, options = {}) {
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const previousQuest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE',
@@ -221,7 +222,7 @@ export async function ingestDiscovery({
     // Checkout discovery may be offered to that checked account and announced
     // after analysis, but it must not consume a Monitor credential or open
     // public sale before the scanner has independently verified it.
-    if (quest.analysis_state === 'SUPPORTED' && source === 'MONITOR' && quest.sale_state !== 'EXPIRED') {
+    if (!skipMonitorTest && quest.analysis_state === 'SUPPORTED' && source === 'MONITOR' && quest.sale_state !== 'EXPIRED') {
       await createMonitorTestBatch(client, { quest, context, force: needsRetest });
     }
     quest = needsRetest ? await pauseQuestForRetest(client, quest, context) : quest;

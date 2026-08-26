@@ -5,15 +5,16 @@ Current status remains **implemented-but-unverified**.
 
 | Requirement group | Primary implementation | Automated evidence | Live evidence still required |
 |---|---|---|---|
-| Node 22 ESM, setup, source SHA | `src/config`, setup/deploy scripts, bootstrap | env/setup/source-version tests | exact inwcloud checkout + restart |
+| Node 22 ESM and setup | `src/config`, setup/deploy scripts, bootstrap | env/setup/startup tests | intended inwcloud checkout + restart |
 | PostgreSQL TLS, roles, time | pools, migrations, role sync/validator | TLS + PostgreSQL 16 role tests | Aiven CA/role provisioning |
 | State machines, CAS, correlation | domain `states.js`, transitions, sessions | state/concurrency/crash tests | production trace sampling |
 | Wallet / immutable ledger | wallet domain, reservations, retention | debit/settlement/refund/checkpoint tests | Owner compensation sign-off |
-| TrueMoney / voucher identity | TrueMoney adapter, payment service/worker | URL/schema/HMAC/ambiguity/replay/crash tests | real low-value + ambiguous UAT |
+| TrueMoney / voucher identity | TrueMoney adapter, payment service/worker | URL/schema/HMAC/fallback-settlement/ambiguity/replay/crash tests | real low-value + ambiguous UAT |
 | Pricing / promotion | pricing resolver, Admin config service | exact-satang + category/promotion tests | Owner Admin pricing UAT |
 | Quest Auto dynamic price / UI recovery | `configuredQuestPriceRange`, price-change event, surface renderer/reconcile | equal/range/incomplete/stale-price, stale embed/button and immediate-refresh tests | visible live price and component refresh |
 | Quest Auto embedded GIF | `src/discord/assets/quest-auto-demo.gif`, `quest-auto-media.js` | exact size/GIF/hash + stale attachment/embed tests | desktop/mobile in-embed animation |
 | Quest new reward/lifetime/media | normalizer, catalog revision merge, expiry/outbox guards, `quest-new.js` | Orb/tier/media/current-revision/expired-filter tests | real Quest reward/time/artwork + historical-scan fidelity |
+| Quest History presentation | `projections.js`, `quest-history-media.js`, `quest-history-banner.png` | linked Quest URL, profile thumbnail, exact banner, safe fallback tests | Discord desktop/mobile card layout and attachment rendering |
 | Catalog / Monitor gate | catalog, discovery/test workers, contract pinning | Monitor-gate + expiry-stop + retest + fingerprint tests | real metadata drift / Monitor UAT |
 | Checkout / account lock | checkout domain + router | quote/session/account uniqueness tests | mobile checkout UAT |
 | Fair queue / Runner | runner domain, leases, executors | fairness/fencing/retry/atomic settlement tests | real Video/Desktop Quest |
@@ -26,7 +27,7 @@ Current status remains **implemented-but-unverified**.
 | Runner/review expiry recovery | Quest API client, Runner service, test gate and review service | expired Quest client/review PostgreSQL tests | verify a real deadline race keeps ambiguous work Reserved and never reseeds an expired Monitor test |
 | Health / alerts | health server, worker manager, alerts | `/statusz`, invariant/SLO tests | external alert delivery |
 | Aiven backup policy | env/deployment policy | Aiven-managed skip/audit tests | Aiven Console recovery evidence |
-| Deployment / rollback / CI | Dockerfile, workflow, deploy scripts | check/lint/coverage/load/audit/Docker | same-SHA deploy + rollback |
+| Deployment / rollback / CI | Dockerfile, workflow, deploy scripts | check/lint/coverage/load/audit/Docker | same-build UAT + rollback |
 | Release acceptance | UAT docs + closeout | source gates only | all UAT rows on one SHA |
 
 ## Quest Auto trace detail
@@ -35,10 +36,11 @@ Current status remains **implemented-but-unverified**.
 
 `src/discord/renderers/surfaces.js`
 
-- title is fixed to **Discord Quest • Auto**;
+- title is fixed to **Discord Quest Auto**;
 - approved description mentions Discord Orbs and Discord Token;
 - `questAutoPriceRangeLabel()` renders one price or a min-max range;
 - incomplete supported price configuration renders a not-ready price line;
+- animated embed thumbnail is `attachment://quest-auto-thumbnail.gif`;
 - embed image is `attachment://quest-auto-demo.gif`;
 - no customer-visible `Questshop Surface • QUEST_AUTO` footer is rendered.
 
@@ -59,19 +61,23 @@ Current status remains **implemented-but-unverified**.
 - the worker manager immediately schedules `reconcileSurfaceAnchors()` in a serialized background chain, so an Admin
   confirmation does not wait for Discord delivery and rapid price edits do not race each other;
 - the reconciliation edits the same durable `QUEST_AUTO` anchor and still uses the existing nonce/missing-message rules;
-- the surface compares expected title/description, expected GIF attachment, embed-image presence and absence of the
-  legacy visible footer, so the newly committed min-max price is detected without a runtime config-version change;
+- the surface compares expected title/description, expected GIF attachments, embed image/thumbnail and absence of
+  the legacy visible footer, so the newly committed min-max price is detected without a runtime config-version change;
 - confirmed missing Discord message may be recreated; permission/network failures preserve the pointer and incident evidence;
 - a failed immediate refresh is logged and the normal Maintenance reconciliation, approximately every 60 seconds,
   remains the repair fallback.
 
 ### Exact bundled media
 
-`src/discord/surfaces/quest-auto-media.js` + `src/discord/assets/quest-auto-demo.gif`
+`src/discord/surfaces/quest-auto-media.js` + `src/discord/assets/quest-auto-demo.gif` +
+`src/discord/assets/quest-auto-thumbnail.gif`
 
 ```text
 Size     9,190,692 bytes
 SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
+
+Thumbnail size     822,513 bytes
+Thumbnail SHA-256  2d1e0e2c09138ac53384ac6272f4c8a9eedff28e2fe227ee06e26f7ef37a6542
 ```
 
 Runtime verifies exact size, GIF signature and SHA-256 before upload. The attachment exists to back the Rich Embed image;
@@ -125,8 +131,30 @@ Outbox delivery-race suppression and Monitor-batch stop behavior.
 - supports at most one large embed image plus one distinct thumbnail and invents no artwork when Discord provides none;
 - generic projection rendering and Outbox delivery use the same `renderQuestNewProjection()` implementation.
 
+## Backoffice log and trace contract
+
+- `LOG_PAYMENTS` follows `TOPUP → payment_attempts → wallet_transactions → manual_reviews/admin_audit_logs` using
+  Top-up ID, Wallet transaction ID and Trace. It begins at `PAYMENT_QUEUED` and edits the same projection through its
+  outcome. The full voucher URL is an Owner-approved Discord-only record after the encrypted payload reaches its
+  seven-day retention boundary; a lost Discord message cannot be reconstructed with the URL after that point.
+  A `SUCCESS` response without a provider transaction ID uses the encrypted voucher identity plus Top-up ID only after
+  HTTP 2xx, exact positive THB amount and intended-single-receiver evidence all agree; it never invents a provider ID.
+- `LOG_QUEST_OPERATIONS` follows `interaction_sessions → orders/order_items → runner_jobs/runner_attempts →
+  reservations/refunds`. Credit from one Top-up can fund more than one Order, so these two chains use references and
+  wallet transactions rather than a fabricated one-to-one shared Trace.
+- `LOG_ADMIN` is append-only and rendered from allowlisted before/after fields. Credential-shaped values are redacted
+  before persistence; Trace and correlation code remain the lookup key for full PostgreSQL evidence.
+- `LOG_SYSTEM` stores only aggregate route/error-class diagnostics. Outbox backlog repair records every coalesced
+  queued event in `state_transitions` and never closes an active lease.
+- The three operational rooms use the same display contract: plain Thai explanation first, safe current status and
+  impact second, then durable identifiers in `ข้อมูลอ้างอิง`, ending with `สรุป:`.  Technical enum values and raw
+  evidence remain database lookup material rather than main Discord-card copy.
+- Backoffice event cards clear prior attachments before each edit and attach one verified common banner. System Incident
+  and system-authored Admin Audit cards also attach the verified animated Questshop logo as their thumbnail; dynamic
+  avatar/artwork lookup failure never prevents the durable Log delivery.
+
 ## Completion labels
 
 - `implemented-but-unverified`: source and automated evidence pass, but one or more live boundaries are missing.
-- `done`: all automated and applicable live boundaries pass on the same exact Git SHA.
+- `done`: all automated and applicable live boundaries pass on the same deployed build.
 - `production-ready`: must not be used before the full live checklist and Owner acceptance are complete.

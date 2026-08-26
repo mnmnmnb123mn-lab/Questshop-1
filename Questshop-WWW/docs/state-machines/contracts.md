@@ -40,9 +40,11 @@ For `QUEST_AUTO`:
 - setup/reconciliation edits the current anchor when it exists;
 - only a confirmed missing Discord message permits replacement/recreation;
 - Discord permission/network/rate-limit failures preserve the authoritative pointer and incident evidence;
-- a stale title/description/price/GIF attachment/embed image or a legacy visible technical footer is presentation drift,
+- a stale title/description/price/media attachment/embed image or thumbnail, or a legacy visible technical footer is presentation drift,
   not a Wallet/Order/Payment transition;
 - the approved `quest-auto-demo.gif` is rendered inside the Rich Embed through `attachment://quest-auto-demo.gif`;
+- the approved animated `quest-auto-thumbnail.gif` is rendered in the upper-right through
+  `attachment://quest-auto-thumbnail.gif`;
 - the customer-facing embed has no `Questshop Surface • QUEST_AUTO` footer; stable nonce lookup is the primary
   invisible-anchor recovery path and footer lookup is migration fallback only;
 - repairing Quest Auto presentation must not write financial aggregates;
@@ -50,3 +52,10 @@ For `QUEST_AUTO`:
 
 Current presentation healing is triggered by setup/restart and the normal Maintenance reconciliation path,
 approximately once every 60 seconds.
+## Customer-discovered Quest verification
+
+- Quest ที่ดึงจาก Token ของลูกค้าใช้สำหรับ Checkout ของบัญชีนั้นโดยตรง หลังตรวจข้อมูล ราคา Contract และเวลาคงเหลือ; สถานะประกาศหรือการพบใน Monitor ไม่ใช่เงื่อนไขบล็อก Checkout
+- เมื่อ Quest ยังไม่เคยพบจาก Monitor ระบบสร้าง Customer Discovery Case หนึ่งรายการต่อ Quest, เก็บลิงก์ Quest และค้นทุกบัญชี Monitor ที่มีสิทธิ์ `TEST` แบบ read-only อัตโนมัติ
+- ระบบจะเริ่ม Test mutation เฉพาะ Monitor ที่พบ Quest และยังทำ Quest ได้; `ไม่พบ Quest` เป็นผลการค้นหา ไม่ใช่ Test/Contract failure
+- การ์ดหลังบ้านเดียวกันแสดงผลค้นหา ผลทดสอบ และสถานะประกาศ ผู้ดูแลกด **ตรวจและทดสอบอีกครั้ง** ได้หลังผลไม่สำเร็จ หรือกด **ส่งประกาศ** จากข้อมูลลูกค้าได้โดยมี Audit
+- `QUEST_NEW` มีไว้แจ้งข่าวเท่านั้น และไม่เปลี่ยนสิทธิ์ Checkout หรือ Order ของลูกค้า

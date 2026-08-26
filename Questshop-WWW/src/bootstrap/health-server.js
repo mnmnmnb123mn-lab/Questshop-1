@@ -12,6 +12,7 @@ export function createHealthState() {
     workers: {},
     overview: {},
     lastError: null,
+    operationalStatus: 'HEALTHY',
   };
 }
 

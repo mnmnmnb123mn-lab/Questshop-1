@@ -17,7 +17,7 @@ function providerSuccess({ amount = '12.50', transactionId = 'provider-123' } = 
   };
 }
 
-function successfulRequest(payload, { statusCode = 200, responseEvent = 'end' } = {}) {
+function successfulRequest(payload, { statusCode = 200, responseEvent = 'end', rawBody = null } = {}) {
   return (_options, callback) => {
     const request = new EventEmitter();
     request.destroy = (error) => setImmediate(() => request.emit('error', error));
@@ -28,7 +28,7 @@ function successfulRequest(payload, { statusCode = 200, responseEvent = 'end' } 
       callback(response);
       setImmediate(() => {
         if (responseEvent === 'end') {
-          response.emit('data', Buffer.from(JSON.stringify(payload)));
+          response.emit('data', Buffer.from(rawBody ?? JSON.stringify(payload)));
           response.emit('end');
         } else if (responseEvent === 'aborted') {
           response.emit('aborted');
@@ -67,15 +67,50 @@ test('TrueMoney voucher URL accepts only canonical HTTPS campaign links', () => 
 });
 
 test('pinned TrueMoney success schema produces a verified exact-cent redemption', async () => {
-  let possiblySent = 0;
+  let checkpointed = 0;
   const result = await redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
-    onPossiblySent: () => { possiblySent += 1; }, requestFactory: successfulRequest(providerSuccess()) });
-  assert.equal(possiblySent, 1);
-  assert.deepEqual(result, {
+    onDispatchCheckpoint: () => { checkpointed += 1; }, requestFactory: successfulRequest(providerSuccess()) });
+  assert.equal(checkpointed, 1);
+  const { providerEvidence, ...settlement } = result;
+  assert.deepEqual(settlement, {
     outcome: 'REDEEMED', amountCents: 1_250n, currency: 'THB', senderName: 'Voucher Sender',
     senderPhone: '0812345678', providerCode: 'SUCCESS', httpStatus: 200,
     receiverConfirmation: 'REQUEST_BOUND_SUCCESS', providerTransactionId: 'provider-123',
   });
+  assert.equal(providerEvidence.settlementIdentity, 'PROVIDER_TRANSACTION_ID');
+  assert.equal(providerEvidence.providerTransactionIdPresent, true);
+  assert.equal(providerEvidence.bodySha256.length, 64);
+});
+
+test('SUCCESS without a provider transaction ID is still a verified settlement', async () => {
+  const result = await redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
+    requestFactory: successfulRequest(providerSuccess({ transactionId: null })) });
+  assert.equal(result.outcome, 'REDEEMED');
+  assert.equal(result.amountCents, 1_250n);
+  assert.equal(result.providerTransactionId, null);
+  assert.equal(result.providerEvidence.settlementIdentity, 'VOUCHER_HMAC');
+  assert.equal(result.providerEvidence.providerTransactionIdPresent, false);
+});
+
+test('error envelopes with null or missing data use the provider code safely', async () => {
+  const expired = await redeemVoucher({ code: voucherCode, receiverPhone: '0912345678', requestFactory: successfulRequest({
+    status: { code: 'VOUCHER_EXPIRED' }, data: null,
+  }, { statusCode: 400 }) });
+  assert.equal(expired.outcome, 'EXPIRED');
+  assert.equal(expired.providerCode, 'VOUCHER_EXPIRED');
+  assert.equal(expired.httpStatus, 400);
+
+  const used = await redeemVoucher({ code: voucherCode, receiverPhone: '0912345678', requestFactory: successfulRequest({
+    status: { code: 'VOUCHER_OUT_OF_STOCK' }, extra: { ignored: true },
+  }, { statusCode: 400 }) });
+  assert.equal(used.outcome, 'ALREADY_REDEEMED');
+  assert.equal(used.providerCode, 'VOUCHER_OUT_OF_STOCK');
+
+  const unknown = await redeemVoucher({ code: voucherCode, receiverPhone: '0912345678', requestFactory: successfulRequest({
+    status: { code: 'UNRECOGNIZED_PROVIDER_RESULT' }, data: null,
+  }, { statusCode: 400 }) });
+  assert.equal(unknown.outcome, 'AMBIGUOUS');
+  assert.equal(unknown.httpStatus, 400);
 });
 
 test('incompatible provider schema is rejected before any financial result is returned', async () => {
@@ -97,6 +132,12 @@ test('SUCCESS requires a successful HTTP status and consistent single-recipient 
   (error) => error.code === 'PROVIDER_CONFIRMATION_INCOMPLETE' && error.category === 'PROVIDER_SCHEMA');
 });
 
+test('ambiguous HTTP responses retain their safe status for payment diagnostics', async () => {
+  await assert.rejects(() => redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
+    requestFactory: successfulRequest(null, { statusCode: 403, rawBody: '<html>forbidden</html>' }) }),
+  (error) => error.code === 'PROVIDER_HTTP_AMBIGUOUS' && error.details?.httpStatus === 403);
+});
+
 test('SUCCESS rejects zero amounts and unsafe numeric transaction ids', async () => {
   await assert.rejects(() => redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
     requestFactory: successfulRequest(providerSuccess({ amount: '0.00' })) }),
@@ -113,11 +154,42 @@ test('response stream abort after dispatch is always ambiguous', async () => {
   (error) => error.code === 'PROVIDER_RESULT_AMBIGUOUS' && error.category === 'AMBIGUOUS');
 });
 
-test('transport error after request.finish is ambiguous, whereas a proven unsent request is retryable', async () => {
+test('any transport error after request.end is ambiguous even when finish has not fired', async () => {
   await assert.rejects(() => redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
     requestFactory: failingRequest({ afterFinish: true }) }), (error) => error.code === 'PROVIDER_RESULT_AMBIGUOUS'
       && error.retryable === false);
   await assert.rejects(() => redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
-    requestFactory: failingRequest({ afterFinish: false }) }), (error) => error.code === 'PROVIDER_NOT_SENT'
-      && error.retryable === true);
+    requestFactory: failingRequest({ afterFinish: false }) }), (error) => error.code === 'PROVIDER_RESULT_AMBIGUOUS'
+      && error.retryable === false && error.category === 'AMBIGUOUS');
+});
+
+test('durable dispatch checkpoint completes before request.end and blocks dispatch on failure', async () => {
+  const calls = [];
+  const requestFactory = () => {
+    const request = new EventEmitter();
+    request.destroy = () => {};
+    request.end = () => {
+      calls.push('end');
+      setImmediate(() => request.emit('error', new Error('stop after ordering check')));
+    };
+    return request;
+  };
+  await assert.rejects(
+    () => redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
+      onDispatchCheckpoint: () => calls.push('checkpoint'), requestFactory }),
+    (error) => error.code === 'PROVIDER_RESULT_AMBIGUOUS',
+  );
+  assert.deepEqual(calls, ['checkpoint', 'end']);
+
+  let ended = false;
+  await assert.rejects(() => redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
+    onDispatchCheckpoint: () => { throw new Error('database unavailable'); },
+    requestFactory: () => {
+      const request = new EventEmitter();
+      request.destroy = () => {};
+      request.end = () => { ended = true; };
+      return request;
+    },
+  }), (error) => error.code === 'PAYMENT_INTENT_CHECKPOINT_FAILED' && error.retryable === true);
+  assert.equal(ended, false);
 });

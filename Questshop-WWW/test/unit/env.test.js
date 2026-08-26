@@ -85,8 +85,9 @@ test('boolean configuration rejects typos instead of silently disabling a safety
   assert.throws(() => loadEnvironment({ ...base, PRELAUNCH: 'yes' }));
 });
 
-test('production refuses an unknown deployment revision', () => {
-  assert.throws(() => loadEnvironment({ ...base, GIT_SHA: 'unknown' }), /GIT_SHA/);
+test('production does not require an operator-supplied deployment revision', () => {
+  const { GIT_SHA: _unused, ...withoutSha } = base;
+  assert.equal(loadEnvironment(withoutSha).GIT_SHA, 'untracked');
 });
 
 test('production requires verify-full on every configured database URL', () => {

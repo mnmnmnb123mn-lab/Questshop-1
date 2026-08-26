@@ -125,9 +125,10 @@ async function decryptPaymentSecrets(pool, topup, env) {
 }
 
 function normalizeProviderResult(result, topup) {
-  if (result.outcome === 'REDEEMED' && !result.providerTransactionId) {
-    return { ...result, outcome: 'AMBIGUOUS', providerCode: 'PROVIDER_TRANSACTION_ID_MISSING' };
-  }
+  // A real SUCCESS response can legitimately omit a provider transaction ID.
+  // The adapter has already verified the HTTP status, exact THB amount and
+  // single receiver confirmation; voucher HMAC + top-up ID is then the local
+  // idempotency identity.  Do not downgrade this settled payment to review.
   if (result.outcome === 'RETRY_WAIT' && topup.attempt_count >= 3) return { ...result, outcome: 'FAILED' };
   return result;
 }
@@ -167,9 +168,11 @@ async function openCircuit(pool, error, context, breaker) {
 function failureResult(error, topup) {
   const ambiguous = error.category === 'AMBIGUOUS' || error.category === 'PROVIDER_SCHEMA'
     || error.code === 'PROVIDER_RESULT_AMBIGUOUS';
-  if (ambiguous) return { outcome: 'AMBIGUOUS', providerCode: error.code ?? error.name };
+  if (ambiguous) return { outcome: 'AMBIGUOUS', providerCode: error.code ?? error.name,
+    httpStatus: error.details?.httpStatus ?? null, providerEvidence: error.details ?? null };
   return { outcome: error.retryable && topup.attempt_count < 3 ? 'RETRY_WAIT' : 'FAILED',
-    providerCode: error.code ?? error.name };
+    providerCode: error.code ?? error.name, httpStatus: error.details?.httpStatus ?? null,
+    providerEvidence: error.details ?? null };
 }
 
 async function recordProviderFailure({ topup, attempt, error, context, breaker, pool }) {
@@ -214,7 +217,10 @@ async function processClaimedPayment({ topup, breaker, holder, env, signal, auto
     try {
       const { code, phone } = await decryptPaymentSecrets(pool, topup, env);
       result = normalizeProviderResult(await redeemVoucher({ code, receiverPhone: phone, signal: heartbeat.signal,
-        onPossiblySent: () => markPaymentPossiblySent({ attemptId: attempt.id }, { pool }) }), topup);
+        onDispatchCheckpoint: async () => {
+          const checkpoint = await markPaymentPossiblySent({ attemptId: attempt.id }, { pool });
+          if (!checkpoint) throw new Error('Payment intent checkpoint was not persisted');
+        } }), topup);
     } catch (error) {
       await recordProviderFailure({ topup, attempt, error, context, breaker, pool });
       return;

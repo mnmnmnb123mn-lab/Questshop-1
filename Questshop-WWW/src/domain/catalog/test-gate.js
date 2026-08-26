@@ -83,10 +83,20 @@ async function enqueueFailureAlert(client, batch, quest, error, context) {
       ) VALUES($1,$2,$3,'OPEN',$4,$5) RETURNING *`, [
       uuidv7(), quest.quest_id, batch.id, errorPayload, context.traceId,
     ])).rows[0];
-  await enqueueProjection(client, {
+  if (!batch.customer_discovery_case_id) await enqueueProjection(client, {
     projectionType: 'QUEST_TEST_FAILURE', aggregateType: 'QUEST_TEST_ALERT', aggregateId: alert.id,
     aggregateVersion: alert.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context,
   });
+  if (batch.customer_discovery_case_id) {
+    const updatedCase = (await client.query(`UPDATE customer_quest_discovery_cases SET verification_state='TEST_FAILED',
+      state_version=state_version+1,current_test_batch_id=$2,last_result=$3,trace_id=$4,updated_at=clock_timestamp()
+      WHERE id=$1 RETURNING *`, [batch.customer_discovery_case_id, batch.id, {
+      code: errorPayload.code, message: errorPayload.message,
+    }, context.traceId])).rows[0];
+    if (updatedCase) await enqueueProjection(client, { projectionType: 'CUSTOMER_QUEST_DISCOVERY_CASE',
+      aggregateType: 'CUSTOMER_QUEST_DISCOVERY_CASE', aggregateId: updatedCase.id,
+      aggregateVersion: updatedCase.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context });
+  }
   return alert;
 }
 
@@ -106,7 +116,9 @@ async function failBatch(client, batch, quest, error, context) {
   return { batch: failed, alert, queued: null };
 }
 
-export async function createMonitorTestBatch(client, { quest, context, requestedBy = 'SYSTEM', force = false }) {
+export async function createMonitorTestBatch(client, {
+  quest, context, requestedBy = 'SYSTEM', force = false, monitorIds = null, customerDiscoveryCaseId = null,
+}) {
   if (await questDeadlinePassed(client, quest)) {
     return { batch: null, queued: null, reused: false, skipped: 'QUEST_EXPIRED' };
   }
@@ -114,13 +126,21 @@ export async function createMonitorTestBatch(client, { quest, context, requested
     WHERE quest_id=$1 AND contract_hash IS NOT DISTINCT FROM $2
     ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [quest.quest_id, quest.current_contract_hash])).rows[0];
   if (existing && (ACTIVE_BATCH_STATES.has(existing.state) || !force)) {
+    if (customerDiscoveryCaseId && !existing.customer_discovery_case_id) {
+      await client.query(`UPDATE quest_test_batches SET customer_discovery_case_id=$2,updated_at=clock_timestamp()
+        WHERE id=$1`, [existing.id, customerDiscoveryCaseId]);
+      existing.customer_discovery_case_id = customerDiscoveryCaseId;
+    }
     return { batch: existing, queued: null, reused: true };
   }
-  const monitorOrder = await activeTestMonitorIds(client);
+  const availableMonitors = await activeTestMonitorIds(client);
+  const monitorOrder = monitorIds == null
+    ? availableMonitors
+    : monitorIds.filter((id) => availableMonitors.includes(id));
   const batch = (await client.query(`INSERT INTO quest_test_batches(
-        id,quest_id,state,monitor_order,contract_hash,trace_id,requested_by
-  ) VALUES($1,$2,'QUEUED',$3,$4,$5,$6) RETURNING *`, [
-    uuidv7(), quest.quest_id, monitorOrder, quest.current_contract_hash, context.traceId, requestedBy,
+        id,quest_id,state,monitor_order,contract_hash,trace_id,requested_by,customer_discovery_case_id
+  ) VALUES($1,$2,'QUEUED',$3,$4,$5,$6,$7) RETURNING *`, [
+    uuidv7(), quest.quest_id, monitorOrder, quest.current_contract_hash, context.traceId, requestedBy, customerDiscoveryCaseId,
   ])).rows[0];
   const target = await activeMonitorAt(client, monitorOrder, 0);
   if (!target) return failBatch(client, batch, quest,
@@ -178,6 +198,22 @@ export async function markMonitorTestBatchPassed(client, { run, context }) {
     projectionType: 'QUEST_TEST_FAILURE', aggregateType: 'QUEST_TEST_ALERT', aggregateId: alert.id,
     aggregateVersion: alert.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context,
   });
+  if (batch.customer_discovery_case_id) {
+    const updatedCase = (await client.query(`UPDATE customer_quest_discovery_cases SET verification_state='PASSED',
+      announcement_state=CASE WHEN announcement_state='NOT_ANNOUNCED' THEN 'QUEUED' ELSE announcement_state END,
+      state_version=state_version+1,current_test_batch_id=$2,last_result=last_result||$3::jsonb,
+      trace_id=$4,updated_at=clock_timestamp() WHERE id=$1 RETURNING *`, [batch.customer_discovery_case_id, batch.id,
+    { test: 'PASSED', testedMonitorId: run.monitor_id, attempts: run.attempt_in_monitor }, context.traceId])).rows[0];
+    if (updatedCase) {
+      if (updatedCase.announcement_state === 'QUEUED') await enqueueProjection(client, {
+        projectionType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: batch.quest_id,
+        aggregateVersion: updatedCase.state_version, surfaceKey: 'QUEST_NEW', context,
+      });
+      await enqueueProjection(client, { projectionType: 'CUSTOMER_QUEST_DISCOVERY_CASE',
+        aggregateType: 'CUSTOMER_QUEST_DISCOVERY_CASE', aggregateId: updatedCase.id,
+        aggregateVersion: updatedCase.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context });
+    }
+  }
   return batch;
 }
 

@@ -39,6 +39,7 @@ test('Quest announcement shows Orbs, Quest lifetime, and two static Quest images
 
   assert.match(embed.title, /พบ Quest ใหม่/);
   assert.ok(embed.description.includes('**รางวัล:** 750 Orbs'));
+  assert.ok(embed.description.includes('**[ดู Quest ได้ที่นี่](' + row.url + ')**\n\n**เริ่ม Quest:**'));
   assert.ok(embed.description.includes(`**เริ่ม Quest:** <t:${startUnix}:F>`));
   assert.ok(embed.description.includes(`**หมดอายุ:** <t:${expiryUnix}:F>`));
   assert.doesNotMatch(embed.description, /ตรวจพบ|อัปเดต/);

@@ -38,6 +38,11 @@ test('same voucher submitted concurrently has one durable owner', async (t) => {
   ]);
   assert.equal(new Set(results.map((result) => result.topup.id)).size, 1);
   assert.equal(Number((await pool.query("SELECT count(*) AS count FROM topups WHERE discord_user_id='voucher-user'")).rows[0].count), 1);
+  const logEvents = (await pool.query(`SELECT count(*)::integer AS count FROM outbox_events o
+    JOIN message_projections p ON p.id=o.projection_id
+    WHERE p.projection_type='PAYMENT_LOG' AND p.surface_key='LOG_PAYMENTS'
+      AND p.aggregate_id=$1`, [results[0].topup.id])).rows[0].count;
+  assert.equal(Number(logEvents), 1);
 });
 
 test('same voucher cannot reveal another customer durable top-up', async (t) => {

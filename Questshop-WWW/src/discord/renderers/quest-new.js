@@ -87,7 +87,7 @@ export async function renderQuestNewProjection(pool, projection) {
     '',
     `**เริ่ม Quest:** ${timestamp(quest.starts_at)}`,
     `**หมดอายุ:** ${timestamp(quest.expires_at)}`,
-  ].filter(Boolean).join('\n');
+  ].filter((line) => line != null).join('\n');
 
   const embed = new EmbedBuilder().setColor(QUEST_COLOR)
     .setTitle(title(`🎉 พบ Quest ใหม่: ${escape(quest.name)}`))

@@ -23,6 +23,13 @@ export function topupAmountNeedsReview(amountCents, policy = DEFAULT_PAYMENT_POL
   return paymentPolicyNeedsReview(amountCents, policy);
 }
 
+async function enqueueCustomerTopupStatus(client, topup, context) {
+  if (!['MANUAL_REVIEW', 'REJECTED'].includes(topup.status)) return;
+  await enqueueProjection(client, { projectionType: 'TOPUP_STATUS_DM', aggregateType: 'TOPUP',
+    aggregateId: topup.id, aggregateVersion: topup.state_version, surfaceKey: `DM:${topup.discord_user_id}`,
+    topic: 'TOPUP_STATUS_DM', context });
+}
+
 async function findVoucher(client, hashes) {
   for (const candidate of hashes) {
     const row = (await client.query(`
@@ -65,6 +72,34 @@ function paymentAttemptError(outcome, providerCode) {
   if (outcome === 'AMBIGUOUS') return { errorClass: 'AMBIGUOUS', errorCode: providerCode ?? outcome };
   if (outcome === 'RETRY_WAIT') return { errorClass: 'RETRYABLE_PROVIDER', errorCode: providerCode ?? outcome };
   return { errorClass: 'PROVIDER_RESULT', errorCode: providerCode ?? outcome };
+}
+
+function safeProviderEvidence(result) {
+  const source = result.providerEvidence ?? {};
+  const httpStatus = Number.isInteger(result.httpStatus) && result.httpStatus >= 100 && result.httpStatus <= 599
+    ? result.httpStatus : null;
+  const bodyLength = Number.isInteger(source.bodyLength) && source.bodyLength >= 0 && source.bodyLength <= 262144
+    ? source.bodyLength : null;
+  const bodySha256 = typeof source.bodySha256 === 'string' && /^[a-f0-9]{64}$/i.test(source.bodySha256)
+    ? source.bodySha256.toLowerCase() : null;
+  const contentType = typeof source.contentType === 'string' && source.contentType.length <= 128
+    ? source.contentType : null;
+  const topLevelKeys = Array.isArray(source.topLevelKeys)
+    ? source.topLevelKeys.filter((key) => typeof key === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(key)).slice(0, 12) : [];
+  const providerCode = typeof result.providerCode === 'string' && /^[A-Z0-9_]{1,100}$/.test(result.providerCode)
+    ? result.providerCode : null;
+  return {
+    httpStatus,
+    contentType,
+    bodyLength,
+    bodySha256,
+    topLevelKeys,
+    providerCode,
+    receiverConfirmation: result.receiverConfirmation ?? null,
+    settlementIdentity: source.settlementIdentity === 'VOUCHER_HMAC' || source.settlementIdentity === 'PROVIDER_TRANSACTION_ID'
+      ? source.settlementIdentity : null,
+    providerTransactionIdPresent: source.providerTransactionIdPresent === true,
+  };
 }
 
 function amountWarningCode(amountCents, policy) {
@@ -147,6 +182,12 @@ export async function submitVoucher({ discordUserId, voucherUrl, env }, context,
         });
         topup = updated;
       }
+      // The durable payment log begins before any provider call.  If the
+      // worker is delayed or unavailable, Owner can still see the accepted
+      // voucher in its queued state and later updates edit this same message.
+      await enqueueProjection(client, { projectionType: 'PAYMENT_LOG', aggregateType: 'TOPUP',
+        aggregateId: topup.id, aggregateVersion: topup.state_version,
+        surfaceKey: 'LOG_PAYMENTS', context });
       return { topup, idempotent: false };
     });
   } catch (error) {
@@ -231,15 +272,19 @@ export async function recordProviderResult({ topup, attemptId, result, policy = 
     if (!(TOPUP_TRANSITIONS[locked.status] ?? []).includes(next)) {
       throw new QuestshopError('TOPUP_TRANSITION_INVALID', `${locked.status} cannot become ${next}`);
     }
-    const attemptError = paymentAttemptError(next, result.providerCode);
+    const providerCode = typeof result.providerCode === 'string' && /^[A-Z0-9_]{1,100}$/.test(result.providerCode)
+      ? result.providerCode : null;
+    const providerHttpStatus = Number.isInteger(result.httpStatus) && result.httpStatus >= 100 && result.httpStatus <= 599
+      ? result.httpStatus : null;
+    const attemptError = paymentAttemptError(next, providerCode);
     const effectivePolicy = policy ?? await loadPaymentPolicy(client);
     const warningCode = amountWarningCode(result.amountCents, effectivePolicy);
     await client.query(`
       UPDATE payment_attempts SET dispatch_state = $2, provider_status_code = $3,
         provider_http_status = $4, provider_evidence = $5,
         error_class=$6,error_code=$7,completed_at = clock_timestamp() WHERE id = $1
-    `, [attemptId, paymentAttemptState(next), result.providerCode ?? null, result.httpStatus ?? null,
-      { receiverConfirmation: result.receiverConfirmation ?? null }, attemptError.errorClass, attemptError.errorCode]);
+    `, [attemptId, paymentAttemptState(next), providerCode, providerHttpStatus,
+      safeProviderEvidence(result), attemptError.errorClass, attemptError.errorCode]);
     let updated = (await client.query(`
       UPDATE topups SET status = $2, state_version = state_version + 1,
         provider_transaction_id = $3, amount_cents = $4::bigint, currency = $5,
@@ -254,7 +299,7 @@ export async function recordProviderResult({ topup, attemptId, result, policy = 
       WHERE id = $1 AND state_version = $9 RETURNING *
     `, [topup.id, next, result.providerTransactionId ?? null, result.amountCents ?? null,
       result.currency ?? null, result.senderName ?? null, result.senderPhone ?? null,
-      result.providerCode ?? null, locked.state_version, topup.attempt_count, warningCode])).rows[0];
+      providerCode, locked.state_version, topup.attempt_count, warningCode])).rows[0];
     if (!updated) throw new QuestshopError('TOPUP_STALE', 'Top-up changed concurrently');
     await recordTransition(client, { aggregateType: 'TOPUP', aggregateId: topup.id,
       fromState: locked.status, toState: next, stateVersion: updated.state_version, context });
@@ -274,6 +319,7 @@ export async function recordProviderResult({ topup, attemptId, result, policy = 
     }
     await enqueueProjection(client, { projectionType: 'PAYMENT_LOG', aggregateType: 'TOPUP',
       aggregateId: topup.id, aggregateVersion: updated.state_version, surfaceKey: 'LOG_PAYMENTS', context });
+    await enqueueCustomerTopupStatus(client, updated, context);
     return updated;
   });
 }
@@ -299,6 +345,7 @@ async function moveRedeemedTopupToReviewInTransaction(client, { topupId, reason 
     reason, financial: true, ownerOnly: true, context });
   await enqueueProjection(client, { projectionType: 'PAYMENT_LOG', aggregateType: 'TOPUP',
     aggregateId: topupId, aggregateVersion: updated.state_version, surfaceKey: 'LOG_PAYMENTS', context });
+  await enqueueCustomerTopupStatus(client, updated, context);
   return { topup: updated, review, idempotent: false };
 }
 

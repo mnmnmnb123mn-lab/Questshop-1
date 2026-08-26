@@ -7,7 +7,7 @@ Questshop คือบอท Discord สำหรับรับทำ Discord Q
 
 > [!IMPORTANT]
 > สถานะ release ปัจจุบันคือ **implemented-but-unverified** จนกว่า Discord, TrueMoney, Quest,
-> Aiven/inwcloud และ Owner UAT จะผ่านบน Git SHA เดียวกันตาม [Pre-launch UAT](docs/uat/prelaunch.md).
+> Aiven/inwcloud และ Owner UAT จะผ่านบน build เดียวกันตาม [Pre-launch UAT](docs/uat/prelaunch.md).
 
 > [!WARNING]
 > Quest Engine ใช้ Discord user token / self-bot behavior ซึ่งอาจขัดเงื่อนไขของ Discord และทำให้บัญชี
@@ -16,7 +16,7 @@ Questshop คือบอท Discord สำหรับรับทำ Discord Q
 ## หน้าร้าน Quest Auto ปัจจุบัน
 
 `/quest-auto` ติดตั้ง Surface ถาวรหนึ่งข้อความ และการเรียกซ้ำจะ update/move ข้อความเดิมแทนการสร้าง panel ซ้อน.
-หน้าร้านใช้หัวข้อ **Discord Quest • Auto** พร้อมปุ่ม **เริ่มทำเควส** และ **เติมเงิน**.
+หน้าร้านใช้หัวข้อ **Discord Quest Auto** พร้อมปุ่ม **เริ่มทำเควส** และ **เติมเงิน**.
 
 ข้อความหลัก:
 
@@ -37,7 +37,7 @@ Questshop คือบอท Discord สำหรับรับทำ Discord Q
 Maintenance worker ปัจจุบันรันประมาณทุก **60 วินาที** ดังนั้นการแก้ราคาบนข้อความเดิมเป็น automatic eventual refresh,
 ไม่ใช่ synchronous update ณ จังหวะกดปุ่มยืนยันราคา.
 
-### GIF หน้าร้านภายใน Embed
+### Thumbnail และ GIF หน้าร้านภายใน Embed
 
 Quest Auto ใช้ GIF ที่แปลงจากวิดีโอเดโมที่ Owner ให้มาและเก็บไว้ตรงนี้:
 
@@ -52,11 +52,20 @@ Size    9,190,692 bytes
 SHA-256 c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
 ```
 
-ก่อนส่งเข้า Discord บอทตรวจ size, GIF signature และ SHA-256. จากนั้นแนบไฟล์ไว้กับข้อความและให้ Rich Embed
-อ้างผ่าน `attachment://quest-auto-demo.gif` ทำให้ภาพเคลื่อนไหวอยู่ **ภายในกรอบ Embed** แทนการแสดง MP4
-เป็นก้อนวิดีโอแยกด้านบน.
+รูปอัญมณีเคลื่อนไหวขวาบนเก็บเป็น GIF:
 
-ถ้าข้อความเดิมยังมี MP4/attachment รุ่นเก่า ระบบจะ clear attachment เก่าแล้วแทนด้วย GIF บน **ข้อความเดิม**.
+```text
+src/discord/assets/quest-auto-thumbnail.gif
+Size    822,513 bytes
+SHA-256 2d1e0e2c09138ac53384ac6272f4c8a9eedff28e2fe227ee06e26f7ef37a6542
+```
+
+ก่อนส่งเข้า Discord บอทตรวจ size, signature และ SHA-256 ของทั้งสองไฟล์ จากนั้น Rich Embed อ้าง GIF เคลื่อนไหว
+เป็น Thumbnail ขวาบนผ่าน `attachment://quest-auto-thumbnail.gif` และอ้าง GIF เดโมด้านล่างผ่าน
+`attachment://quest-auto-demo.gif` ทำให้ภาพเคลื่อนไหวอยู่ **ภายในกรอบ Embed** แทนการแสดง MP4 แยกด้านบน.
+
+ถ้าข้อความเดิมยังมี MP4/attachment รุ่นเก่าหรือไม่มี Thumbnail ระบบจะ clear attachment เก่าแล้วแทนด้วย GIF ทั้งคู่
+บน **ข้อความเดิม**.
 Quest Auto ยังเอา footer เทคนิค `Questshop Surface • QUEST_AUTO` ออกจากหน้าที่ลูกค้าเห็น และใช้ stable
 Discord nonce เป็นตัวช่วยกู้ anchor; footer แบบเก่ายังคงเป็น migration fallback สำหรับข้อความรุ่นก่อนเท่านั้น.
 
@@ -77,6 +86,9 @@ Confirm Order
 - Wallet ห้ามติดลบ; ไม่มีถอน/โอน; Refund เป็น Wallet credit
 - Ledger / Admin audit / release evidence เป็น append-only ตาม contract
 - TrueMoney หลัง request อาจส่งสำเร็จแล้วห้าม blind retry
+- ผล `HTTP 2xx` + `SUCCESS` ที่ยืนยันยอด THB เป็นบวกและผู้รับหนึ่งคน จะเพิ่มเครดิตได้แม้ TrueMoney
+  ไม่ส่งเลขธุรกรรม: ระบบใช้ voucher HMAC กับ Top-up ID เป็นหลักฐานภายในและบันทึกเลขธุรกรรมเป็น `NULL`
+  ตามความจริง หากหลักฐานข้อใดไม่ครบจะส่ง Owner ตรวจสอบแทน
 - หนึ่ง Quest account มี active job ได้ไม่เกินหนึ่งงานทั่วระบบ
 - Monitor ทุกบัญชีทำ Scan + Test; Monitor-discovered Quest ยัง private จน test ผ่านหรือ Admin ใช้ audited **ส่งเลย**
 - customer-discovered Quest อาจถูกเสนอเฉพาะ account นั้นตาม policy แต่ไม่ประกาศ `quest-new` อัตโนมัติ:
@@ -90,6 +102,18 @@ Owner ใช้ `OWNER_ID`; Admin คนอื่นต้องมี Discord `
 
 ตาม Owner policy บอทไม่ตรวจ human visibility/privacy ของห้องหลังบ้าน. `LOG_PAYMENTS` อาจมี full TrueMoney voucher link;
 Owner ต้องตั้ง channel visibility เอง. Discord 403 ถูกบันทึกเป็น incident แต่บอทไม่เปลี่ยน permission ให้เอง.
+payload ซองที่เข้ารหัสจะถูกเก็บตาม retention 7 วัน: ลิงก์เต็มในข้อความ `LOG_PAYMENTS` เดิมยังอยู่ตามนโยบาย Owner
+แต่หากข้อความนั้นสูญหายหลังครบอายุ ระบบจะกู้ได้เพียงการ์ดแบบปกปิดเท่านั้น.
+
+Payment Log แสดงสถานะภาษาไทย, HTTP status ที่ปลอดภัย และวิธีอ้างอิงรายการโดยไม่แสดง response body, ชื่อหรือ
+เบอร์ผู้ส่งจาก Provider. กรณีไม่มีเลขธุรกรรมแต่หลักฐานรับเงินครบจะแสดงว่าอ้างอิงด้วย “รหัสซองที่เข้ารหัสและ
+Top-up ID”; Owner ยืนยัน Manual Review แบบนี้ได้สองครั้งและต้องใช้ยอดที่ตรงกับผล TrueMoney เท่านั้น.
+
+`LOG_QUEST_OPERATIONS`, `LOG_ADMIN` และ `LOG_SYSTEM` แสดงคำอธิบายภาษาไทยก่อนข้อมูลเทคนิคเสมอ:
+การ์ดบอกสิ่งที่เกิดขึ้น สถานะหรือผลกระทบ เหตุผลที่อ่านง่าย และปิดท้ายด้วย `ข้อมูลอ้างอิง` กับ `สรุป:`
+เพื่อให้ผู้ดูแลค้นต่อในฐานข้อมูลได้โดยไม่ต้องอ่านข้อความดิบใน Discord.
+การ์ดทั้งสามห้องมีแถบ `backoffice-log-banner.webp` ด้านล่าง; รูปขวาบนใช้ Quest artwork หรือ global Discord profile
+เมื่อมีข้อมูล และ `LOG_SYSTEM` ใช้โลโก้ GIF ที่ตรวจ integrity แล้ว.
 
 การติดตั้งครั้งแรกยังเปิดบอทและแผง Owner ได้แม้ยังไม่มี TrueMoney receiver: Health จะแสดง
 `MISSING_RECEIVER` และระบบรับซองจะปฏิเสธอย่างปลอดภัยจนกว่าจะเพิ่ม receiver ที่ Active. หาก Provider รับซองสำเร็จ
@@ -111,7 +135,6 @@ Owner ต้องตั้ง channel visibility เอง. Discord 403 ถู�
 | `DATA_ENCRYPTION_KEYS_JSON` | Data encryption keyring |
 | `VOUCHER_HMAC_KEYS_JSON` | Voucher HMAC keyring |
 | `BACKUP_MODE` | Aiven ใช้ `AIVEN_MANAGED` |
-| `GIT_SHA` | SHA เต็ม 40 ตัวของ source ที่ deploy |
 | `PRELAUNCH` | UAT ใช้ `true` |
 | `TIMEZONE` | `Asia/Bangkok` |
 | `RUNNER_CONCURRENCY` | ค่าเริ่มต้น `2` |
@@ -167,6 +190,9 @@ start         → Questshop ready
 /log-admin
 /log-system
 ```
+
+หน้าประวัติ Quest คงรูปโปรไฟล์บัญชีไว้ขวาบน แสดง Order และสถานะเครดิตแบบย่อ โดยบรรทัด `ชื่อ Quest — ความคืบหน้า%`
+กดเปิด Quest ที่ตรงรายการได้ และมีแถบสี `quest-history-banner.png` แนบอยู่ด้านล่างของทุกการ์ด
 
 ## Health endpoints
 
@@ -224,4 +250,4 @@ docker build -t questshop:local .
 - Aiven TLS/role provisioning, inwcloud restart และ health endpoint
 - Owner pre-launch closeout, rollback rehearsal และ external alert delivery
 
-ห้ามเรียกโปรเจกต์นี้ว่า production-ready ก่อนหลักฐานเหล่านี้ผ่านบน Git SHA เดียวกัน.
+ห้ามเรียกโปรเจกต์นี้ว่า production-ready ก่อนหลักฐานเหล่านี้ผ่านบน build เดียวกัน.

@@ -1,4 +1,5 @@
 import https from 'node:https';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { parseBahtToCents } from '../../shared/money.js';
 import { QuestshopError } from '../../shared/errors.js';
@@ -7,15 +8,21 @@ const VOUCHER_CODE = /^[A-Za-z0-9]{16,128}$/;
 const MAX_RESPONSE_BYTES = 256 * 1024;
 const PROVIDER_HOST = 'gift.truemoney.com';
 
-const responseSchema = z.object({
+// TrueMoney uses a different envelope when a voucher cannot be redeemed.  In
+// particular, real error responses may have `data: null` or omit it entirely.
+// Validate the status first, then apply the stricter success contract only to
+// a response that claims SUCCESS.
+const statusEnvelopeSchema = z.object({
   status: z.object({
-    code: z.string(),
-    message: z.string().optional(),
+    code: z.string().min(1).max(100),
   }),
+}).passthrough();
+
+const successResponseSchema = statusEnvelopeSchema.extend({
   data: z.object({
     my_ticket: z.object({
       amount_baht: z.string().regex(/^(0|[1-9]\d*)(?:\.\d{1,2})?$/),
-      transaction_id: z.union([z.string(), z.number()]).optional(),
+      transaction_id: z.union([z.string(), z.number()]).nullable().optional(),
     }).optional(),
     owner_profile: z.object({
       full_name: z.string().optional(),
@@ -25,8 +32,8 @@ const responseSchema = z.object({
       member: z.number().int().optional(),
       available: z.number().int().optional(),
     }).optional(),
-  }).optional(),
-});
+  }).passthrough(),
+}).passthrough();
 
 export function normalizeVoucherUrl(input) {
   if (typeof input !== 'string' || input.length > 2048) {
@@ -99,21 +106,65 @@ function mapProviderFailure(parsed, httpStatus) {
   return { outcome: 'AMBIGUOUS', providerCode: code, httpStatus };
 }
 
+function safeHttpStatus(value) {
+  return Number.isInteger(value) && value >= 100 && value <= 599 ? value : null;
+}
+
+function safeContentType(headers) {
+  const value = Array.isArray(headers?.['content-type']) ? headers['content-type'][0] : headers?.['content-type'];
+  const mediaType = typeof value === 'string' ? value.split(';', 1)[0].trim().toLowerCase() : '';
+  return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(mediaType) ? mediaType : null;
+}
+
+function safeTopLevelKeys(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  return Object.keys(value).filter((key) => /^[A-Za-z0-9_]{1,64}$/.test(key)).slice(0, 12);
+}
+
+function safeProviderCode(value) {
+  return typeof value === 'string' && /^[A-Z0-9_]{1,100}$/.test(value) ? value : null;
+}
+
+function providerDiagnostics(response, body, raw = null) {
+  return {
+    httpStatus: safeHttpStatus(response.statusCode),
+    contentType: safeContentType(response.headers),
+    bodyLength: body.length,
+    bodySha256: createHash('sha256').update(body).digest('hex'),
+    topLevelKeys: safeTopLevelKeys(raw),
+    providerCode: safeProviderCode(raw?.status?.code),
+  };
+}
+
 export async function redeemVoucher({
   code,
   receiverPhone,
   signal,
-  onPossiblySent = () => {},
+  onDispatchCheckpoint,
+  // Kept temporarily for adapter callers that have not yet migrated. The
+  // callback is now a pre-dispatch durable checkpoint, not a `finish` hook.
+  onPossiblySent,
   requestFactory = https.request,
 }) {
   if (!VOUCHER_CODE.test(code)) throw new TypeError('invalid voucher code');
   if (!/^0\d{9}$/.test(receiverPhone)) throw new TypeError('invalid receiver phone');
   const body = Buffer.from(JSON.stringify({ mobile: receiverPhone, voucher_hash: code }));
+  const checkpoint = onDispatchCheckpoint ?? onPossiblySent ?? (() => {});
   return new Promise((resolve, reject) => {
-    let finished = false;
     let settled = false;
-    let possiblySentPromise = Promise.resolve();
-    const request = requestFactory({
+    let dispatchStarted = false;
+    let request;
+    const failRequest = (cause) => {
+      if (settled) return;
+      settled = true;
+      reject(new QuestshopError(
+        dispatchStarted ? 'PROVIDER_RESULT_AMBIGUOUS' : 'PROVIDER_NOT_SENT',
+        dispatchStarted ? 'TrueMoney result is ambiguous after request dispatch' : 'TrueMoney request was not sent',
+        { category: dispatchStarted ? 'AMBIGUOUS' : 'NETWORK', retryable: !dispatchStarted, cause },
+      ));
+    };
+    try {
+      request = requestFactory({
       protocol: 'https:',
       hostname: PROVIDER_HOST,
       port: 443,
@@ -149,45 +200,57 @@ export async function redeemVoucher({
       response.on('end', async () => {
         if (settled) return;
         settled = true;
-        try { await possiblySentPromise; }
-        catch (cause) {
-          reject(ambiguousProviderError('PAYMENT_INTENT_CHECKPOINT_FAILED',
-            'ไม่สามารถยืนยัน Payment intent checkpoint', { cause }));
-          return;
-        }
         const httpOk = successfulHttpStatus(response.statusCode);
+        const responseBody = Buffer.concat(chunks);
         let raw;
         try {
-          raw = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          raw = JSON.parse(responseBody.toString('utf8'));
         } catch (cause) {
+          const diagnostics = providerDiagnostics(response, responseBody);
           reject(httpOk
-            ? providerSchemaError('PROVIDER_SCHEMA_INCOMPATIBLE', 'TrueMoney response is not valid JSON', { cause })
-            : ambiguousProviderError('PROVIDER_HTTP_AMBIGUOUS',
-              `TrueMoney returned HTTP ${response.statusCode ?? 'unknown'} with an unreadable body`, { cause }));
-          return;
-        }
-        const parsed = responseSchema.safeParse(raw);
-        if (!parsed.success) {
-          reject(httpOk
-            ? providerSchemaError('PROVIDER_SCHEMA_INCOMPATIBLE', 'TrueMoney response schema changed', {
-              details: parsed.error.issues,
+            ? providerSchemaError('PROVIDER_SCHEMA_INCOMPATIBLE', 'TrueMoney response is not valid JSON', {
+              cause, details: diagnostics,
             })
             : ambiguousProviderError('PROVIDER_HTTP_AMBIGUOUS',
-              `TrueMoney returned HTTP ${response.statusCode ?? 'unknown'} with an incompatible body`));
+              `TrueMoney returned HTTP ${response.statusCode ?? 'unknown'} with an unreadable body`, {
+                cause, details: diagnostics,
+              }));
           return;
         }
-        if (parsed.data.status.code !== 'SUCCESS') {
-          resolve(mapProviderFailure(parsed.data, response.statusCode));
+        const diagnostics = providerDiagnostics(response, responseBody, raw);
+        const envelope = statusEnvelopeSchema.safeParse(raw);
+        if (!envelope.success) {
+          reject(httpOk
+            ? providerSchemaError('PROVIDER_SCHEMA_INCOMPATIBLE', 'TrueMoney response schema changed', {
+              details: diagnostics,
+            })
+            : ambiguousProviderError('PROVIDER_HTTP_AMBIGUOUS',
+              `TrueMoney returned HTTP ${response.statusCode ?? 'unknown'} with an incompatible body`, {
+                details: diagnostics,
+              }));
+          return;
+        }
+        if (envelope.data.status.code !== 'SUCCESS') {
+          resolve({ ...mapProviderFailure(envelope.data, response.statusCode), providerEvidence: diagnostics });
           return;
         }
         if (!httpOk) {
           reject(ambiguousProviderError('PROVIDER_HTTP_INCONSISTENT',
-            `TrueMoney reported SUCCESS with HTTP ${response.statusCode ?? 'unknown'}`));
+            `TrueMoney reported SUCCESS with HTTP ${response.statusCode ?? 'unknown'}`, {
+              details: { httpStatus: response.statusCode ?? null },
+            }));
+          return;
+        }
+        const parsed = successResponseSchema.safeParse(raw);
+        if (!parsed.success) {
+          reject(providerSchemaError('PROVIDER_SCHEMA_INCOMPATIBLE', 'TrueMoney success response schema changed', {
+            details: diagnostics,
+          }));
           return;
         }
         if (!parsed.data.data?.my_ticket || !singleRecipientConfirmed(parsed.data.data)) {
           reject(providerSchemaError('PROVIDER_CONFIRMATION_INCOMPLETE',
-            'Amount or single-recipient confirmation is missing or contradictory'));
+            'Amount or single-recipient confirmation is missing or contradictory', { details: diagnostics }));
           return;
         }
         let amountCents;
@@ -201,7 +264,7 @@ export async function redeemVoucher({
             reject(cause);
             return;
           }
-          reject(providerSchemaError('PROVIDER_AMOUNT_INVALID', 'TrueMoney returned an invalid amount', { cause }));
+          reject(providerSchemaError('PROVIDER_AMOUNT_INVALID', 'TrueMoney returned an invalid amount', { cause, details: diagnostics }));
           return;
         }
         resolve({
@@ -214,29 +277,45 @@ export async function redeemVoucher({
           httpStatus: response.statusCode,
           receiverConfirmation: 'REQUEST_BOUND_SUCCESS',
           providerTransactionId,
+          providerEvidence: {
+            ...diagnostics,
+            receiverConfirmation: 'REQUEST_BOUND_SUCCESS',
+            settlementIdentity: providerTransactionId ? 'PROVIDER_TRANSACTION_ID' : 'VOUCHER_HMAC',
+            providerTransactionIdPresent: providerTransactionId != null,
+          },
         });
       });
-    });
-    request.once('finish', () => {
-      finished = true;
-      possiblySentPromise = Promise.resolve(onPossiblySent());
-      possiblySentPromise.catch((error) => request.destroy(error));
-    });
+      });
+    } catch (cause) {
+      failRequest(cause);
+      return;
+    }
     request.once('timeout', () => request.destroy(new Error('provider timeout')));
-    request.once('error', (cause) => {
-      if (settled) return;
-      settled = true;
-      reject(new QuestshopError(
-        finished ? 'PROVIDER_RESULT_AMBIGUOUS' : 'PROVIDER_NOT_SENT',
-        finished ? 'TrueMoney result is ambiguous after request dispatch' : 'TrueMoney request was not sent',
-        { category: finished ? 'AMBIGUOUS' : 'NETWORK', retryable: !finished, cause },
-      ));
-    });
+    request.once('error', failRequest);
     if (signal) {
       const abort = () => request.destroy(new DOMException('Aborted', 'AbortError'));
       if (signal.aborted) abort();
       else signal.addEventListener('abort', abort, { once: true });
     }
-    request.end(body);
+    // `request.end()` is the dispatch boundary. Persist the intent before it
+    // runs; any later socket/timeout/response failure is deliberately
+    // ambiguous and must never trigger an automatic second redemption.
+    Promise.resolve().then(checkpoint).then(() => {
+      if (settled) return;
+      dispatchStarted = true;
+      try {
+        request.end(body);
+      } catch (cause) {
+        failRequest(cause);
+      }
+    }).catch((cause) => {
+      if (settled) return;
+      settled = true;
+      request.destroy();
+      reject(new QuestshopError('PAYMENT_INTENT_CHECKPOINT_FAILED',
+        'ไม่สามารถบันทึก Payment intent ก่อนส่งคำขอ TrueMoney', {
+          category: 'NETWORK', retryable: true, cause,
+        }));
+    });
   });
 }

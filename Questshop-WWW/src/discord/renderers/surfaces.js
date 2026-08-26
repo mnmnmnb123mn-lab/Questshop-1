@@ -5,7 +5,9 @@ import { customId } from '../components/custom-id.js';
 import { adminCategoryOptions } from './admin.js';
 import { DISCORD_LIMITS, truncateDiscordText } from '../payload.js';
 import { DEFAULT_QUEST_PRICE_CENTS } from '../../domain/pricing/categories.js';
-import { QUEST_AUTO_MEDIA_ATTACHMENT_URL } from '../surfaces/quest-auto-media.js';
+import {
+  QUEST_AUTO_MEDIA_ATTACHMENT_URL, QUEST_AUTO_THUMBNAIL_ATTACHMENT_URL,
+} from '../surfaces/quest-auto-media.js';
 
 const COLORS = Object.freeze({ primary: 0x5865f2, success: 0x23a55a, warning: 0xf0b232, danger: 0xf23f43 });
 
@@ -40,8 +42,9 @@ export function renderQuestAuto(config = {}) {
     'เลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ',
   ].join('\n');
   const embed = new EmbedBuilder().setColor(COLORS.primary)
-    .setTitle(truncateDiscordText('Discord Quest • Auto', DISCORD_LIMITS.embedTitle))
+    .setTitle(truncateDiscordText('Discord Quest Auto', DISCORD_LIMITS.embedTitle))
     .setDescription(truncateDiscordText(defaultDescription, DISCORD_LIMITS.embedDescription))
+    .setThumbnail(QUEST_AUTO_THUMBNAIL_ATTACHMENT_URL)
     .setImage(QUEST_AUTO_MEDIA_ATTACHMENT_URL);
   return {
     content: null,
@@ -73,9 +76,14 @@ export function renderSurfaceAnchor(surfaceKey, config = {}) {
     QUEST_NEW: 'Quest ใหม่', QUEST_HISTORY: 'ประวัติการทำ Quest', LOG_PAYMENTS: 'บันทึกการเติมเงิน',
     LOG_QUEST_OPERATIONS: 'บันทึกการทำ Quest', LOG_ADMIN: 'บันทึกการทำงานของแอดมิน', LOG_SYSTEM: 'เหตุขัดข้องของระบบ',
   };
+  const descriptions = {
+    LOG_QUEST_OPERATIONS: 'ห้องนี้บันทึกการเลือก Quest การทดสอบ และการทำ Quest ของลูกค้า ข้อความแต่ละรายการจะแสดงสถานะล่าสุด',
+    LOG_ADMIN: 'ห้องนี้บันทึกสิ่งที่ผู้ดูแลและระบบแก้ไข เพื่อใช้ตรวจย้อนหลังได้ว่าใครทำอะไรและเพราะอะไร',
+    LOG_SYSTEM: 'ห้องนี้แจ้งปัญหาของระบบและสถานะเมื่อกลับมาปกติ รหัสอ้างอิงอยู่ท้ายการ์ดสำหรับค้นย้อนหลัง',
+  };
   return {
     embeds: [new EmbedBuilder().setColor(COLORS.primary).setTitle(truncateDiscordText(names[surfaceKey] ?? surfaceKey, DISCORD_LIMITS.embedTitle))
-      .setDescription('Questshop ดูแลข้อความในห้องนี้และกู้การแจ้งเตือนที่ค้างอยู่ให้อัตโนมัติหลังระบบเริ่มใหม่')],
+      .setDescription(descriptions[surfaceKey] ?? 'Questshop ดูแลข้อความในห้องนี้และกู้การแจ้งเตือนที่ค้างอยู่ให้อัตโนมัติหลังระบบเริ่มใหม่')],
     allowedMentions: { parse: [] },
   };
 }

@@ -41,7 +41,8 @@ export const ROUTE_CONTRACTS = Object.freeze({
   dlq_replay_submit: admin('MODAL_SUBMIT'), config_concurrency: admin('BUTTON', 'MODAL'),
   config_concurrency_submit: admin('MODAL_SUBMIT'), test_fail_send: admin('BUTTON'),
   test_fail_retry: admin('BUTTON'), customer_quest_publish: admin('BUTTON'),
-  customer_quest_test: admin('BUTTON'),
+  customer_quest_test: admin('BUTTON'), customer_quest_case_retry: admin('BUTTON'),
+  customer_quest_case_announce: admin('BUTTON'),
 
   topup_review_credit: owner('BUTTON', 'MODAL'), topup_review_reject: owner('BUTTON', 'MODAL'),
   topup_review_decision_submit: owner('MODAL_SUBMIT'), receiver_activate: owner('BUTTON', 'MODAL'),

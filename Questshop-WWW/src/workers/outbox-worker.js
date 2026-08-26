@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { discordErrorKind, fetchDiscordMessage, findDiscordMessageByNonce } from '../discord/transport.js';
 import { reconcileIncident } from '../domain/incidents/service.js';
 import { normalizeDiscordPayload } from '../discord/payload.js';
+import { v7 as uuidv7 } from 'uuid';
 
 const BACKOFF = [1, 5, 15, 60, 300, 900];
 
@@ -226,6 +227,9 @@ export async function renderProjectionForDelivery(pool, projection, dependencies
 export async function processOutbox({ holder, client, pool, env, renderProjectionFunction = renderProjectionForDelivery }) {
   const event = await acquireDelivery({ holder }, { pool });
   if (!event) return false;
+  const startedAt = performance.now();
+  let outcome = 'SUCCESS';
+  let errorClass = null;
   const heartbeat = startDeliveryHeartbeat(event, pool);
   try {
     const projection = event.projection_id
@@ -259,11 +263,16 @@ export async function processOutbox({ holder, client, pool, env, renderProjectio
     await recordDelivery({ outboxId: event.id, holder, fencingToken: event.fencing_token,
       messageId: message.id, pingSent }, { pool });
   } catch (error) {
+    outcome = 'ERROR';
+    errorClass = error?.code ?? error?.category ?? error?.name ?? 'UNKNOWN';
     if (!(error instanceof FencingLostError)) {
       await failDelivery(event, error, pool);
     }
   } finally {
     await heartbeat.stop();
+    await pool.query(`INSERT INTO operation_metrics(id,operation,outcome,duration_ms,error_class,trace_id)
+      VALUES($1,'OUTBOX_DELIVERY',$2,$3,$4,$5)`, [uuidv7(), outcome,
+      Math.max(0, Math.round(performance.now() - startedAt)), errorClass, event.trace_id]).catch(() => {});
   }
   return true;
 }

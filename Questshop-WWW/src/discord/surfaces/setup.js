@@ -10,7 +10,14 @@ import {
 } from '../transport.js';
 import { normalizeDiscordPayload } from '../payload.js';
 import { parseCustomId } from '../components/custom-id.js';
-import { QUEST_AUTO_MEDIA_FILENAME, QUEST_AUTO_MEDIA_SIZE, loadQuestAutoMedia } from './quest-auto-media.js';
+import {
+  QUEST_AUTO_MEDIA_FILENAME,
+  QUEST_AUTO_MEDIA_SIZE,
+  QUEST_AUTO_THUMBNAIL_FILENAME,
+  QUEST_AUTO_THUMBNAIL_SIZE,
+  loadQuestAutoMedia,
+  loadQuestAutoThumbnail,
+} from './quest-auto-media.js';
 
 const surfaceSetupLocks = new Map();
 
@@ -43,9 +50,6 @@ async function surfacePayload(surfaceKey, config, pool = null) {
     ? await configuredQuestPriceRange(pool)
     : undefined;
   const body = renderSurfaceAnchor(surfaceKey, brandingWithPriceRange(config, priceRange));
-  if (surfaceKey !== 'QUEST_AUTO') {
-    body.embeds?.[0]?.setFooter?.({ text: `Questshop Surface • ${surfaceKey}` });
-  }
   return normalizeDiscordPayload(body);
 }
 
@@ -57,16 +61,18 @@ function messageAttachments(message) {
   return [];
 }
 
-function questAutoMediaAttachments(message) {
+function questAutoAttachments(message, filename, size) {
   return messageAttachments(message).filter((attachment) => (
-    (attachment?.name === QUEST_AUTO_MEDIA_FILENAME || attachment?.filename === QUEST_AUTO_MEDIA_FILENAME)
-      && Number(attachment?.size) === QUEST_AUTO_MEDIA_SIZE
+    (attachment?.name === filename || attachment?.filename === filename)
+      && Number(attachment?.size) === size
   ));
 }
 
 function hasOnlyQuestAutoMedia(message) {
   const attachments = messageAttachments(message);
-  return attachments.length === 1 && questAutoMediaAttachments(message).length === 1;
+  return attachments.length === 2
+    && questAutoAttachments(message, QUEST_AUTO_MEDIA_FILENAME, QUEST_AUTO_MEDIA_SIZE).length === 1
+    && questAutoAttachments(message, QUEST_AUTO_THUMBNAIL_FILENAME, QUEST_AUTO_THUMBNAIL_SIZE).length === 1;
 }
 
 async function withSurfaceFiles(body, surfaceKey, message) {
@@ -77,6 +83,7 @@ async function withSurfaceFiles(body, surfaceKey, message) {
     files: [
       ...(body.files ?? []),
       { attachment: await loadQuestAutoMedia(), name: QUEST_AUTO_MEDIA_FILENAME },
+      { attachment: await loadQuestAutoThumbnail(), name: QUEST_AUTO_THUMBNAIL_FILENAME },
     ],
   };
 }
@@ -146,7 +153,6 @@ function normalizedEmbedContract(embed) {
       text: embed.footer.text ?? null,
       iconUrl: embed.footer.icon_url ?? embed.footer.iconURL ?? null,
     } : null,
-    thumbnail: embed.thumbnail ? comparableImageUrl(embed.thumbnail.url) : null,
     fields: Array.isArray(embed.fields) ? embed.fields.map((field) => ({
       name: field.name ?? null,
       value: field.value ?? null,
@@ -186,10 +192,10 @@ function comparableImageUrl(url) {
   }
 }
 
-function questAutoImageMatchesAttachment(message, imageUrl) {
+function questAutoImageMatchesAttachment(message, imageUrl, filename, size) {
   const actual = comparableImageUrl(imageUrl);
   if (!actual) return false;
-  return questAutoMediaAttachments(message).some((attachment) => (
+  return questAutoAttachments(message, filename, size).some((attachment) => (
     comparableAttachmentUrls(attachment).includes(actual)
   ));
 }
@@ -199,7 +205,10 @@ export function questAutoSurfaceMatches(message, expectedBody) {
   const actual = firstEmbedData(message);
   return String(message.content ?? '') === String(expectedBody.content ?? '')
     && questAutoEmbedMatches(message, expectedBody)
-    && questAutoImageMatchesAttachment(message, actual.image?.url)
+    && questAutoImageMatchesAttachment(message, actual.image?.url,
+      QUEST_AUTO_MEDIA_FILENAME, QUEST_AUTO_MEDIA_SIZE)
+    && questAutoImageMatchesAttachment(message, actual.thumbnail?.url,
+      QUEST_AUTO_THUMBNAIL_FILENAME, QUEST_AUTO_THUMBNAIL_SIZE)
     && questAutoComponentsMatch(message, expectedBody);
 }
 
@@ -322,9 +331,9 @@ async function recordSurfaceIncident(pool, surfaceKey, error, context) {
   } }, context, { pool });
 }
 
-async function resolveSurfaceIncidentSafely(pool, surfaceKey, context) {
+async function resolveSurfaceIncidentSafely(pool, surfaceKey, context, code = 'DISCORD_SURFACE_RECONCILE_FAILED') {
   try {
-    await reconcileIncident({ code: 'DISCORD_SURFACE_RECONCILE_FAILED', scope: surfaceKey,
+    await reconcileIncident({ code, scope: surfaceKey,
       active: false, severity: 'ERROR', evidence: {} }, context, { pool });
   } catch {
     // A successful Discord repair must not be reported as failed because the
@@ -339,6 +348,12 @@ async function recordSurfaceIncidentSafely(pool, surfaceKey, error, context) {
     // A database outage is already the authoritative failure. Do not hide
     // the original Discord error or stop reconciliation of other surfaces.
   }
+}
+
+function discordConnectivityFailure(error) {
+  const code = String(error?.code ?? '');
+  return ['ENOTFOUND', 'ETIMEDOUT', 'ECONNRESET', 'UND_ERR_CONNECT_TIMEOUT'].includes(code)
+    || code.startsWith('UND_ERR_CONNECT_');
 }
 
 async function deactivateOrphan(message, pool, surfaceKey, context) {
@@ -398,14 +413,22 @@ export async function reconcileSurfaceAnchors({ client, pool, env, config }, con
   const surfaces = (await pool.query(`SELECT * FROM surfaces WHERE state IN ('ACTIVE','RECONCILING')`)).rows;
   const guild = await client.guilds.fetch(env.DISCORD_GUILD_ID);
   const results = [];
+  const connectivitySurfaces = [];
   for (const surface of surfaces) {
     try {
       results.push(await reconcileOneSurface({ guild, pool, surface, config, context }));
     } catch (error) {
-      await recordSurfaceIncidentSafely(pool, surface.surface_key, error, context);
+      if (discordConnectivityFailure(error)) connectivitySurfaces.push(surface.surface_key);
+      else await recordSurfaceIncidentSafely(pool, surface.surface_key, error, context);
       results.push({ surfaceKey: surface.surface_key, reconciled: false,
         reason: String(error?.code ?? error?.name ?? 'DISCORD_ERROR') });
     }
+  }
+  if (connectivitySurfaces.length) {
+    await reconcileIncident({ code: 'DISCORD_CONNECTIVITY', scope: 'DISCORD', active: true,
+      severity: 'ERROR', evidence: { surfaces: connectivitySurfaces.sort() } }, context, { pool });
+  } else {
+    await resolveSurfaceIncidentSafely(pool, 'DISCORD', context, 'DISCORD_CONNECTIVITY');
   }
   return results;
 }

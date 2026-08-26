@@ -11,7 +11,7 @@ Orders are aggregates calculated from item state. One account can have one activ
 ## Persistent Discord storefront
 
 `QUEST_AUTO` is a durable Discord surface, not a normal transient message. The renderer owns the fixed storefront
-heading **Discord Quest • Auto**, the Owner-approved Thai description, the **เริ่มทำเควส** / **เติมเงิน** buttons,
+heading **Discord Quest Auto**, the Owner-approved Thai description, the **เริ่มทำเควส** / **เติมเงิน** buttons,
 and the current customer-facing price summary.
 
 The price line is derived read-only from the active `TYPE` price rules for all four supported Quest task types.
@@ -19,18 +19,20 @@ When all configured prices are equal, the storefront renders one value such as `
 it renders the minimum-to-maximum range such as `5-7 บาท`. If any supported TYPE price is missing, the storefront
 fails closed to `ค่าบริการยังไม่พร้อม` instead of inventing a price.
 
-The persistent storefront carries one fixed Owner-approved GIF at `src/discord/assets/quest-auto-demo.gif`.
-Before upload the runtime verifies exact size `9,190,692` bytes, a valid GIF signature, and SHA-256
-`c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1`.
-The GIF is attached to the Discord message and the Rich Embed references `attachment://quest-auto-demo.gif`, so the
-animation appears inside the embed instead of as a standalone MP4/video block. The media is bundled source, not a
-generic video subsystem or external URL dependency.
+The persistent storefront carries one fixed Owner-approved GIF at `src/discord/assets/quest-auto-demo.gif` and one
+animated upper-right thumbnail at `src/discord/assets/quest-auto-thumbnail.gif`. Before upload the runtime verifies
+each file's size, valid GIF signature and SHA-256: the demo is `9,190,692` bytes with SHA-256
+`c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1`, and the thumbnail is `822,513` bytes with
+SHA-256 `2d1e0e2c09138ac53384ac6272f4c8a9eedff28e2fe227ee06e26f7ef37a6542`.
+Both assets are attached to the Discord message. The Rich Embed references `attachment://quest-auto-thumbnail.gif`
+as its thumbnail and `attachment://quest-auto-demo.gif` as its lower image, so both animations appear inside the embed
+instead of as a standalone MP4/video block. The media is bundled source, not an external URL dependency.
 
 Quest Auto intentionally has no customer-visible `Questshop Surface • QUEST_AUTO` footer. Recovery prefers the stable
 surface nonce; legacy footer lookup remains only as a migration fallback for older messages.
 
-Surface reconciliation compares the stored anchor against the expected title/description, expected GIF attachment,
-embed image and absence of the legacy visible footer. A stale price, missing/legacy media, deleted anchor or
+Surface reconciliation compares the stored anchor against the expected title/description, GIF attachments,
+embed image/thumbnail and absence of the legacy visible footer. A stale price, missing/legacy media, deleted anchor or
 config-version drift is repaired by editing/recovering the same durable surface. Reconciliation runs through the
 normal Maintenance worker, currently on an approximately 60-second cadence, and setup/restart can also heal the
 surface. It must not spam a second active Quest Auto panel.

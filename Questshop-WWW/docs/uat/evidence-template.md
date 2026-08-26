@@ -7,7 +7,7 @@ Never record raw tokens, voucher URLs, database URLs, cookies, passwords or encr
 
 | Field | Value |
 |---|---|
-| Git SHA (`git rev-parse HEAD`) | |
+| Build/Deployment ID (ถ้ามี) | |
 | App version | |
 | Engine / executor / contract versions | |
 | Schema version | |
@@ -16,7 +16,7 @@ Never record raw tokens, voucher URLs, database URLs, cookies, passwords or encr
 | Owner conducting UAT | |
 | Guild ID | |
 
-Stop the round if app/migration/config deployment changes the Git SHA.
+Stop the round if the app, migration or configuration is deployed again during the round.
 
 ## Preconditions
 
@@ -33,17 +33,22 @@ Stop the round if app/migration/config deployment changes the Git SHA.
 Expected source contract:
 
 ```text
-Title    Discord Quest • Auto
+Title    Discord Quest Auto
 GIF      src/discord/assets/quest-auto-demo.gif
 Embed    attachment://quest-auto-demo.gif
 Size     9,190,692 bytes
 SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
+GIF      src/discord/assets/quest-auto-thumbnail.gif
+Thumb    attachment://quest-auto-thumbnail.gif
+Size     822,513 bytes
+SHA-256  2d1e0e2c09138ac53384ac6272f4c8a9eedff28e2fe227ee06e26f7ef37a6542
 Footer   none visible to customer
 ```
 
 | Case | Discord Message ID / evidence | Expected outcome | Observed outcome | Owner approval |
 |---|---|---|---|---|
 | `/quest-auto` install/update | | one durable active anchor | | |
+| Thumbnail rendering | | animated GIF appears upper-right on desktop/mobile | | |
 | Desktop GIF rendering | | `quest-auto-demo.gif` animates inside Rich Embed | | |
 | Mobile GIF rendering | | same GIF animates inside Rich Embed | | |
 | Standalone media regression | | no MP4/video block appears above storefront | | |
@@ -51,8 +56,8 @@ Footer   none visible to customer
 | Equal GAME/VIDEO price | | one amount, e.g. `5 บาท` | | |
 | Different GAME/VIDEO price | | min-max range, e.g. `5-7 บาท` | | |
 | Price refresh timing | | same message updates within ~60s Maintenance window | | |
-| Restart | | no duplicate anchor/GIF attachment | | |
-| Legacy/missing media | | same anchor replaces stale attachment with `quest-auto-demo.gif` | | |
+| Restart | | no duplicate anchor/media attachments | | |
+| Legacy/missing media | | same anchor restores both expected assets | | |
 | Legacy footer migration | | old footer anchor migrates without duplicate panel | | |
 | Deleted anchor | | exactly one replacement becomes authoritative | | |
 | Discord 403 | | incident/pointer preserved; no permission auto-repair | | |
@@ -64,7 +69,9 @@ Record only message/channel IDs and timestamps, never a Discord user token.
 | Case | Top-up / Order / Trace ID | Expected outcome | Observed outcome | Owner approval |
 |---|---|---|---|---|
 | Real low-value TrueMoney success | | `REDEEMED → CREDITED` exactly once | | |
+| Real success without provider transaction ID | | one credit; stored provider ID remains `NULL`; masked fallback reference | | |
 | Same voucher submitted twice | | one durable Top-up owner | | |
+| Used / expired voucher | | mapped Thai terminal reason, no credit | | |
 | Provider timeout after possible send | | `AMBIGUOUS`, no blind retry | | |
 | Owner resolves ambiguous payment | | Credit or Reject with audit | | |
 | Five Quest items: 3 success / 2 failure | | 3 Capture + 2 Release | | |
@@ -107,4 +114,4 @@ For Quest runs, record Order Item ID, Job ID and shortened support code only.
 
 - [ ] Every applicable row passed or has an approved compensating/forward-fix record.
 - [ ] Owner accepts residual risks.
-- [ ] Status is `done` only for this exact Git SHA; otherwise **implemented-but-unverified**.
+- [ ] Status is `done` only for this deployed build; otherwise **implemented-but-unverified**.

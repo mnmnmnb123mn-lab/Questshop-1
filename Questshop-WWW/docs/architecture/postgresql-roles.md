@@ -59,4 +59,4 @@ A compliant production deployment must prove:
 5. Object synchronization passes after migration, including when `applied: 0`.
 6. `price_rules` remains readable by Runtime so checkout and Quest Auto can resolve customer pricing.
 
-These are source/test contracts until live Aiven provisioning is verified on the exact deployed Git SHA.
+These are source/test contracts until live Aiven provisioning is verified on the intended deployed build.

@@ -12,6 +12,9 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: Questshop-WWW
     services:
       postgres:
         image: postgres:16
@@ -37,6 +40,7 @@ jobs:
         with:
           node-version: 22.22.0
           cache: npm
+          cache-dependency-path: Questshop-WWW/package-lock.json
       - run: npm ci --ignore-scripts
       - name: Check pull-request patch whitespace
         if: ${{ github.event_name == 'pull_request' }}
@@ -50,10 +54,10 @@ jobs:
       - run: npm run lint
       - run: npm run test:coverage
       - uses: actions/upload-artifact@v7
-        if: ${{ always() && hashFiles('coverage/lcov.info') != '' }}
+        if: ${{ always() && hashFiles('Questshop-WWW/coverage/lcov.info') != '' }}
         with:
           name: lcov-${{ github.sha }}
-          path: coverage/lcov.info
+          path: Questshop-WWW/coverage/lcov.info
           if-no-files-found: error
       - run: >-
           node --input-type=module -e "import pg from 'pg'; const client = new pg.Client({ connectionString: process.env.TEST_DATABASE_URL }); await client.connect(); await client.query('CREATE DATABASE questshop_loadtest'); await client.end();"

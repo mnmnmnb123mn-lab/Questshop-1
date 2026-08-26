@@ -38,9 +38,10 @@ import {
 import {
   forcePublishFailedMonitorTest, openOrderItemReview, setCircuitBreakerState,
 } from '../../domain/admin/operations-service.js';
+import { loadCustomerQuestDiscovery } from '../../domain/catalog/customer-discovery-service.js';
 import {
-  loadCustomerQuestDiscovery, publishCustomerDiscoveredQuest, requestCustomerDiscoveryTest,
-} from '../../domain/catalog/customer-discovery-service.js';
+  loadCustomerDiscoveryCase, queueCustomerDiscoveryAnnouncement, retryCustomerDiscoveryCase,
+} from '../../domain/catalog/customer-discovery-case-service.js';
 import { loadTestFailureAlert, retryFailedTestAlert } from '../../domain/catalog/test-gate.js';
 import { discardDeadLetter, replayDeadLetter } from '../../domain/outbox/dlq-service.js';
 import { loadRuntimeConfig } from '../../config/runtime-config.js';
@@ -697,25 +698,63 @@ async function assertCustomerQuestDiscoveryBinding(interaction, discoveryId, run
   return discovery;
 }
 
+async function assertCustomerQuestCaseBinding(interaction, caseId, runtime) {
+  const found = await withTransaction({ pool: runtime.pool, isolation: 'READ COMMITTED', maxAttempts: 1 },
+    (client) => loadCustomerDiscoveryCase(client, caseId, { messageId: interaction.message?.id }));
+  if (found?.surface_key !== 'LOG_QUEST_OPERATIONS') {
+    throw new QuestshopError('CUSTOMER_DISCOVERY_CASE_NOT_FOUND', 'ข้อความตรวจ Quest นี้หมดอายุแล้ว');
+  }
+  const surface = (await runtime.pool.query(`SELECT * FROM surfaces
+    WHERE surface_key='LOG_QUEST_OPERATIONS' AND state='ACTIVE'`)).rows[0];
+  if (!surface || surface.guild_id !== interaction.guildId || surface.channel_id !== interaction.channelId) {
+    throw new QuestshopError('SURFACE_BINDING_INVALID', 'ห้อง Log นี้ไม่ใช่ Surface ที่ใช้งานอยู่');
+  }
+  return found;
+}
+
 async function handleCustomerQuestPublish({ interaction, route, runtime, gates: _gates }) {
   if (route.route !== 'customer_quest_publish' || !interaction.isButton()) return;
-  await assertCustomerQuestDiscoveryBinding(interaction, route.sessionId, runtime);
-  const result = await publishCustomerDiscoveredQuest({ discoveryId: route.sessionId,
-    runnerConcurrency: runnerConcurrency(runtime) },
-  contextFor(interaction, 'customer_discovery_publish'), { pool: runtime.pool });
-  return interaction.editReply(result.idempotent
+  const discovery = await assertCustomerQuestDiscoveryBinding(interaction, route.sessionId, runtime);
+  const caseRow = (await runtime.pool.query(`SELECT id FROM customer_quest_discovery_cases WHERE quest_id=$1`, [discovery.quest_id])).rows[0];
+  if (!caseRow) return interaction.editReply('รายการเก่านี้ยังไม่มี Case ใหม่ กรุณารอการตรวจครั้งถัดไป');
+  const result = await queueCustomerDiscoveryAnnouncement({ caseId: caseRow.id },
+    contextFor(interaction, 'customer_discovery_publish'), { pool: runtime.pool });
+  return interaction.editReply(result.reused
     ? 'Quest นี้ถูกสั่งประกาศแล้ว'
     : 'รับคำสั่งแล้ว Quest จะถูกประกาศในห้อง Quest ใหม่');
 }
 
 async function handleCustomerQuestTest({ interaction, route, runtime, gates: _gates }) {
   if (route.route !== 'customer_quest_test' || !interaction.isButton()) return;
-  await assertCustomerQuestDiscoveryBinding(interaction, route.sessionId, runtime);
-  const result = await requestCustomerDiscoveryTest({ discoveryId: route.sessionId },
+  const discovery = await assertCustomerQuestDiscoveryBinding(interaction, route.sessionId, runtime);
+  const caseRow = (await runtime.pool.query(`SELECT id FROM customer_quest_discovery_cases WHERE quest_id=$1`, [discovery.quest_id])).rows[0];
+  if (!caseRow) return interaction.editReply('รายการเก่านี้ยังไม่มี Case ใหม่ กรุณารอการตรวจครั้งถัดไป');
+  const result = await retryCustomerDiscoveryCase({ caseId: caseRow.id },
     contextFor(interaction, 'customer_discovery_test'), { pool: runtime.pool });
   return interaction.editReply(result.idempotent
-    ? 'Quest นี้ถูกส่งทดสอบแล้ว'
-    : 'รับคำสั่งแล้ว ระบบจะทดสอบ Quest ด้วย Monitor Token');
+    ? 'ระบบกำลังตรวจ Quest นี้อยู่แล้ว'
+    : 'รับคำสั่งแล้ว ระบบจะค้นในบัญชีทดสอบทั้งหมดก่อนเริ่มทดสอบ');
+}
+
+async function handleCustomerQuestCaseRetry({ interaction, route, runtime, gates: _gates }) {
+  if (route.route !== 'customer_quest_case_retry' || !interaction.isButton()) return;
+  await interaction.deferReply({ ephemeral: true });
+  await assertCustomerQuestCaseBinding(interaction, route.sessionId, runtime);
+  const result = await retryCustomerDiscoveryCase({ caseId: route.sessionId },
+    contextFor(interaction, 'customer_discovery_case_retry'), { pool: runtime.pool });
+  return interaction.editReply(result.reused
+    ? 'ระบบกำลังตรวจ Quest นี้อยู่แล้ว'
+    : 'รับคำสั่งแล้ว ระบบจะค้นในบัญชีทดสอบทั้งหมดและทดสอบเมื่อพบ Quest');
+}
+
+async function handleCustomerQuestCaseAnnounce({ interaction, route, runtime, gates: _gates }) {
+  if (route.route !== 'customer_quest_case_announce' || !interaction.isButton()) return;
+  await interaction.deferReply({ ephemeral: true });
+  await assertCustomerQuestCaseBinding(interaction, route.sessionId, runtime);
+  const result = await queueCustomerDiscoveryAnnouncement({ caseId: route.sessionId },
+    contextFor(interaction, 'customer_discovery_case_announce'), { pool: runtime.pool });
+  return interaction.editReply(result.idempotent ? 'Quest นี้อยู่ระหว่างประกาศหรือประกาศแล้ว'
+    : 'รับคำสั่งแล้ว จะส่งประกาศจากข้อมูลที่ลูกค้าพบโดยระบุว่ายังไม่ยืนยันด้วย Monitor');
 }
 
 async function handleTestFailureSend({ interaction, route, runtime, gates: _gates }) {
@@ -1210,19 +1249,28 @@ async function handlePaymentReviewPick({ interaction, route, runtime, gates: _ga
 if (route.route === 'payment_review_pick' && interaction.isStringSelectMenu()) {
   await interaction.deferReply({ ephemeral: true });
   const review = (await runtime.pool.query(`SELECT r.*,t.discord_user_id,t.amount_cents,t.provider_transaction_id,
-    t.status AS topup_status,t.failure_code,t.warning_code
+    t.status AS topup_status,t.failure_code,t.warning_code,
+    COALESCE((SELECT a.provider_http_status BETWEEN 200 AND 299
+      AND a.provider_evidence->>'receiverConfirmation'='REQUEST_BOUND_SUCCESS'
+      AND (a.provider_evidence->>'settlementIdentity'='VOUCHER_HMAC'
+        OR a.error_code='PROVIDER_TRANSACTION_ID_MISSING')
+      FROM payment_attempts a WHERE a.topup_id=t.id ORDER BY a.attempt_number DESC LIMIT 1),false)
+      AS alternate_settlement_evidence
     FROM manual_reviews r JOIN topups t ON r.subject_type='TOPUP' AND r.subject_id=t.id::text
     WHERE r.id=$1 AND r.state<>'RESOLVED'`, [interaction.values[0]])).rows[0];
   if (!review) throw new QuestshopError('REVIEW_NOT_FOUND', 'รายการเติมเงินนี้ถูกจัดการไปแล้ว');
   const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
     channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'TOPUP_REVIEW_DETAIL',
-    payload: { reviewId: review.id, expectedVersion: String(review.state_version) }, configVersion: runtime.config.version },
+    payload: { reviewId: review.id, expectedVersion: String(review.state_version),
+      alternateSettlementEvidence: review.alternate_settlement_evidence === true }, configVersion: runtime.config.version },
   contextFor(interaction, 'topup_review_detail'), { pool: runtime.pool });
   const detail = [
     `ผู้เติม: <@${review.discord_user_id}> (\`${review.discord_user_id}\`)`,
     `สถานะ: **${displayState(review.topup_status)}**`,
     `ยอดที่ยืนยันได้: **${review.amount_cents == null ? 'ยังไม่ทราบ' : money(review.amount_cents)}**`,
     `เลขธุรกรรม: \`${review.provider_transaction_id ?? 'ยังไม่มี'}\``,
+    ...(review.alternate_settlement_evidence === true
+      ? ['หลักฐานจาก TrueMoney: ยืนยันยอดและผู้รับแล้ว — ยืนยันด้วยรหัสซองที่เข้ารหัสได้'] : []),
     `สาเหตุ: ${escapedText(review.failure_code ?? review.opened_reason ?? 'ต้องตรวจในแอป TrueMoney')}`,
   ].join('\n');
   return interaction.editReply({ content: detail, components: [new ActionRowBuilder().addComponents(
@@ -1238,11 +1286,16 @@ async function handleTopupReviewDecision({ interaction, route, runtime, gates: _
 if (['topup_review_credit', 'topup_review_reject'].includes(route.route) && interaction.isButton()) {
   ownerOnly(interaction, runtime, 'รายการเติมเงินที่ผลไม่ชัดเจนให้ Owner ตัดสินเท่านั้น');
   const credit = route.route === 'topup_review_credit';
+  const detailSession = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOPUP_REVIEW_DETAIL' },
+  contextFor(interaction, 'topup_review_action_preview'), { pool: runtime.pool });
+  const providerIdRequired = detailSession.payload.alternateSettlementEvidence !== true;
   return showPreparedModal({ interaction, runtime, route,
     modal: (sessionId) => fieldsModal('topup_review_decision_submit', sessionId,
       credit ? 'ยืนยันเพิ่มเครดิตจากซอง' : 'ปฏิเสธรายการเติมเงิน', credit ? [
       { id: 'amount', label: 'ยอดที่ยืนยันได้ (บาท)', max: 24 },
-      { id: 'provider_id', label: 'เลขธุรกรรม TrueMoney', max: 200 },
+      { id: 'provider_id', label: providerIdRequired ? 'เลขธุรกรรม TrueMoney' : 'เลขธุรกรรม TrueMoney (ถ้ามี)', max: 200,
+        required: providerIdRequired },
       { id: 'reason', label: 'หลักฐานและเหตุผล', long: true, max: 500 },
     ] : [{ id: 'reason', label: 'เหตุผลที่ปฏิเสธ', long: true, max: 500 }]),
     prepare: async (sessionId) => {
@@ -1933,6 +1986,8 @@ export const ROUTE_HANDLERS = Object.freeze({
   "breaker_submit": handleBreakerSubmit,
   "customer_quest_publish": handleCustomerQuestPublish,
   "customer_quest_test": handleCustomerQuestTest,
+  "customer_quest_case_retry": handleCustomerQuestCaseRetry,
+  "customer_quest_case_announce": handleCustomerQuestCaseAnnounce,
   "test_fail_send": handleTestFailureSend,
   "test_fail_retry": handleTestFailureRetry,
 });

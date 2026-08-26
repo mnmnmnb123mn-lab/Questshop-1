@@ -4,6 +4,7 @@ import { RUNNER_VERSION_COMPATIBILITY, isRunnerVersionCompatible } from '../conf
 import { usesApplicationBackup } from '../config/env.js';
 import { reconcileIncident } from '../domain/incidents/service.js';
 import { escalateStuckRedeemedTopups } from '../domain/payments/service.js';
+import { recomputeHealthStatus } from '../bootstrap/health-status.js';
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -35,6 +36,26 @@ async function setIncident(client, { code, scope, active, severity, evidence }) 
   }, { pool: client });
 }
 
+export async function reconcileStabilizedIncident(pool, {
+  code, scope, active, severity, evidence, samples = 1, minimumSamples = 1, openAfter = 2, resolveAfter = 3,
+}) {
+  // A window without enough measurements is neutral: it neither creates a
+  // noisy alert nor clears a real one. Samples are durable so a restart does
+  // not reset the anti-flap decision.
+  if (samples < minimumSamples) return;
+  const operation = `ALERT:${code}:${scope}`;
+  await pool.query(`INSERT INTO operation_metrics(id,operation,outcome,duration_ms,error_class)
+    VALUES($1,$2,$3,0,NULL)`, [uuidv7(), operation, active ? 'ERROR' : 'SUCCESS']);
+  const limit = Math.max(openAfter, resolveAfter);
+  const outcomes = (await pool.query(`SELECT outcome FROM operation_metrics WHERE operation=$1
+    ORDER BY created_at DESC,id DESC LIMIT $2`, [operation, limit])).rows.map((row) => row.outcome);
+  if (outcomes.length >= openAfter && outcomes.slice(0, openAfter).every((outcome) => outcome === 'ERROR')) {
+    await setIncident(pool, { code, scope, active: true, severity, evidence });
+  } else if (outcomes.length >= resolveAfter && outcomes.slice(0, resolveAfter).every((outcome) => outcome === 'SUCCESS')) {
+    await setIncident(pool, { code, scope, active: false, severity, evidence });
+  }
+}
+
 async function collectRuntimeMetrics(pool, eventLoopMonitor) {
   const rssBytes = process.memoryUsage().rss;
   const memoryLimit = await memoryLimitBytes();
@@ -62,7 +83,7 @@ async function collectAlertSnapshot(pool, { applicationBackupEnabled }) {
         AND completed_at>=clock_timestamp()-interval '35 days'`),
     ]
     : [noApplicationBackupQuery, noApplicationBackupQuery, noApplicationBackupQuery, noApplicationBackupQuery];
-  const [financial, payment, queue, scheduler, outbox, errors, backup, restore, backupCorruption, restoreFailure,
+  const [financial, payment, queue, scheduler, outbox, errors, panelRoutes, errorRoutes, backup, restore, backupCorruption, restoreFailure,
     counts, gates, activeVersions, slo] = await Promise.all([
     pool.query(`SELECT (SELECT count(*)::integer FROM wallets WHERE available_cents<0 OR reserved_cents<0) AS negative,
       (SELECT count(*)::integer FROM wallets w LEFT JOIN LATERAL (SELECT available_after_cents,reserved_after_cents
@@ -96,6 +117,17 @@ async function collectAlertSnapshot(pool, { applicationBackupEnabled }) {
     pool.query(`SELECT count(*)::integer AS total,count(*) FILTER (WHERE outcome='ERROR')::integer AS failed
       FROM operation_metrics WHERE operation IN ('PANEL_REQUEST','CUSTOMER_INTERACTION')
         AND outcome IN ('SUCCESS','ERROR') AND created_at>=clock_timestamp()-interval '5 minutes'`),
+    pool.query(`SELECT route,count(*)::integer AS samples,
+      percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms)::double precision AS p95_ms
+      FROM operation_metrics WHERE operation='PANEL_REQUEST' AND route IS NOT NULL
+        AND created_at>=clock_timestamp()-interval '5 minutes'
+      GROUP BY route ORDER BY p95_ms DESC,samples DESC,route ASC LIMIT 3`),
+    pool.query(`SELECT COALESCE(route,'ไม่ระบุ') AS route,COALESCE(error_class,'UNKNOWN') AS error_class,
+      count(*)::integer AS failed
+      FROM operation_metrics WHERE operation IN ('PANEL_REQUEST','CUSTOMER_INTERACTION') AND outcome='ERROR'
+        AND created_at>=clock_timestamp()-interval '5 minutes'
+      GROUP BY COALESCE(route,'ไม่ระบุ'),COALESCE(error_class,'UNKNOWN')
+      ORDER BY failed DESC,route ASC,error_class ASC LIMIT 3`),
     backupResult, restoreResult, backupCorruptionResult, restoreFailureResult,
     pool.query(`SELECT (SELECT count(*)::integer FROM runner_jobs WHERE state NOT IN ('COMPLETED','FAILED')) AS queue,
       (SELECT count(*)::integer FROM outbox_events WHERE state IN ('PENDING','LEASED','RETRY_WAIT')) AS outbox,
@@ -112,17 +144,21 @@ async function collectAlertSnapshot(pool, { applicationBackupEnabled }) {
         AND created_at>=clock_timestamp()-interval '5 minutes') AS interaction_ack_p99,
       percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE operation='PANEL_REQUEST'
         AND created_at>=clock_timestamp()-interval '5 minutes') AS panel_p95,
+      count(*) FILTER (WHERE operation='PANEL_REQUEST' AND created_at>=clock_timestamp()-interval '5 minutes')::integer AS panel_count,
       percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE operation='TOPUP_CREDIT'
         AND created_at>=clock_timestamp()-interval '24 hours') AS topup_p95,
       percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE operation='TOPUP_CREDIT'
         AND created_at>=clock_timestamp()-interval '24 hours') AS topup_p99,
       percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE operation='OUTBOX_DELIVERY'
         AND created_at>=clock_timestamp()-interval '5 minutes') AS outbox_p95,
+      count(*) FILTER (WHERE operation='OUTBOX_DELIVERY' AND created_at>=clock_timestamp()-interval '5 minutes')::integer AS outbox_count,
       count(*) FILTER (WHERE operation='INTERACTION_ACK' AND created_at>=clock_timestamp()-interval '5 minutes')::integer AS interaction_count
       FROM operation_metrics`),
   ]);
   return { invariant: financial.rows[0], payment: payment.rows[0], queue: queue.rows[0], scheduler: scheduler.rows[0],
     outbox: outbox.rows[0], errors: errors.rows[0], applicationBackupEnabled,
+    panelRoutes: panelRoutes.rows.map((row) => ({ route: row.route, samples: Number(row.samples), p95Ms: Number(row.p95_ms) })),
+    errorRoutes: errorRoutes.rows.map((row) => ({ route: row.route, errorClass: row.error_class, failed: Number(row.failed) })),
     backupAgeMs: backup.rows[0]?.age_ms == null ? null : Number(backup.rows[0].age_ms),
     restoreAgeMs: restore.rows[0]?.age_ms == null ? null : Number(restore.rows[0].age_ms),
     backupCorruption: Number(backupCorruption.rows[0]?.count ?? 0), restoreFailure: Number(restoreFailure.rows[0]?.count ?? 0),
@@ -189,9 +225,12 @@ async function applyOperationalAlerts(pool, snapshot, health, runtime) {
   await setIncident(pool, { code: 'QUEUE_STUCK', scope: 'RUNNER', active: snapshot.queue.stuck > 0, severity: 'ERROR', evidence: snapshot.queue });
   await setIncident(pool, { code: 'SCHEDULER_LAG', scope: 'RUNNER', active: Number(snapshot.scheduler.lag_ms) > 5_000,
     severity: 'ERROR', evidence: snapshot.scheduler });
-  await setIncident(pool, { code: 'OUTBOX_STUCK', scope: 'DISCORD', active: snapshot.outbox.stuck > 0, severity: 'ERROR', evidence: snapshot.outbox });
+  await reconcileStabilizedIncident(pool, { code: 'OUTBOX_STUCK', scope: 'DISCORD', active: snapshot.outbox.stuck > 0,
+    severity: 'ERROR', evidence: snapshot.outbox, openAfter: 2, resolveAfter: 2 });
   const errorRateHigh = snapshot.errors.total >= 20 && snapshot.errors.failed / snapshot.errors.total >= 0.05;
-  await setIncident(pool, { code: 'ERROR_RATE_HIGH', scope: 'OPERATIONS', active: errorRateHigh, severity: 'ERROR', evidence: snapshot.errors });
+  await reconcileStabilizedIncident(pool, { code: 'ERROR_RATE_HIGH', scope: 'OPERATIONS', active: errorRateHigh,
+    severity: 'ERROR', evidence: { ...snapshot.errors, topFailures: snapshot.errorRoutes },
+    samples: Number(snapshot.errors.total), minimumSamples: 20 });
   const backupChecks = snapshot.applicationBackupEnabled;
   await setIncident(pool, { code: 'BACKUP_STALE', scope: 'DATABASE', active: backupChecks && snapshot.backupAgeMs > 26 * HOUR_MS,
     severity: 'ERROR', evidence: { ageMs: snapshot.backupAgeMs } });
@@ -209,8 +248,8 @@ async function applyOperationalAlerts(pool, snapshot, health, runtime) {
     lastHeartbeatAt: worker.lastHeartbeatAt,
     lastCompletedAt: worker.lastCompletedAt ?? null,
   }));
-  await setIncident(pool, { code: 'WORKER_HEARTBEAT_MISSING', scope: 'RUNTIME', active: staleWorkers.length > 0,
-    severity: 'ERROR', evidence: { workers: staleWorkers } });
+  await reconcileStabilizedIncident(pool, { code: 'WORKER_HEARTBEAT_MISSING', scope: 'RUNTIME', active: staleWorkers.length > 0,
+    severity: 'ERROR', evidence: { workers: staleWorkers }, openAfter: 2, resolveAfter: 2 });
   const sustained = (await pool.query(`SELECT count(*) FILTER (WHERE operation='SYSTEM:MEMORY_PERCENT' AND outcome='ERROR'
     AND created_at>=clock_timestamp()-interval '10 minutes')::integer AS memory_high,
     count(*) FILTER (WHERE operation='SYSTEM:EVENT_LOOP_LAG' AND outcome='ERROR'
@@ -229,22 +268,28 @@ async function applyOperationalAlerts(pool, snapshot, health, runtime) {
   await setIncident(pool, { code: 'INTERACTION_ACK_SLO', scope: 'DISCORD',
     active: Number(snapshot.slo.interaction_count) >= 20 && (interactionP95 > 2_000 || interactionP99 >= 2_800),
     severity: 'ERROR', evidence: { p95Ms: interactionP95, p99Ms: interactionP99, count: snapshot.slo.interaction_count } });
-  await setIncident(pool, { code: 'PANEL_LATENCY_SLO', scope: 'DISCORD', active: panelP95 > 5_000,
-    severity: 'WARNING', evidence: { p95Ms: panelP95 } });
+  await reconcileStabilizedIncident(pool, { code: 'PANEL_LATENCY_SLO', scope: 'DISCORD', active: panelP95 > 5_000,
+    severity: 'WARNING', evidence: { p95Ms: panelP95, samples: Number(snapshot.slo.panel_count), topRoutes: snapshot.panelRoutes },
+    samples: Number(snapshot.slo.panel_count), minimumSamples: 5 });
   await setIncident(pool, { code: 'TOPUP_LATENCY_SLO', scope: 'TRUEMONEY', active: topupP95 > 60_000,
     severity: 'WARNING', evidence: { p95Ms: topupP95, p99Ms: topupP99 } });
   await setIncident(pool, { code: 'TOPUP_LATENCY_P99_SLO', scope: 'TRUEMONEY', active: topupP99 > 300_000,
     severity: 'WARNING', evidence: { p99Ms: topupP99 } });
-  await setIncident(pool, { code: 'OUTBOX_LATENCY_SLO', scope: 'DISCORD', active: outboxP95 > 30_000,
-    severity: 'WARNING', evidence: { p95Ms: outboxP95 } });
+  await reconcileStabilizedIncident(pool, { code: 'OUTBOX_LATENCY_SLO', scope: 'DISCORD', active: outboxP95 > 30_000,
+    severity: 'WARNING', evidence: { p95Ms: outboxP95, samples: Number(snapshot.slo.outbox_count) },
+    samples: Number(snapshot.slo.outbox_count), minimumSamples: 10 });
 }
 
-function resolveHealthStatus({ financialBroken, paymentState, health, snapshot }) {
-  if (financialBroken || paymentState.redeemedStuck > 0 || snapshot.backupCorruption > 0 || snapshot.restoreFailure > 0) return 'INCIDENT';
-  if (!health.ready) return 'NOT_READY';
-  if (paymentState.queueStuck > 0 || snapshot.queue.stuck || snapshot.outbox.stuck || Number(snapshot.scheduler.lag_ms) > 5_000) return 'DEGRADED';
-  if (!snapshot.counts.store_open) return 'MAINTENANCE';
-  return 'HEALTHY';
+export function resolveHealthStatus({ financialBroken, paymentState, health, snapshot }) {
+  const operationalStatus = financialBroken || paymentState.redeemedStuck > 0
+    || snapshot.backupCorruption > 0 || snapshot.restoreFailure > 0
+    ? 'INCIDENT'
+    : paymentState.queueStuck > 0 || snapshot.queue.stuck || snapshot.outbox.stuck
+      || Number(snapshot.scheduler.lag_ms) > 5_000
+      ? 'DEGRADED'
+      : snapshot.counts.store_open ? 'HEALTHY' : 'MAINTENANCE';
+  health.operationalStatus = operationalStatus;
+  return recomputeHealthStatus({ health, operationalStatus });
 }
 
 export async function evaluateAlerts({ pool, health, env = { BACKUP_ENABLED: true }, eventLoopMonitor = null }) {

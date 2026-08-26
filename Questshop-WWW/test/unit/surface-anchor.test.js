@@ -8,6 +8,8 @@ import {
 import { normalizeDiscordPayload } from '../../src/discord/payload.js';
 import {
   QUEST_AUTO_MEDIA_ATTACHMENT_URL, QUEST_AUTO_MEDIA_FILENAME, QUEST_AUTO_MEDIA_SIZE, loadQuestAutoMedia,
+  QUEST_AUTO_THUMBNAIL_ATTACHMENT_URL, QUEST_AUTO_THUMBNAIL_FILENAME, QUEST_AUTO_THUMBNAIL_SIZE,
+  loadQuestAutoThumbnail,
 } from '../../src/discord/surfaces/quest-auto-media.js';
 
 function createChannel({ listedMessages = [], sentMessage = { id: 'new-anchor' } } = {}) {
@@ -47,19 +49,25 @@ function cloneJson(value) {
 
 function questAutoMessage(expected) {
   const attachmentUrl = 'https://cdn.example/quest-auto-demo.gif';
+  const thumbnailUrl = 'https://cdn.example/quest-auto-thumbnail.gif';
   return {
     content: '',
-    attachments: new Map([['gif', {
-      name: QUEST_AUTO_MEDIA_FILENAME, size: QUEST_AUTO_MEDIA_SIZE, url: attachmentUrl,
-    }]]),
-    embeds: [{ ...cloneJson(expected.embeds[0]), image: { url: attachmentUrl } }],
+    attachments: new Map([
+      ['gif', { name: QUEST_AUTO_MEDIA_FILENAME, size: QUEST_AUTO_MEDIA_SIZE, url: attachmentUrl }],
+      ['thumbnail', {
+        name: QUEST_AUTO_THUMBNAIL_FILENAME, size: QUEST_AUTO_THUMBNAIL_SIZE, url: thumbnailUrl,
+      }],
+    ]),
+    embeds: [{
+      ...cloneJson(expected.embeds[0]), image: { url: attachmentUrl }, thumbnail: { url: thumbnailUrl },
+    }],
     components: cloneJson(expected.components),
   };
 }
 
 test('Quest Auto uses the Owner-approved storefront copy and one price when categories match', () => {
   const body = renderQuestAuto({ priceRange: { minCents: 500n, maxCents: 500n } });
-  assert.equal(body.embeds[0].data.title, 'Discord Quest • Auto');
+  assert.equal(body.embeds[0].data.title, 'Discord Quest Auto');
   assert.equal(body.embeds[0].data.description, [
     'ทำ Quest เพื่อสะสม **Discord Orbs** ด้วยระบบอัตโนมัติ',
     '**ค่าบริการ 5 บาท / เควสสำเร็จ**',
@@ -67,6 +75,7 @@ test('Quest Auto uses the Owner-approved storefront copy and one price when cate
     'เลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ',
   ].join('\n'));
   assert.equal(body.embeds[0].data.image.url, QUEST_AUTO_MEDIA_ATTACHMENT_URL);
+  assert.equal(body.embeds[0].data.thumbnail.url, QUEST_AUTO_THUMBNAIL_ATTACHMENT_URL);
   assert.equal(body.embeds[0].data.footer, undefined);
 });
 
@@ -140,11 +149,21 @@ test('Quest Auto recovers its invisible anchor by stable nonce instead of a visi
     id: 'quest-auto-anchor',
     nonce: surfaceNonce('QUEST_AUTO'),
     author: { id: 'bot' },
-    attachments: new Map([['gif', {
-      name: QUEST_AUTO_MEDIA_FILENAME, size: QUEST_AUTO_MEDIA_SIZE,
-      url: 'https://cdn.example/quest-auto-demo.gif',
-    }]]),
-    embeds: [{ title: 'Discord Quest • Auto', image: { url: 'https://cdn.example/quest-auto-demo.gif' } }],
+    attachments: new Map([
+      ['gif', {
+        name: QUEST_AUTO_MEDIA_FILENAME, size: QUEST_AUTO_MEDIA_SIZE,
+        url: 'https://cdn.example/quest-auto-demo.gif',
+      }],
+      ['thumbnail', {
+        name: QUEST_AUTO_THUMBNAIL_FILENAME, size: QUEST_AUTO_THUMBNAIL_SIZE,
+        url: 'https://cdn.example/quest-auto-thumbnail.gif',
+      }],
+    ]),
+    embeds: [{
+      title: 'Discord Quest Auto',
+      image: { url: 'https://cdn.example/quest-auto-demo.gif' },
+      thumbnail: { url: 'https://cdn.example/quest-auto-thumbnail.gif' },
+    }],
     edit: async () => marker,
   };
   const channel = createChannel({ listedMessages: [marker] });
@@ -154,18 +173,33 @@ test('Quest Auto recovers its invisible anchor by stable nonce instead of a visi
   assert.equal(channel.sent.length, 0);
 });
 
-test('Quest Auto bundled GIF is the exact uploaded asset', async () => {
+test('Quest Auto bundled GIF and thumbnail are the exact uploaded assets', async () => {
   const media = await loadQuestAutoMedia();
+  const thumbnail = await loadQuestAutoThumbnail();
   assert.ok(Buffer.isBuffer(media));
+  assert.ok(Buffer.isBuffer(thumbnail));
   assert.equal(media.length, 9_190_692);
+  assert.equal(thumbnail.length, QUEST_AUTO_THUMBNAIL_SIZE);
   assert.equal(media.subarray(0, 6).toString('ascii'), 'GIF89a');
+  assert.equal(thumbnail.subarray(0, 6).toString('ascii'), 'GIF89a');
+  assert.equal([...thumbnail].filter((_, index) => thumbnail[index] === 0x21
+    && thumbnail[index + 1] === 0xf9 && thumbnail[index + 2] === 0x04).length, 56);
 });
 
-test('Quest Auto embeds the uploaded GIF and clears stale attachments', async () => {
+test('Quest Auto replaces a legacy PNG thumbnail with the uploaded GIF assets', async () => {
   const edits = [];
   const existing = {
     id: 'quest-auto',
-    attachments: new Map([['legacy', { name: 'videoplayback.mp4' }]]),
+    attachments: new Map([
+      ['demo', {
+        name: QUEST_AUTO_MEDIA_FILENAME, size: QUEST_AUTO_MEDIA_SIZE,
+        url: 'https://cdn.example/quest-auto-demo.gif',
+      }],
+      ['legacy-thumbnail', {
+        name: 'quest-auto-thumbnail.png', size: 1_447_045,
+        url: 'https://cdn.example/quest-auto-thumbnail.png',
+      }],
+    ]),
     edit: async (body) => {
       edits.push(body);
       return existing;
@@ -177,22 +211,32 @@ test('Quest Auto embeds the uploaded GIF and clears stale attachments', async ()
   assert.equal(edits.length, 1);
   assert.deepEqual(edits[0].attachments, []);
   assert.equal(edits[0].files?.[0]?.name, QUEST_AUTO_MEDIA_FILENAME);
+  assert.equal(edits[0].files?.[1]?.name, QUEST_AUTO_THUMBNAIL_FILENAME);
   assert.ok(Buffer.isBuffer(edits[0].files[0].attachment));
+  assert.ok(Buffer.isBuffer(edits[0].files[1].attachment));
   assert.equal(edits[0].files[0].attachment.length, 9_190_692);
+  assert.equal(edits[0].files[1].attachment.length, QUEST_AUTO_THUMBNAIL_SIZE);
   assert.equal(edits[0].files[0].attachment.subarray(0, 6).toString('ascii'), 'GIF89a');
   assert.equal(edits[0].embeds[0].image.url, QUEST_AUTO_MEDIA_ATTACHMENT_URL);
+  assert.equal(edits[0].embeds[0].thumbnail.url, QUEST_AUTO_THUMBNAIL_ATTACHMENT_URL);
   assert.equal(edits[0].embeds[0].footer, undefined);
   assert.match(edits[0].embeds[0].description, /ค่าบริการ 5-7 บาท/);
 });
 
-test('Quest Auto keeps its existing uploaded GIF instead of uploading a duplicate on refresh', async () => {
+test('Quest Auto keeps its existing uploaded media instead of uploading duplicates on refresh', async () => {
   let editedBody;
   const existing = {
     id: 'quest-auto',
-    attachments: new Map([['gif', {
-      name: QUEST_AUTO_MEDIA_FILENAME, size: QUEST_AUTO_MEDIA_SIZE,
-      url: 'https://cdn.example/quest-auto-demo.gif',
-    }]]),
+    attachments: new Map([
+      ['gif', {
+        name: QUEST_AUTO_MEDIA_FILENAME, size: QUEST_AUTO_MEDIA_SIZE,
+        url: 'https://cdn.example/quest-auto-demo.gif',
+      }],
+      ['thumbnail', {
+        name: QUEST_AUTO_THUMBNAIL_FILENAME, size: QUEST_AUTO_THUMBNAIL_SIZE,
+        url: 'https://cdn.example/quest-auto-thumbnail.gif',
+      }],
+    ]),
     edit: async (body) => {
       editedBody = body;
       return existing;
@@ -203,6 +247,7 @@ test('Quest Auto keeps its existing uploaded GIF instead of uploading a duplicat
   assert.equal(editedBody.files, undefined);
   assert.equal(editedBody.attachments, undefined);
   assert.equal(editedBody.embeds[0].image.url, QUEST_AUTO_MEDIA_ATTACHMENT_URL);
+  assert.equal(editedBody.embeds[0].thumbnail.url, QUEST_AUTO_THUMBNAIL_ATTACHMENT_URL);
 });
 
 test('Quest Auto reconciliation detects stale price and rejects the old visible technical footer', () => {

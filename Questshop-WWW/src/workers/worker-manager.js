@@ -10,6 +10,7 @@ import { runMaintenance } from './maintenance-worker.js';
 import { createContext } from '../shared/correlation.js';
 import { scanMonitor } from './discovery-worker.js';
 import { testQuest } from './quest-test-worker.js';
+import { processCustomerDiscoveryMonitorSearch } from './customer-discovery-monitor-worker.js';
 import { runScheduledBackup } from './backup-worker.js';
 import { runRetention } from './retention-worker.js';
 import { rotateEncryptedRows } from './key-rotation-worker.js';
@@ -20,6 +21,7 @@ import { reconcileIncident } from '../domain/incidents/service.js';
 import { reconcileSurfaceAnchors } from '../discord/surfaces/setup.js';
 import { APPLICATION_EVENTS, applicationEvents } from '../shared/application-events.js';
 import { safeError } from '../shared/redaction.js';
+import { recomputeHealthStatus } from '../bootstrap/health-status.js';
 
 async function gate(pool, name) {
   return (await pool.query('SELECT enabled FROM feature_gates WHERE gate = $1', [name])).rows[0]?.enabled === true;
@@ -101,12 +103,11 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
         && health.checks.keyrings === 'OK';
       health.ready = ready;
       if (ready) health.lastError = null;
-      if (!ready) health.status = 'NOT_READY';
-      else if (health.status === 'NOT_READY') health.status = 'HEALTHY';
+      health.status = recomputeHealthStatus({ health });
       return false;
     } catch (error) {
-      health.ready = false; health.status = 'NOT_READY';
-      health.checks.database = 'FAILED'; health.lastError = error;
+      health.ready = false; health.checks.database = 'FAILED';
+      health.status = recomputeHealthStatus({ health }); health.lastError = error;
       throw error;
     }
   }, 5_000);
@@ -161,6 +162,10 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
       && scanMonitor({ env, pool, signal, holder: scannerHolder,
         runnerConcurrency: configuredRunnerConcurrency(client, env) }), 60_000);
     const testHolder = uuidv7();
+    const customerDiscoveryHolder = uuidv7();
+    start('customer-discovery-monitor-search', async () => (await gate(pool, 'QUEST_BACKGROUND_TESTING_ENABLED'))
+      && processCustomerDiscoveryMonitorSearch({ env, pool, signal, holder: customerDiscoveryHolder,
+        runnerConcurrency: configuredRunnerConcurrency(client, env) }), 1_000);
     start('quest-test', async () => (await gate(pool, 'QUEST_BACKGROUND_TESTING_ENABLED'))
       && testQuest({ env, pool, signal, holder: testHolder,
         runnerConcurrency: configuredRunnerConcurrency(client, env) }), 1_000);

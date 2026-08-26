@@ -10,7 +10,7 @@ after(async () => { await pool?.end(); });
 
 const release = Object.freeze({ prelaunch: true, gitSha: '9cf9a75', appVersion: '0.1.0', engineVersion: '1.0.0' });
 
-test('pre-launch gate changes preserve an append-only Git-SHA release evidence record', async (t) => {
+test('pre-launch gate changes preserve append-only release evidence without requiring a Git SHA', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const context = createContext({ actorType: 'OWNER', actorId: 'owner', guildId: 'guild',
     idempotencyKey: 'prelaunch-gate-evidence' });
@@ -24,8 +24,11 @@ test('pre-launch gate changes preserve an append-only Git-SHA release evidence r
   assert.equal(evidence.prelaunch, true);
   assert.equal(evidence.evidence.enabled, true);
   const orderGate = (await pool.query("SELECT * FROM feature_gates WHERE gate='ORDER_ACCEPTING'")).rows[0];
-  await assert.rejects(() => updateFeatureGate({ gate: 'ORDER_ACCEPTING', enabled: true,
-    expectedVersion: orderGate.version, reason: 'missing deploy sha', release: { ...release, gitSha: 'unknown' } }, context, { pool }),
-  (error) => error.code === 'RELEASE_SHA_REQUIRED');
-  assert.equal(Number((await pool.query('SELECT count(*) AS count FROM release_evidence')).rows[0].count), 1);
+  const untracked = await updateFeatureGate({ gate: 'ORDER_ACCEPTING', enabled: true,
+    expectedVersion: orderGate.version, reason: 'deployment revision not supplied',
+    release: { ...release, gitSha: 'untracked' } }, context, { pool });
+  assert.equal(untracked.enabled, true);
+  assert.equal((await pool.query(`SELECT git_sha FROM release_evidence WHERE subject_id=$1`,
+    [`ORDER_ACCEPTING:v${untracked.version}`])).rows[0].git_sha, 'untracked');
+  assert.equal(Number((await pool.query('SELECT count(*) AS count FROM release_evidence')).rows[0].count), 2);
 });
