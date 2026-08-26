@@ -52,10 +52,8 @@ import {
   renderPaymentMethod,
   renderQuote,
   renderSelection,
-  renderTopupProcessing,
-  renderTopupResult,
 } from '../renderers/checkout.js';
-import { waitForCustomerTopup } from '../../domain/payments/customer-status.js';
+import { acknowledgeTopupAndStartSettlement } from './topup-acknowledgement.js';
 import { adminNavigationComponents } from '../renderers/admin.js';
 import { orderStateLabel } from '../renderers/labels.js';
 import { QUEST_PRICE_CATEGORIES } from '../../domain/pricing/categories.js';
@@ -719,7 +717,7 @@ async function handleCustomerQuestPublish({ interaction, route, runtime, gates: 
   if (!caseRow) return interaction.editReply('รายการเก่านี้ยังไม่มี Case ใหม่ กรุณารอการตรวจครั้งถัดไป');
   const result = await queueCustomerDiscoveryAnnouncement({ caseId: caseRow.id },
     contextFor(interaction, 'customer_discovery_publish'), { pool: runtime.pool });
-  return interaction.editReply(result.reused
+  return interaction.editReply(result.idempotent
     ? 'Quest นี้ถูกสั่งประกาศแล้ว'
     : 'รับคำสั่งแล้ว Quest จะถูกประกาศในห้อง Quest ใหม่');
 }
@@ -920,10 +918,7 @@ if (route.route === 'voucher_submit' && interaction.isModalSubmit()) {
     throw error;
   }
   await completeInteractionSession(session, interaction, runtime);
-  await interaction.editReply(renderTopupProcessing(result.topup.id));
-  const topup = await waitForCustomerTopup({ topupId: result.topup.id,
-    discordUserId: interaction.user.id, signal: runtime.abortController?.signal }, { pool: runtime.pool });
-  return interaction.editReply(renderTopupResult(topup));
+  return acknowledgeTopupAndStartSettlement({ interaction, result, runtime });
 }
 }
 

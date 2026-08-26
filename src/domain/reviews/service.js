@@ -10,6 +10,7 @@ import { REVIEW_TRANSITIONS } from './states.js';
 import { ORDER_ITEM_TRANSITIONS } from '../orders/states.js';
 import { RUNNER_JOB_TRANSITIONS } from '../runner/states.js';
 import { TOPUP_TRANSITIONS } from '../payments/states.js';
+import { enqueueCustomerTopupStatus } from '../payments/customer-notification.js';
 import { TEST_TRANSITIONS } from '../catalog/states.js';
 import { createMonitorTestBatch, hasCurrentTestPass, questDeadlinePassed } from '../catalog/test-gate.js';
 import { appendLedger } from '../wallet/ledger.js';
@@ -237,6 +238,7 @@ async function applyReversalReviewDecision(client, review, topup, decision, inpu
     reason: input.reason, context });
   await enqueueProjection(client, { projectionType: 'PAYMENT_STATUS_LOG', aggregateType: 'TOPUP',
     aggregateId: topup.id, aggregateVersion: updated.state_version, surfaceKey: 'LOG_PAYMENTS', context });
+  await enqueueCustomerTopupStatus(client, updated, context);
   return { topupId: topup.id, status: updated.status, transactionId: ledger.id };
 }
 
@@ -261,9 +263,7 @@ async function applyTopupDecision(client, review, decision, input, context) {
     await enqueueProjection(client, { projectionType: 'PAYMENT_LOG', aggregateType: 'TOPUP',
       aggregateId: topup.id, aggregateVersion: updated.state_version,
       surfaceKey: 'LOG_PAYMENTS', context });
-    await enqueueProjection(client, { projectionType: 'TOPUP_STATUS_DM', aggregateType: 'TOPUP',
-      aggregateId: topup.id, aggregateVersion: updated.state_version, surfaceKey: `DM:${updated.discord_user_id}`,
-      topic: 'TOPUP_STATUS_DM', context });
+    await enqueueCustomerTopupStatus(client, updated, context);
     return { topupId: topup.id, status: updated.status };
   }
   if (decision !== 'CREDIT') throw new TypeError('invalid top-up review decision');

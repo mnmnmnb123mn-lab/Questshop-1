@@ -11,6 +11,7 @@ import {
 import { RUNNER_JOB_TRANSITIONS } from '../domain/runner/states.js';
 import { ORDER_ITEM_TRANSITIONS } from '../domain/orders/states.js';
 import { TOPUP_TRANSITIONS } from '../domain/payments/states.js';
+import { enqueueCustomerTopupStatus } from '../domain/payments/customer-notification.js';
 import { ANALYSIS_TRANSITIONS, SALE_TRANSITIONS, TEST_TRANSITIONS } from '../domain/catalog/states.js';
 import { enqueueProjection } from '../domain/outbox/service.js';
 import { loadRuntimeConfig } from '../config/runtime-config.js';
@@ -237,6 +238,7 @@ async function recoverCrashedPayments(database, context) {
       reasonCode: 'PROCESS_CRASH_AFTER_POSSIBLE_SEND', context: tracedContext });
     await openReview(database, { subjectType: 'TOPUP', subjectId: row.id,
       reason: 'PROCESS_CRASH_AFTER_POSSIBLE_SEND', financial: true, ownerOnly: true, context: tracedContext });
+    await enqueueCustomerTopupStatus(database, reviewState, tracedContext);
   }
   const retries = (await database.query(`SELECT * FROM topups
       WHERE status='RETRY_WAIT' AND available_at<=clock_timestamp()
@@ -250,6 +252,7 @@ async function recoverCrashedPayments(database, context) {
     if (!updated) throw new QuestshopError('STALE_TOPUP_STATE', `Top-up ${row.id} changed during recovery`);
     await recordTransition(database, { aggregateType: 'TOPUP', aggregateId: updated.id,
       fromState: row.status, toState: 'PAYMENT_QUEUED', stateVersion: updated.state_version, context });
+    await enqueueCustomerTopupStatus(database, updated, context);
   }
 }
 

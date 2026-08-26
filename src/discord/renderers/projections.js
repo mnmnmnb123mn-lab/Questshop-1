@@ -23,9 +23,10 @@ import {
   PAYMENT_LOG_BANNER_ATTACHMENT_URL, PAYMENT_LOG_BANNER_FILENAME, loadPaymentLogBanner,
 } from '../surfaces/payment-log-media.js';
 import {
+  ADMIN_LOG_BANNER_ATTACHMENT_URL, ADMIN_LOG_BANNER_FILENAME,
   BACKOFFICE_LOG_BANNER_ATTACHMENT_URL, BACKOFFICE_LOG_BANNER_FILENAME,
   LOG_SYSTEM_THUMBNAIL_ATTACHMENT_URL, LOG_SYSTEM_THUMBNAIL_FILENAME,
-  loadBackofficeLogBanner, loadLogSystemThumbnail,
+  loadAdminLogBanner, loadBackofficeLogBanner, loadLogSystemThumbnail,
 } from '../surfaces/backoffice-log-media.js';
 
 const color = { pending: 0xf0b232, success: 0x23a55a, failure: 0xf23f43, info: 0x5865f2 };
@@ -57,8 +58,8 @@ function paymentReasonLabel(value) {
 }
 function paymentEmbedColor(status) {
   if (status === 'CREDITED') return color.success;
-  if (status === 'MANUAL_REVIEW' || status === 'REDEEMED') return color.pending;
-  if (['PAYMENT_QUEUED', 'PROCESSING', 'VALIDATING', 'RETRY_WAIT', 'RECEIVED'].includes(status)) return color.info;
+  if (status === 'MANUAL_REVIEW' || status === 'RETRY_WAIT') return color.pending;
+  if (['PAYMENT_QUEUED', 'PROCESSING', 'VALIDATING', 'REDEEMED', 'RECEIVED'].includes(status)) return color.info;
   return color.failure;
 }
 function orderItemLine(item) {
@@ -253,45 +254,74 @@ async function renderPaymentLog(pool, projection, { env, client }) {
   };
 }
 
-async function renderTopupStatusDm(pool, projection) {
-  const topup = (await pool.query(`SELECT id,status,failure_code,warning_code,updated_at
-    FROM topups WHERE id=$1`, [projection.aggregate_id])).rows[0];
+function customerTopupStatus(status) {
+  return {
+    PAYMENT_QUEUED: ['⏳ รับรายการเติมเงินแล้ว', 'ระบบบันทึกรายการแล้วและกำลังเริ่มตรวจสอบซองกับ TrueMoney'],
+    PROCESSING: ['🔄 กำลังตรวจสอบซอง', 'ระบบกำลังตรวจสอบซองกับ TrueMoney กรุณาอย่าส่งซองเดิมซ้ำ'],
+    RETRY_WAIT: ['🟡 กำลังลองตรวจสอบใหม่', 'การเชื่อมต่อก่อนส่งคำขอยังไม่สำเร็จ ระบบจะลองใหม่อย่างปลอดภัย'],
+    REDEEMED: ['⏳ รับเงินจากซองแล้ว', 'TrueMoney ยืนยันการรับเงินแล้ว ระบบกำลังเพิ่มเครดิตเข้ากระเป๋า'],
+    CREDITED: ['✅ เติมเครดิตสำเร็จ', 'เครดิตถูกเพิ่มเข้ากระเป๋าของคุณเรียบร้อยแล้ว'],
+    MANUAL_REVIEW: ['🔎 รายการเติมเงินกำลังตรวจสอบ', 'ระบบยังไม่ได้เพิ่มเครดิต รายการนี้ถูกส่งให้ Owner ตรวจสอบ'],
+    REJECTED: ['⚠️ รายการเติมเงินไม่ได้รับอนุมัติ', 'รายการนี้ไม่ได้เพิ่มเครดิต หากต้องการความช่วยเหลือให้ติดต่อ Owner พร้อม Top-up ID'],
+    INVALID: ['❌ ใช้ซองนี้ไม่ได้', 'ระบบไม่ได้เพิ่มเครดิตจากซองนี้ กรุณาตรวจสอบลิงก์แล้วสร้างซองใหม่'],
+    EXPIRED: ['❌ ซองหมดอายุแล้ว', 'ระบบไม่ได้เพิ่มเครดิตจากซองนี้ กรุณาสร้างซองใหม่แล้วส่งอีกครั้ง'],
+    ALREADY_REDEEMED: ['❌ ซองถูกใช้ไปแล้ว', 'ระบบไม่ได้เพิ่มเครดิตจากซองนี้ กรุณาใช้ซองที่ยังไม่เคยรับ'],
+    FAILED: ['❌ เติมเครดิตไม่สำเร็จ', 'รายการนี้ไม่ได้เพิ่มเครดิต คุณสามารถลองใหม่ด้วยซองใหม่ได้'],
+    REVERSED: ['↩️ เครดิตถูกย้อนกลับ', 'เครดิตจากรายการนี้ถูกย้อนกลับตามผลการตรวจสอบ'],
+  }[status] ?? ['ℹ️ อัปเดตสถานะเติมเงิน', 'สถานะรายการเติมเงินมีการเปลี่ยนแปลง'];
+}
+
+async function renderTopupStatusDm(pool, projection, { client } = {}) {
+  const topup = (await pool.query(`SELECT t.*,
+    l.available_before_cents,l.available_after_cents,w.available_cents AS wallet_available_cents
+    FROM topups t
+    LEFT JOIN wallets w ON w.discord_user_id=t.discord_user_id
+    LEFT JOIN LATERAL (SELECT x.* FROM wallet_transactions x
+      WHERE x.reference_type='TOPUP' AND x.reference_id=t.id::text
+      ORDER BY x.created_at DESC LIMIT 1) l ON true
+    WHERE t.id=$1`, [projection.aggregate_id])).rows[0];
   if (!topup) return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('ไม่พบสถานะเติมเงิน')], allowedMentions: noMentions };
-  const status = {
-    CREDITED: {
-      color: color.success,
-      title: '✅ เติมเครดิตสำเร็จ',
-      message: 'ระบบเพิ่มเครดิตเข้ากระเป๋าเงินของคุณเรียบร้อยแล้ว',
-    },
-    MANUAL_REVIEW: {
-      color: color.pending,
-      title: '🔎 รายการเติมเงินกำลังตรวจสอบ',
-      message: 'ระบบยังไม่ได้เพิ่มเครดิต รายการนี้ถูกส่งให้ Owner ตรวจสอบเพื่อป้องกันความคลาดเคลื่อนของยอดเงิน',
-    },
-    REJECTED: {
-      color: color.failure,
-      title: '⚠️ รายการเติมเงินไม่ได้รับอนุมัติ',
-      message: 'รายการนี้ไม่ได้เพิ่มเครดิต หากต้องการความช่วยเหลือ โปรดติดต่อ Owner พร้อม Top-up ID นี้',
-    },
-    INVALID: { color: color.failure, title: '⚠️ ใช้ซองนี้ไม่ได้', message: 'ระบบไม่ได้เพิ่มเครดิตจากซองนี้' },
-    EXPIRED: { color: color.failure, title: '⚠️ ซองหมดอายุแล้ว', message: 'ระบบไม่ได้เพิ่มเครดิตจากซองนี้' },
-    ALREADY_REDEEMED: { color: color.failure, title: '⚠️ ซองถูกใช้ไปแล้ว', message: 'ระบบไม่ได้เพิ่มเครดิตจากซองนี้' },
-    FAILED: { color: color.failure, title: '⚠️ เติมเงินไม่สำเร็จ', message: 'ระบบไม่ได้เพิ่มเครดิตจากซองนี้' },
-  }[topup.status] ?? {
-    color: color.info,
-    title: 'อัปเดตสถานะเติมเงิน',
-    message: 'สถานะรายการเติมเงินมีการเปลี่ยนแปลง',
-  };
+  const [heading, message] = customerTopupStatus(topup.status);
   const reason = paymentReasonLabel(topup.failure_code ?? topup.warning_code);
-  const description = [
-    status.message,
+  const terminal = ['CREDITED', 'MANUAL_REVIEW', 'REJECTED', 'INVALID', 'EXPIRED', 'ALREADY_REDEEMED', 'FAILED', 'REVERSED']
+    .includes(topup.status);
+  const total = BigInt(topup.amount_cents ?? 0) + BigInt(topup.bonus_cents ?? 0);
+  const hasCreditAmounts = ['CREDITED', 'REVERSED'].includes(topup.status);
+  const lines = [
+    message,
     '',
-    `**Top-up ID:** \`${topup.id}\``,
+    '**ข้อมูลรายการ**',
+    `**Top-up ID:** \`${escape(topup.id)}\``,
     `**สถานะ:** ${topupStateLabel(topup.status)}`,
-    ...(reason ? [`**เหตุผล:** ${reason}`] : []),
-  ].join('\n');
-  return { embeds: [new EmbedBuilder().setColor(status.color).setTitle(status.title)
-    .setDescription(boundedDescription(description)).setTimestamp(topup.updated_at)], allowedMentions: noMentions };
+    `**ส่งรายการเมื่อ:** ${timestamp(topup.created_at, 'F')}`,
+    ...(topup.credited_at ? [`**${['CREDITED', 'REVERSED'].includes(topup.status) ? 'เติมสำเร็จเมื่อ' : 'ดำเนินการล่าสุดเมื่อ'}:** ${timestamp(topup.credited_at, 'F')}`] : []),
+    ...(terminal && !topup.credited_at ? [`**ดำเนินการล่าสุดเมื่อ:** ${timestamp(topup.updated_at, 'F')}`] : []),
+  ];
+  if (hasCreditAmounts) {
+    lines.push('', '**รายละเอียดเครดิต**');
+    if (topup.status === 'REVERSED') {
+      lines.push(`**ยอดที่ย้อนกลับ:** ${moneyOrUnknown(total)}`);
+      lines.push(`**ยอดคงเหลือปัจจุบัน:** ${moneyOrUnknown(topup.wallet_available_cents)}`);
+    } else {
+      lines.push(`**ยอดก่อนเติม:** ${moneyOrUnknown(topup.available_before_cents)}`);
+      lines.push(`**ยอดเงินจากซอง:** ${moneyOrUnknown(topup.amount_cents)}`);
+      lines.push(`**โบนัสโปรโมชั่น:** ${moneyOrUnknown(topup.bonus_cents)}`);
+      lines.push(`**ได้รับทั้งหมด:** ${moneyOrUnknown(total)}`);
+      lines.push(`**ยอดคงเหลือใหม่:** ${moneyOrUnknown(topup.available_after_cents ?? topup.wallet_available_cents)}`);
+    }
+  }
+  if (reason) lines.push('', `**เหตุผล:** ${reason}`);
+  lines.push('', 'โปรดเก็บ Top-up ID ไว้สำหรับติดต่อผู้ดูแล');
+  const embed = new EmbedBuilder().setColor(paymentEmbedColor(topup.status)).setTitle(title(heading))
+    .setDescription(boundedDescription(lines.join('\n')))
+    .setImage(PAYMENT_LOG_BANNER_ATTACHMENT_URL)
+    .setTimestamp(topup.updated_at);
+  await setDiscordUserThumbnail(embed, client, topup.discord_user_id);
+  return {
+    embeds: [embed], attachments: [],
+    files: [{ attachment: await loadPaymentLogBanner(), name: PAYMENT_LOG_BANNER_FILENAME }],
+    allowedMentions: noMentions,
+  };
 }
 
 async function renderQuestOperation(pool, projection) {
@@ -378,37 +408,46 @@ async function renderCustomerQuestDiscovery(pool, projection, { client } = {}) {
 }
 
 async function renderCustomerQuestDiscoveryCase(pool, projection, { client } = {}) {
-  const found = (await pool.query(`SELECT c.*,q.name,q.task_type,q.url,q.artwork_url,b.cycle_number,b.state AS search_state
+  const found = (await pool.query(`SELECT c.*,q.name,q.task_type,q.url,q.artwork_url,b.cycle_number,b.state AS search_state,
+      latest.created_at AS latest_discovered_at
     FROM customer_quest_discovery_cases c JOIN quests q ON q.quest_id=c.quest_id
-    LEFT JOIN customer_quest_monitor_search_batches b ON b.id=c.current_search_batch_id WHERE c.id=$1`,
+    LEFT JOIN customer_quest_discoveries latest ON latest.id=c.latest_discovery_id
+    LEFT JOIN customer_quest_monitor_search_batches b ON b.id=c.current_search_batch_id
+    LEFT JOIN LATERAL (SELECT enabled AS background_testing_enabled FROM feature_gates
+      WHERE gate='QUEST_BACKGROUND_TESTING_ENABLED') gate ON true WHERE c.id=$1`,
   [projection.aggregate_id])).rows[0];
   if (!found) return missingProjection('ไม่พบรายการ Quest ที่พบจากลูกค้า');
   const labels = {
-    CHECK_QUEUED: 'กำลังเข้าคิวตรวจบัญชีทดสอบ', CHECKING: 'กำลังตรวจบัญชีทดสอบ',
+    NOT_CHECKED: 'ยังไม่ได้ตรวจบัญชีทดสอบ', CHECK_QUEUED: 'กำลังเข้าคิวตรวจบัญชีทดสอบ', CHECKING: 'กำลังตรวจบัญชีทดสอบ',
     NOT_FOUND: 'ไม่พบ Quest ในบัญชีทดสอบ', CHECK_INCOMPLETE: 'ตรวจบัญชีทดสอบไม่ครบ',
     FOUND_NOT_TESTABLE: 'พบ Quest แต่ไม่มีบัญชีที่พร้อมทดสอบ', TESTING: 'กำลังทดสอบ Quest',
     TEST_FAILED: 'ทดสอบ Quest ไม่ผ่าน', PASSED: 'ทดสอบ Quest ผ่านแล้ว',
   };
   const verification = labels[found.verification_state] ?? 'กำลังตรวจสอบ Quest';
+  const testingEnabled = found.background_testing_enabled !== false;
   const result = found.last_result ?? {};
   const action = found.verification_state === 'PASSED'
     ? (found.announcement_state === 'ANNOUNCED' ? 'ระบบทดสอบผ่านและประกาศ Quest แล้ว' : 'ระบบทดสอบผ่านและส่ง Quest เข้าคิวประกาศแล้ว')
     : ['NOT_FOUND', 'CHECK_INCOMPLETE', 'FOUND_NOT_TESTABLE', 'TEST_FAILED'].includes(found.verification_state)
       ? 'ผู้ดูแลเลือกตรวจและทดสอบใหม่ หรือส่งประกาศจากข้อมูลที่ลูกค้าพบได้'
+      : !testingEnabled ? 'ระบบทดสอบอัตโนมัติปิดอยู่ Checkout ของลูกค้ายังใช้งานได้ตามปกติ'
       : 'ระบบกำลังดำเนินการตรวจ Quest นี้โดยอัตโนมัติ';
   const questUrl = safeHttpsUrl(found.url);
   const description = [
-    `**ผู้พบครั้งแรก:** <@${escape(found.first_discord_user_id)}>`,
+    `**ผู้พบครั้งแรก:** <@${escape(found.first_discord_user_id)}> • ${timestamp(found.created_at)}`,
+    `**พบล่าสุด:** ${timestamp(found.latest_discovered_at ?? found.created_at)}`,
     `**บัญชี Quest ล่าสุด:** ${escape(found.latest_account_username ?? 'ไม่ระบุ')} (\`${escape(found.latest_account_id ?? 'ไม่ระบุ')}\`)`,
     `**Quest:** ${escape(found.name)}`, `**ประเภท:** ${questTypeLabel(found.task_type)}`,
     questUrl ? `**ลิงก์ Quest:** ${questUrl}` : null,
     `**สถานะตรวจ:** ${verification}`,
+    !testingEnabled && ['CHECK_QUEUED', 'CHECKING'].includes(found.verification_state)
+      ? '**ระบบทดสอบ:** ปิดอยู่ — รอเปิดใช้งานก่อนจึงจะตรวจต่อ' : null,
     `**ตรวจบัญชีทดสอบ:** ${Number(result.total ?? 0)} บัญชี • พบ ${Number(result.found ?? 0)} • พร้อมทดสอบ ${Number(result.testable ?? 0)} • ไม่พบ ${Number(result.notFound ?? 0)} • ตรวจไม่ได้ ${Number(result.failed ?? 0)}`,
     `**สถานะประกาศ:** ${found.announcement_state === 'ANNOUNCED' ? 'ประกาศแล้ว' : found.announcement_state === 'QUEUED' ? 'กำลังส่งประกาศ' : 'ยังไม่ประกาศ'}`,
     reference([`รหัส Quest: \`${escape(found.quest_id)}\``, `พบจากลูกค้า ${found.sighting_count} ครั้ง`, `รหัสติดตาม: \`${escape(found.trace_id)}\``]),
     summary(action),
   ].filter(Boolean).join('\n');
-  const terminal = ['NOT_FOUND', 'CHECK_INCOMPLETE', 'FOUND_NOT_TESTABLE', 'TEST_FAILED'].includes(found.verification_state);
+  const terminal = ['NOT_CHECKED', 'NOT_FOUND', 'CHECK_INCOMPLETE', 'FOUND_NOT_TESTABLE', 'TEST_FAILED'].includes(found.verification_state);
   const embed = new EmbedBuilder().setColor(found.verification_state === 'PASSED' ? color.success
     : terminal ? color.pending : color.info).setTitle(title(found.verification_state === 'PASSED'
     ? '✅ ตรวจและทดสอบ Quest จากลูกค้าแล้ว' : terminal ? '⚠️ ตรวจ Quest จากลูกค้ายังไม่สำเร็จ' : '🔎 พบ Quest ใหม่จาก Checkout ลูกค้า'))
@@ -739,10 +778,14 @@ async function withBackofficeMedia(projection, body) {
   if (!backofficeProjectionTypes.has(projection.projection_type)) return body;
   const { backofficeSystemThumbnail = false, ...payload } = body;
   const embed = payload.embeds?.[0];
-  if (embed?.setImage) embed.setImage(BACKOFFICE_LOG_BANNER_ATTACHMENT_URL);
+  const adminAudit = projection.projection_type === 'ADMIN_AUDIT';
+  const bannerUrl = adminAudit ? ADMIN_LOG_BANNER_ATTACHMENT_URL : BACKOFFICE_LOG_BANNER_ATTACHMENT_URL;
+  if (embed?.setImage) embed.setImage(bannerUrl);
   const needsSystemThumbnail = projection.projection_type === 'SYSTEM_INCIDENT' || backofficeSystemThumbnail;
   if (needsSystemThumbnail && embed?.setThumbnail) embed.setThumbnail(LOG_SYSTEM_THUMBNAIL_ATTACHMENT_URL);
-  const files = [{ attachment: await loadBackofficeLogBanner(), name: BACKOFFICE_LOG_BANNER_FILENAME }];
+  const files = [adminAudit
+    ? { attachment: await loadAdminLogBanner(), name: ADMIN_LOG_BANNER_FILENAME }
+    : { attachment: await loadBackofficeLogBanner(), name: BACKOFFICE_LOG_BANNER_FILENAME }];
   if (needsSystemThumbnail) files.push({ attachment: await loadLogSystemThumbnail(), name: LOG_SYSTEM_THUMBNAIL_FILENAME });
   return { ...payload, attachments: [], files };
 }

@@ -12,6 +12,39 @@ let pool;
 before(async () => { pool = await createTestPool(); });
 after(async () => { await pool?.end(); });
 
+async function activeReceiver(traceId) {
+  const current = (await pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1")).rows[0];
+  if (current) return current.id;
+  const id = uuidv7();
+  const version = Number((await pool.query('SELECT COALESCE(max(version),0)+1 AS version FROM receiver_versions')).rows[0].version);
+  await pool.query(`INSERT INTO receiver_versions(id,version,encrypted_phone,encryption_key_version,
+    nonce,auth_tag,phone_last4,state,actor_id,trace_id)
+    VALUES($1,$2,$3,1,$4,$5,'1234','ACTIVE','owner',$6)`,
+  [id, version, Buffer.alloc(10), Buffer.alloc(12), Buffer.alloc(16), traceId]);
+  return id;
+}
+
+async function createTopupStatusDmFixture({ status = 'PAYMENT_QUEUED' } = {}) {
+  const traceId = uuidv7();
+  const receiverId = await activeReceiver(traceId);
+  const topupId = uuidv7();
+  const discordUserId = `dm-topup-${topupId}`;
+  const projectionId = uuidv7();
+  const eventId = uuidv7();
+  await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
+    receiver_version_id,receiver_phone_last4,trace_id)
+    VALUES($1,$2,$3,1,$4,$5,'1234',$6)`,
+  [topupId, discordUserId, status, Buffer.from(topupId), receiverId, traceId]);
+  await pool.query(`INSERT INTO message_projections(id,projection_type,aggregate_id,surface_key,nonce)
+    VALUES($1,'TOPUP_STATUS_DM',$2,$3,$4)`,
+  [projectionId, topupId, `DM:${discordUserId}`, `topup-dm-${topupId.slice(0, 12)}`]);
+  await pool.query(`INSERT INTO outbox_events(id,topic,aggregate_type,aggregate_id,aggregate_version,
+    projection_id,projection_version,state,trace_id)
+    VALUES($1,'TOPUP_STATUS_DM','TOPUP',$2,1,$3,1,'PENDING',$4)`,
+  [eventId, topupId, projectionId, traceId]);
+  return { traceId, topupId, discordUserId, projectionId, eventId };
+}
+
 test('outbox exhausts bounded retries into schema-valid DLQ evidence', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const projection = uuidv7(); const event = uuidv7(); const trace = uuidv7();
@@ -109,6 +142,92 @@ test('final order DM is attempted once and a DM failure never retries or dead-le
   assert.equal(fetches, 1);
   assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [secondEvent])).rows[0].state,
     'DELIVERED');
+});
+
+test('disabled Top-up DM retries all backoff slots before Financial DLQ without changing money', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const fixture = await createTopupStatusDmFixture();
+  let fetches = 0;
+  const disabledClient = { users: { fetch: async () => {
+    fetches += 1;
+    throw Object.assign(new Error('DM disabled'), { status: 403, code: 50007 });
+  } } };
+  for (let attempt = 1; attempt <= 6; attempt += 1) {
+    assert.equal(await processOutbox({ holder: uuidv7(), client: disabledClient, pool, env: {} }), true);
+    const event = (await pool.query('SELECT state FROM outbox_events WHERE id=$1', [fixture.eventId])).rows[0];
+    assert.equal(event.state, 'RETRY_WAIT', `attempt ${attempt}`);
+    assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM dead_letter_items
+      WHERE source_id=$1`, [fixture.eventId])).rows[0].count), 0);
+    await pool.query('UPDATE outbox_events SET available_at=clock_timestamp() WHERE id=$1', [fixture.eventId]);
+  }
+  assert.equal(await processOutbox({ holder: uuidv7(), client: disabledClient, pool, env: {} }), true);
+  assert.equal(fetches, 7);
+  assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [fixture.eventId])).rows[0].state,
+    'DEAD_LETTER');
+  assert.equal((await pool.query(`SELECT category,state FROM dead_letter_items WHERE source_id=$1`, [fixture.eventId]))
+    .rows[0].category, 'FINANCIAL');
+  assert.equal((await pool.query('SELECT status FROM topups WHERE id=$1', [fixture.topupId])).rows[0].status,
+    'PAYMENT_QUEUED');
+  assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM wallet_transactions
+    WHERE reference_type='TOPUP' AND reference_id=$1`, [fixture.topupId])).rows[0].count), 0);
+});
+
+test('Top-up DM recovery coalesces a retry and edits the same message with the latest state', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const fixture = await createTopupStatusDmFixture();
+  const disabledClient = { users: { fetch: async () => {
+    throw Object.assign(new Error('DM disabled'), { status: 403, code: 50007 });
+  } } };
+  assert.equal(await processOutbox({ holder: uuidv7(), client: disabledClient, pool, env: {} }), true);
+  assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [fixture.eventId])).rows[0].state,
+    'RETRY_WAIT');
+
+  const context = createContext({ traceId: fixture.traceId, actorType: 'SYSTEM', actorId: 'test',
+    guildId: 'guild', idempotencyKey: `topup-dm-recover:${fixture.topupId}` });
+  const processing = (await pool.query(`UPDATE topups SET status='PROCESSING',state_version=state_version+1,
+    updated_at=clock_timestamp() WHERE id=$1 RETURNING *`, [fixture.topupId])).rows[0];
+  await enqueueProjection(pool, { projectionType: 'TOPUP_STATUS_DM', aggregateType: 'TOPUP',
+    aggregateId: fixture.topupId, aggregateVersion: processing.state_version,
+    surfaceKey: `DM:${fixture.discordUserId}`, topic: 'TOPUP_STATUS_DM', context });
+  assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [fixture.eventId])).rows[0].state,
+    'DELIVERED');
+
+  let sends = 0; let edits = 0;
+  const message = { id: 'topup-status-message', edit: async (body) => {
+    edits += 1;
+    assert.deepEqual(body.attachments, []);
+    assert.equal(body.files.length, 1);
+    return message;
+  } };
+  const channel = { isTextBased: () => true, send: async (body) => {
+    sends += 1;
+    assert.deepEqual(body.attachments, []);
+    assert.equal(body.files.length, 1);
+    return message;
+  }, messages: { fetch: async (input) => input.message ? message : [] } };
+  const enabledClient = { users: { fetch: async () => ({ createDM: async () => channel }) } };
+  const renderer = async () => ({ embeds: [], attachments: [], files: [{ attachment: Buffer.from('banner'), name: 'banner.webp' }],
+    allowedMentions: { parse: [] } });
+  assert.equal(await processOutbox({ holder: uuidv7(), client: enabledClient, pool, env: {},
+    renderProjectionFunction: renderer }), true);
+  const createdProjection = (await pool.query('SELECT message_id FROM message_projections WHERE id=$1',
+    [fixture.projectionId])).rows[0];
+  assert.equal(createdProjection.message_id, message.id);
+
+  const credited = (await pool.query(`UPDATE topups SET status='CREDITED',state_version=state_version+1,
+    amount_cents=5000,currency='THB',credited_at=clock_timestamp(),updated_at=clock_timestamp()
+    WHERE id=$1 RETURNING *`, [fixture.topupId])).rows[0];
+  await enqueueProjection(pool, { projectionType: 'TOPUP_STATUS_DM', aggregateType: 'TOPUP',
+    aggregateId: fixture.topupId, aggregateVersion: credited.state_version,
+    surfaceKey: `DM:${fixture.discordUserId}`, topic: 'TOPUP_STATUS_DM', context });
+  assert.equal(await processOutbox({ holder: uuidv7(), client: enabledClient, pool, env: {},
+    renderProjectionFunction: renderer }), true);
+  assert.equal(sends, 1);
+  assert.equal(edits, 1);
+  assert.equal((await pool.query('SELECT message_id FROM message_projections WHERE id=$1', [fixture.projectionId]))
+    .rows[0].message_id, message.id);
+  assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM dead_letter_items
+    WHERE source_id=$1`, [fixture.eventId])).rows[0].count), 0);
 });
 
 test('Discord 404 reconciles only the affected surface and 429 honors Retry-After', async (t) => {

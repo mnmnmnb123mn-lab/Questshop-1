@@ -97,6 +97,32 @@ test('daily top-up lock blocks a voucher that was queued before the lock existed
   assert.equal(target.attempt_count, 0);
 });
 
+test('a just-submitted targeted lease never takes another customer\'s older queued voucher', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const trace = uuidv7();
+  const receiver = await createReceiver(trace);
+  const olderTopup = uuidv7();
+  const submittedTopup = uuidv7();
+  await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
+    receiver_version_id,receiver_phone_last4,trace_id,created_at)
+    VALUES($1,'older-queued-customer','PAYMENT_QUEUED',1,$2,$3,'1234',$4,clock_timestamp()-interval '1 hour'),
+      ($5,'just-submitted-customer','PAYMENT_QUEUED',1,$6,$3,'1234',$4,clock_timestamp())`, [
+    olderTopup, Buffer.alloc(32, 96), receiver, trace, submittedTopup, Buffer.alloc(32, 97),
+  ]);
+
+  const claimed = await acquirePaymentJob({ holder: uuidv7(), topupId: submittedTopup }, { pool });
+  assert.equal(claimed.id, submittedTopup);
+  const rows = (await pool.query('SELECT id,status FROM topups WHERE id = ANY($1::uuid[]) ORDER BY id',
+    [[olderTopup, submittedTopup]])).rows;
+  assert.deepEqual(new Map(rows.map((row) => [row.id, row.status])), new Map([
+    [olderTopup, 'PAYMENT_QUEUED'], [submittedTopup, 'PROCESSING'],
+  ]));
+  // This file intentionally shares one disposable schema. Leave neither test
+  // fixture eligible for the later FIFO-acquisition cases.
+  await pool.query(`UPDATE topups SET status='FAILED',lease_owner=NULL,lease_expires_at=NULL
+    WHERE id = ANY($1::uuid[])`, [[olderTopup, submittedTopup]]);
+});
+
 test('stuck redeemed top-up is escalated to an Owner-only manual review', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const trace = uuidv7();

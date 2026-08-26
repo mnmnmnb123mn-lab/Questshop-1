@@ -150,8 +150,13 @@ async function loadTestQuest({ monitor, run, env, pool, testSignal, allowComplet
   const api = createQuestApiClient({ token, profile: profileFromEnv(env),
     coordinator: getPersistentDiscordRateLimitCoordinator(pool) });
   const quest = (await api.fetchQuests(testSignal)).find((candidate) => candidate.id === run.quest_id);
+  if (!quest) {
+    throw Object.assign(new Error('Quest is no longer visible in this Monitor account'), {
+      code: 'TEST_QUEST_MISSING', accountSpecific: true, category: 'BUSINESS',
+    });
+  }
   const executor = quest && selectQuestExecutor(quest);
-  if (!quest || !executor?.supportsAutomaticProgress || executor.id !== run.executor_id) {
+  if (!executor?.supportsAutomaticProgress || executor.id !== run.executor_id) {
     throw Object.assign(new Error('Quest contract unsupported on monitor'), { code: 'TEST_CONTRACT_UNSUPPORTED' });
   }
   if (quest.contractHash !== run.contract_hash) {
@@ -191,7 +196,9 @@ async function performTestMutation(pool, run, context, input) {
 function freshQuestLoader(api, run, testSignal) {
   return async () => {
     const fresh = (await api.fetchQuests(testSignal)).find((candidate) => candidate.id === run.quest_id);
-    if (!fresh) throw Object.assign(new Error('Quest disappeared during test'), { code: 'TEST_QUEST_MISSING' });
+    if (!fresh) throw Object.assign(new Error('Quest disappeared during test'), {
+      code: 'TEST_QUEST_MISSING', accountSpecific: true, category: 'BUSINESS',
+    });
     return fresh;
   };
 }

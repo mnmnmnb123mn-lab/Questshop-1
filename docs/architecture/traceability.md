@@ -104,8 +104,9 @@ filename or include an explicit attachment migration.
 - stores Discord Quest `starts_at` and `expires_at` as the customer-visible lifetime source;
 - Monitor discovery reconciles expiry before creating a test batch, so an already-expired Quest can remain in durable
   history but consumes no Monitor test attempt and creates no public `QUEST_NEW` projection;
-- customer checkout discovery may admit the Quest only for the authenticated account, but does not enqueue public
-  `QUEST_NEW`; its durable backoffice record requires an Administrator to choose audited publication or Monitor testing;
+- customer checkout discovery may admit the Quest only for the authenticated account, independently from notification
+  or Monitor visibility. Its durable Case starts a search across Test Monitors; only visible accounts are tested, while
+  no visibility result is reported honestly and may be retried. A passed test queues an informational `QUEST_NEW`;
 - active test batches re-check the Quest deadline before choosing another Monitor, and an expired batch closes without
   cycling credentials or generating an exhausted-monitor alert;
 - the common Outbox enqueue boundary refuses `QUEST_NEW` for an expired Quest regardless of whether the caller is
@@ -137,6 +138,11 @@ Outbox delivery-race suppression and Monitor-batch stop behavior.
   Top-up ID, Wallet transaction ID and Trace. It begins at `PAYMENT_QUEUED` and edits the same projection through its
   outcome. The full voucher URL is an Owner-approved Discord-only record after the encrypted payload reaches its
   seven-day retention boundary; a lost Discord message cannot be reconstructed with the URL after that point.
+  Immediately after a customer commits a new voucher, the interaction acknowledges only that durable acceptance and
+  starts settlement for the exact Top-up in the background; it never waits for a same-window result or acquires an
+  older Top-up. `TOPUP_STATUS_DM` owns one customer DM projection per Top-up and edits it through queued, processing,
+  retry, terminal, review and reversal states. กรณีลูกค้าปิด DM ระบบลองส่งใหม่ 6 รอบตาม backoff ก่อนเข้า
+  Financial DLQ; the regular payment Worker remains the recovery path.
   A `SUCCESS` response without a provider transaction ID uses the encrypted voucher identity plus Top-up ID only after
   HTTP 2xx, exact positive THB amount and intended-single-receiver evidence all agree; it never invents a provider ID.
 - `LOG_QUEST_OPERATIONS` follows `interaction_sessions → orders/order_items → runner_jobs/runner_attempts →

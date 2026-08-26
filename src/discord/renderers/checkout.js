@@ -175,52 +175,28 @@ export function renderPaymentMethod(walletAvailableCents, sessionId) {
   return { embeds: [embed], components: [new ActionRowBuilder().addComponents(select)], allowedMentions: noMentions };
 }
 
-export function renderTopupProcessing(topupId) {
-  return { embeds: [new EmbedBuilder().setColor(COLOR.warning).setTitle('⏳ กำลังตรวจสอบซอง')
-    .setDescription(boundedDescription(`ระบบรับรายการแล้วและกำลังตรวจสอบกับ TrueMoney\n\n**Top-up ID:** \`${escape(topupId)}\`\nกรุณารอสักครู่ ไม่ต้องส่งซองซ้ำ`))],
-  components: [], allowedMentions: noMentions };
-}
-
-function topupFailureDescription(topup) {
-  const guidance = {
-    INVALID: 'ตรวจสอบว่าลิงก์เป็นซอง TrueMoney ที่ถูกต้องแล้วลองใหม่',
-    EXPIRED: 'กรุณาสร้างซองใหม่แล้วส่งอีกครั้ง',
-    ALREADY_REDEEMED: 'กรุณาตรวจสอบว่าซองยังไม่เคยถูกใช้',
-    FAILED: 'รายการนี้ไม่ได้เพิ่มเครดิต คุณสามารถลองด้วยซองใหม่ได้',
-    REJECTED: 'เจ้าของร้านตรวจสอบแล้วและไม่ได้เพิ่มเครดิตจากรายการนี้',
-    REVERSED: 'เครดิตจากรายการนี้ถูกย้อนกลับตามผลการตรวจสอบ',
+// This is intentionally an acknowledgement, not a payment result. The
+// Top-up has committed durably, while TrueMoney settlement continues through
+// the customer-owned DM projection.
+export function renderTopupAccepted({ topup, idempotent = false }) {
+  const existing = idempotent === true;
+  const description = [
+    existing
+      ? 'พบซองนี้ในระบบแล้ว จึงไม่รับซ้ำและไม่เรียก TrueMoney เพิ่ม'
+      : 'ระบบบันทึกรายการของคุณเรียบร้อยแล้ว กำลังตรวจสอบซองกับ TrueMoney',
+    '',
+    `**Top-up ID:** \`${escape(topup.id)}\``,
+    `**สถานะ${existing ? 'ล่าสุด' : ''}:** ${topupStateLabel(topup.status)}`,
+    `**ส่งรายการเมื่อ:** ${timestamp(topup.created_at ?? topup.updated_at, 'F')}`,
+    '',
+    'ระบบจะแจ้งความคืบหน้าผ่าน DM โปรดเปิดรับข้อความส่วนตัวจากสมาชิกเซิร์ฟเวอร์',
+    'ไม่ต้องส่งซองเดิมซ้ำ เก็บ Top-up ID ไว้หากต้องติดต่อผู้ดูแล',
+  ].join('\n');
+  return {
+    embeds: [new EmbedBuilder().setColor(COLOR.primary)
+      .setTitle(existing ? 'ℹ️ พบรายการเติมเงินเดิม' : '📨 รับรายการเติมเงินแล้ว')
+      .setDescription(boundedDescription(description))],
+    components: [],
+    allowedMentions: noMentions,
   };
-  return guidance[topup.status] ?? 'รายการนี้ไม่ได้เพิ่มเครดิต หากต้องการความช่วยเหลือให้แจ้ง Top-up ID กับเจ้าของร้าน';
-}
-
-export function renderTopupResult(topup) {
-  if (topup.status === 'CREDITED') {
-    const total = BigInt(topup.amount_cents ?? 0) + BigInt(topup.bonus_cents ?? 0);
-    const lines = [
-      `**Top-up ID:** \`${topup.id}\``,
-      `**ยอดก่อนเติม:** ${baht(topup.available_before)}`,
-      `**ยอดเงินจากซอง:** ${baht(topup.amount_cents)}`,
-      `**โบนัสโปรโมชั่น:** ${baht(topup.bonus_cents)}`,
-      `**ได้รับทั้งหมด:** ${baht(total)}`,
-      `**ยอดคงเหลือใหม่:** ${baht(topup.available_after ?? topup.wallet_available_cents)}`,
-    ];
-    if (topup.promotion_name) lines.splice(4, 0, `**โปรโมชั่น:** ${escape(topup.promotion_name)}`);
-    return { embeds: [new EmbedBuilder().setColor(COLOR.success).setTitle('✅ เติมเครดิตสำเร็จ')
-      .setDescription(boundedDescription(lines.join('\n'))).setFooter({ text: 'ใบเสร็จฉบับเต็มจะส่งทาง DM อีกครั้ง' })],
-    components: [], allowedMentions: noMentions };
-  }
-  if (['AMBIGUOUS', 'MANUAL_REVIEW', 'REDEEMED'].includes(topup.status)) {
-    const received = topup.status === 'REDEEMED' ? '\nระบบรับเงินจากซองแล้ว แต่ยังเพิ่มเครดิตไม่เสร็จ' : '';
-    return { embeds: [new EmbedBuilder().setColor(COLOR.warning).setTitle('🟠 กำลังตรวจสอบรายการ')
-      .setDescription(boundedDescription(`**สถานะ:** ${topupStateLabel(topup.status)}${received}\n**Top-up ID:** \`${escape(topup.id)}\`\n\nห้ามส่งซองเดิมซ้ำ เจ้าของร้านจะตรวจสอบหลักฐานและดำเนินการต่อ`))],
-    components: [], allowedMentions: noMentions };
-  }
-  if (['INVALID', 'EXPIRED', 'ALREADY_REDEEMED', 'FAILED', 'REJECTED', 'REVERSED'].includes(topup.status)) {
-    return { embeds: [new EmbedBuilder().setColor(COLOR.danger).setTitle('❌ เติมเครดิตไม่สำเร็จ')
-      .setDescription(boundedDescription(`**สถานะ:** ${topupStateLabel(topup.status)}\n**Top-up ID:** \`${escape(topup.id)}\`\n\n${topupFailureDescription(topup)}`))],
-    components: [], allowedMentions: noMentions };
-  }
-  return { embeds: [new EmbedBuilder().setColor(COLOR.warning).setTitle('⏳ ระบบยังดำเนินการอยู่')
-    .setDescription(boundedDescription(`**สถานะ:** ${topupStateLabel(topup.status)}\n**Top-up ID:** \`${escape(topup.id)}\`\n\nคุณปิดข้อความนี้ได้ ระบบยังทำงานต่อและจะส่งใบเสร็จทาง DM เมื่อเสร็จ`))],
-  components: [], allowedMentions: noMentions };
 }

@@ -9,6 +9,13 @@ There is no production release/tag evidence yet; current work remains under `[Un
 
 ## [Unreleased]
 
+- Simplified customer Top-up status DMs by removing the payment-attempt count, promotion name, and TrueMoney/Wallet
+  reference section. The financial evidence remains available in `LOG_PAYMENTS` and PostgreSQL.
+- Replaced the lower image on both customer Top-up DMs and `LOG_PAYMENTS` with the Owner-supplied verified RGB
+  `payment-log-banner.png` (`461×8`) while retaining attachment replacement on every projection edit.
+- Split `LOG_ADMIN` from the shared backoffice banner and assigned the Owner-supplied verified `admin-log-banner.webp`;
+  `LOG_QUEST_OPERATIONS` and `LOG_SYSTEM` continue using `backoffice-log-banner.webp`.
+
 ### Current operational baseline
 
 - Runtime: Node.js `>=22.22.0 <23`, Discord single-Guild, PostgreSQL 16+.
@@ -23,9 +30,13 @@ There is no production release/tag evidence yet; current work remains under `[Un
 
 ### Added
 
-- `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` and `LOG_SYSTEM` now attach the verified shared
-  `backoffice-log-banner.webp` beneath every event card. `LOG_SYSTEM` and system-authored Admin Audit cards use the
-  verified animated Questshop GIF thumbnail; operational cards use safe Quest artwork or global Discord avatars.
+- Customer Top-up acknowledgement now returns immediately after durable acceptance and uses one editable DM status card.
+  A disabled customer DM retries through the bounded Outbox schedule before entering Financial DLQ; retry status uses the
+  same yellow operational color as Manual Review.
+
+- `LOG_QUEST_OPERATIONS` and `LOG_SYSTEM` attach the verified `backoffice-log-banner.webp`, while `LOG_ADMIN` attaches
+  its verified `admin-log-banner.webp`. `LOG_SYSTEM` and system-authored Admin Audit cards use the verified animated
+  Questshop GIF thumbnail; operational cards use safe Quest artwork or global Discord avatars.
 - Durable `LOG_SYSTEM` incident stabilization: recurring code/scope pairs reopen and edit one message, operational
   alerts require consecutive evidence, and Discord connectivity failures are grouped across affected surfaces.
 - Historical Outbox projection backlog repair with transition evidence. A deployment keeps any active lease, retains
@@ -33,12 +44,13 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - Payment Logs now begin at `PAYMENT_QUEUED`, so a provider-worker delay remains visible and later outcomes update the
   same durable message rather than appearing as a separate record.
 - Payment Logs render the payer's Discord profile as the upper-right thumbnail and attach the supplied
-  `payment-log-banner.webp` as one verified lower embed image on every current-state update.
+  `payment-log-banner.png` as one verified lower embed image on every current-state update.
 - Backoffice renderers now carry durable Trace/correlation context. Admin Audit before/after snapshots are allowlisted
   for Discord and recursively redact credential-shaped fields before append-only persistence.
 
-- Customer-only top-up status DMs for `MANUAL_REVIEW` and an Owner's terminal `REJECTED` decision, so a delayed
-  interaction does not leave the customer without a result.
+- One durable customer Top-up DM now begins as soon as `PAYMENT_QUEUED` commits and edits through processing, retry,
+  credit, failure, Manual Review, Owner decision and reversal. Its safe Thai Embed includes the payer avatar,
+  timestamps and verified payment banner without exposing voucher data, PII or backoffice transaction references.
 
 - Persistent Quest Auto storefront copy with fixed title **Discord Quest Auto**, Discord Orbs / Discord Token guidance,
   and the existing **เริ่มทำเควส** / **เติมเงิน** controls.
@@ -80,6 +92,10 @@ There is no production release/tag evidence yet; current work remains under `[Un
   evidence and the Administrator decision without retaining the customer Token.
 
 ### Changed
+
+- Customer voucher submission now acknowledges the durable Top-up ID immediately rather than waiting for a TrueMoney
+  result. A targeted post-commit settlement attempt then starts in the background; it cannot claim another customer's
+  queued voucher, and the customer follows the one durable DM card instead of waiting in the Ephemeral window.
 
 - `GIT_SHA` is no longer a required deployment Environment Variable. Production starts without it, setup does not
   import or request it, and pre-launch evidence uses the internal `untracked` marker when no source revision is available.

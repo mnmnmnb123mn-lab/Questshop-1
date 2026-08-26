@@ -245,18 +245,35 @@ async function processClaimedPayment({ topup, breaker, holder, env, signal, auto
   }
 }
 
-export async function processPayment({ holder, env, signal, autoCredit = false, pool = getRuntimePool() }) {
+// A customer interaction may supply `topupId` after submitVoucher has
+// committed.  This is deliberately a targeted lease: it never bypasses the
+// same durable intent, lease, checkpoint, provider verification or wallet
+// credit path used by the background worker.
+export async function processPayment({ holder, env, signal, autoCredit = false, topupId = null,
+  pool = getRuntimePool() }) {
   await auditPaymentSettlement({ holder, env, pool });
   await reconcilePaymentPolicyState({ holder, env, pool });
+  // Interaction configuration can be a few moments old. Re-read the durable
+  // gate before the targeted provider path so an Owner's newly closed
+  // automatic-credit gate wins over a stale UI/runtime snapshot.
+  if (topupId && autoCredit) {
+    const gate = (await pool.query("SELECT enabled FROM feature_gates WHERE gate='AUTO_CREDIT_ENABLED'")).rows[0];
+    if (gate?.enabled !== true) return false;
+  }
   const policy = await loadPaymentPolicy(pool);
-  if (autoCredit && await creditPendingRedemption({ holder, env, pool, policy })) return true;
+  // An interaction must never settle a different customer's older REDEEMED
+  // row merely because it was the first one to arrive. Recovery workers keep
+  // handling that queue-wide responsibility.
+  if (autoCredit && !topupId && await creditPendingRedemption({ holder, env, pool, policy })) return true;
   const breaker = (await pool.query("SELECT state FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
   if (breaker?.state === 'OPEN') return false;
   if (!autoCredit && breaker?.state !== 'HALF_OPEN') {
-    await stopTopupIntakeWhenSettlementDisabled(pool);
+    // A targeted fast-path must not change the global gate.  The ordinary
+    // worker remains the authority that contains a disabled settlement path.
+    if (!topupId) await stopTopupIntakeWhenSettlementDisabled(pool);
     return false;
   }
-  const topup = await acquirePaymentJob({ holder }, { pool });
+  const topup = await acquirePaymentJob({ holder, topupId }, { pool });
   if (!topup) return false;
   await processClaimedPayment({ topup, breaker, holder, env, signal, autoCredit, policy, pool });
   return true;

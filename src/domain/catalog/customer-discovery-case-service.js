@@ -4,8 +4,8 @@ import { enqueueProjection } from '../outbox/service.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { createMonitorTestBatch } from './test-gate.js';
 import { appendAdminAudit } from '../admin/audit.js';
+import { recordTransition } from '../shared/transition.js';
 
-const ACTIVE_SEARCH = new Set(['QUEUED', 'RUNNING']);
 const TERMINAL_CHECK = new Set(['VISIBLE', 'VISIBLE_COMPLETED', 'NOT_VISIBLE', 'FAILED']);
 
 async function enqueueCase(client, row, context) {
@@ -30,15 +30,27 @@ async function startSearch(client, caseRow, context) {
       VALUES($1,$2,$3)`, [uuidv7(), batch.id, monitor.id]);
     await client.query(`UPDATE customer_quest_monitor_search_batches SET state='RUNNING',state_version=state_version+1,
       updated_at=clock_timestamp() WHERE id=$1`, [batch.id]);
+    await recordTransition(client, { aggregateType: 'CUSTOMER_MONITOR_SEARCH_BATCH', aggregateId: batch.id,
+      fromState: 'QUEUED', toState: 'RUNNING', stateVersion: Number(batch.state_version) + 1,
+      reasonCode: 'CUSTOMER_DISCOVERY_MONITOR_SEARCH_STARTED', metadata: { monitorCount: monitors.length }, context });
   } else {
     await client.query(`UPDATE customer_quest_monitor_search_batches SET state='NO_MONITORS',state_version=state_version+1,
       completed_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1`, [batch.id]);
+    await recordTransition(client, { aggregateType: 'CUSTOMER_MONITOR_SEARCH_BATCH', aggregateId: batch.id,
+      fromState: 'QUEUED', toState: 'NO_MONITORS', stateVersion: Number(batch.state_version) + 1,
+      reasonCode: 'CUSTOMER_DISCOVERY_NO_TEST_MONITORS', context });
   }
   const state = monitors.length ? 'CHECK_QUEUED' : 'CHECK_INCOMPLETE';
   const updated = (await client.query(`UPDATE customer_quest_discovery_cases SET verification_state=$2,
     current_search_batch_id=$3,state_version=state_version+1,last_result=$4,trace_id=$5,updated_at=clock_timestamp()
     WHERE id=$1 RETURNING *`, [caseRow.id, state, batch.id,
     monitors.length ? { checked: 0, total: monitors.length } : { code: 'TEST_MONITOR_UNAVAILABLE' }, context.traceId])).rows[0];
+  if (caseRow.verification_state !== updated.verification_state) await recordTransition(client, {
+    aggregateType: 'CUSTOMER_QUEST_DISCOVERY_CASE', aggregateId: updated.id,
+    fromState: caseRow.verification_state, toState: updated.verification_state,
+    stateVersion: updated.state_version, reasonCode: monitors.length
+      ? 'CUSTOMER_DISCOVERY_MONITOR_SEARCH_QUEUED' : 'CUSTOMER_DISCOVERY_NO_TEST_MONITORS', context,
+  });
   await enqueueCase(client, updated, context);
   return { caseRow: updated, batchId: batch.id, reused: false };
 }
@@ -76,7 +88,8 @@ export async function loadCustomerDiscoveryCase(client, caseId, { messageId = nu
 
 export async function acquireCustomerMonitorSearchCheck({ holder, ttlSeconds = 120 }, options = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
-    const candidate = (await client.query(`SELECT ch.*,b.case_id,c.quest_id,m.account_id,m.state AS monitor_state,
+    const candidate = (await client.query(`SELECT ch.*,b.case_id,b.state AS batch_state,b.trace_id AS batch_trace_id,
+      c.quest_id,c.verification_state,m.account_id,m.state AS monitor_state,
       cr.key_version,cr.nonce,cr.ciphertext,cr.auth_tag
       FROM customer_quest_monitor_search_checks ch
       JOIN customer_quest_monitor_search_batches b ON b.id=ch.batch_id
@@ -89,6 +102,23 @@ export async function acquireCustomerMonitorSearchCheck({ holder, ttlSeconds = 1
       state_version=state_version+1,attempt_count=attempt_count+1,lease_owner=$2,
       lease_expires_at=clock_timestamp()+make_interval(secs=>$3),fencing_token=fencing_token+1,updated_at=clock_timestamp()
       WHERE id=$1 RETURNING *`, [candidate.id, holder, ttlSeconds])).rows[0];
+    const context = { traceId: candidate.batch_trace_id, causationId: null, actorType: 'SYSTEM', actorId: holder };
+    if (candidate.state !== 'LEASED') await recordTransition(client, {
+      aggregateType: 'CUSTOMER_MONITOR_SEARCH_CHECK', aggregateId: check.id,
+      fromState: candidate.state, toState: 'LEASED', stateVersion: check.state_version,
+      reasonCode: 'CUSTOMER_DISCOVERY_MONITOR_CHECK_LEASED', context,
+    });
+    if (candidate.verification_state === 'CHECK_QUEUED') {
+      const checking = (await client.query(`UPDATE customer_quest_discovery_cases SET verification_state='CHECKING',
+        state_version=state_version+1,updated_at=clock_timestamp()
+        WHERE id=$1 AND verification_state='CHECK_QUEUED' RETURNING *`, [candidate.case_id])).rows[0];
+      if (checking) {
+        await recordTransition(client, { aggregateType: 'CUSTOMER_QUEST_DISCOVERY_CASE', aggregateId: checking.id,
+          fromState: 'CHECK_QUEUED', toState: 'CHECKING', stateVersion: checking.state_version,
+          reasonCode: 'CUSTOMER_DISCOVERY_MONITOR_SEARCH_RUNNING', context });
+        await enqueueCase(client, checking, context);
+      }
+    }
     return { ...candidate, ...check };
   });
 }
@@ -100,6 +130,13 @@ export async function completeCustomerMonitorSearchCheck({ check, state, evidenc
       WHERE id=$1 AND state='LEASED' AND lease_owner=$2 AND fencing_token=$3 RETURNING *`,
     [check.id, check.lease_owner, check.fencing_token, state, evidence, errorClass])).rows[0];
     if (!updated) return null;
+    await recordTransition(client, { aggregateType: 'CUSTOMER_MONITOR_SEARCH_CHECK', aggregateId: updated.id,
+      fromState: 'LEASED', toState: state, stateVersion: updated.state_version,
+      reasonCode: state === 'NOT_VISIBLE' ? 'CUSTOMER_DISCOVERY_QUEST_NOT_VISIBLE'
+        : state === 'VISIBLE' ? 'CUSTOMER_DISCOVERY_QUEST_VISIBLE'
+          : state === 'VISIBLE_COMPLETED' ? 'CUSTOMER_DISCOVERY_QUEST_ALREADY_COMPLETED'
+            : state === 'PENDING' ? 'CUSTOMER_DISCOVERY_MONITOR_CHECK_RETRY'
+            : 'CUSTOMER_DISCOVERY_MONITOR_CHECK_FAILED', metadata: { errorClass }, context });
     const batch = (await client.query('SELECT * FROM customer_quest_monitor_search_batches WHERE id=$1 FOR UPDATE', [check.batch_id])).rows[0];
     const checks = (await client.query(`SELECT state,monitor_id,evidence FROM customer_quest_monitor_search_checks WHERE batch_id=$1 FOR UPDATE`, [check.batch_id])).rows;
     if (!checks.every((item) => TERMINAL_CHECK.has(item.state))) return updated;
@@ -110,6 +147,9 @@ export async function completeCustomerMonitorSearchCheck({ check, state, evidenc
     if (!visible.length && visibleCompleted.length && !failed.length) next = 'FOUND';
     await client.query(`UPDATE customer_quest_monitor_search_batches SET state=$2,state_version=state_version+1,
       completed_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1`, [batch.id, next]);
+    await recordTransition(client, { aggregateType: 'CUSTOMER_MONITOR_SEARCH_BATCH', aggregateId: batch.id,
+      fromState: batch.state, toState: next, stateVersion: Number(batch.state_version) + 1,
+      reasonCode: `CUSTOMER_DISCOVERY_MONITOR_SEARCH_${next}`, context });
     const caseRow = (await client.query('SELECT * FROM customer_quest_discovery_cases WHERE id=$1 FOR UPDATE', [batch.case_id])).rows[0];
     let verificationState = next === 'NOT_FOUND' ? 'NOT_FOUND' : next === 'INCOMPLETE' ? 'CHECK_INCOMPLETE'
       : visible.length ? 'TESTING' : 'FOUND_NOT_TESTABLE';
@@ -120,12 +160,18 @@ export async function completeCustomerMonitorSearchCheck({ check, state, evidenc
         requestedBy: 'CUSTOMER_DISCOVERY', customerDiscoveryCaseId: caseRow.id });
       testBatchId = test.batch?.id ?? null;
       if (!testBatchId) verificationState = 'FOUND_NOT_TESTABLE';
+      else if (test.batch.state === 'FAILED') verificationState = 'TEST_FAILED';
     }
     const result = { total: checks.length, found: visible.length + visibleCompleted.length, testable: visible.length,
       notFound: checks.filter((item) => item.state === 'NOT_VISIBLE').length, failed: failed.length };
     const updatedCase = (await client.query(`UPDATE customer_quest_discovery_cases SET verification_state=$2,
       current_test_batch_id=$3,state_version=state_version+1,last_result=$4,trace_id=$5,updated_at=clock_timestamp()
       WHERE id=$1 RETURNING *`, [caseRow.id, verificationState, testBatchId, result, context.traceId])).rows[0];
+    if (caseRow.verification_state !== updatedCase.verification_state) await recordTransition(client, {
+      aggregateType: 'CUSTOMER_QUEST_DISCOVERY_CASE', aggregateId: updatedCase.id,
+      fromState: caseRow.verification_state, toState: updatedCase.verification_state,
+      stateVersion: updatedCase.state_version, reasonCode: `CUSTOMER_DISCOVERY_MONITOR_SEARCH_${next}`, context,
+    });
     await enqueueCase(client, updatedCase, context);
     return updated;
   });
@@ -138,6 +184,9 @@ export async function queueCustomerDiscoveryAnnouncement({ caseId }, context, op
     if (row.announcement_state === 'ANNOUNCED' || row.announcement_state === 'QUEUED') return { caseRow: row, idempotent: true };
     const updated = (await client.query(`UPDATE customer_quest_discovery_cases SET announcement_state='QUEUED',
       state_version=state_version+1,trace_id=$2,updated_at=clock_timestamp() WHERE id=$1 RETURNING *`, [row.id, context.traceId])).rows[0];
+    await recordTransition(client, { aggregateType: 'CUSTOMER_QUEST_DISCOVERY_CASE', aggregateId: updated.id,
+      fromState: row.announcement_state, toState: updated.announcement_state, stateVersion: updated.state_version,
+      reasonCode: 'CUSTOMER_DISCOVERY_ANNOUNCEMENT_QUEUED', context });
     await enqueueProjection(client, { projectionType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: updated.quest_id,
       aggregateVersion: updated.state_version, surfaceKey: 'QUEST_NEW', context });
     if (context.actorType === 'ADMIN' || context.actorType === 'OWNER') await appendAdminAudit(client, {
@@ -155,8 +204,11 @@ export async function markCustomerDiscoveryAnnouncementDelivered(client, questId
   const row = (await client.query(`UPDATE customer_quest_discovery_cases SET announcement_state='ANNOUNCED',
     state_version=state_version+1,updated_at=clock_timestamp() WHERE quest_id=$1 AND announcement_state='QUEUED'
     RETURNING *`, [questId])).rows[0];
-  if (row) await enqueueCase(client, row, context);
+  if (row) {
+    await recordTransition(client, { aggregateType: 'CUSTOMER_QUEST_DISCOVERY_CASE', aggregateId: row.id,
+      fromState: 'QUEUED', toState: 'ANNOUNCED', stateVersion: row.state_version,
+      reasonCode: 'CUSTOMER_DISCOVERY_ANNOUNCEMENT_DELIVERED', context });
+    await enqueueCase(client, row, context);
+  }
   return row;
 }
-
-export { ACTIVE_SEARCH };

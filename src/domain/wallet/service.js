@@ -13,6 +13,7 @@ import { appendLedger } from './ledger.js';
 import { resolvePromotionBonus } from '../promotions/resolver.js';
 import { bangkokDayBounds } from '../../db/postgres-time.js';
 import { TOPUP_TRANSITIONS } from '../payments/states.js';
+import { enqueueCustomerTopupStatus } from '../payments/customer-notification.js';
 import { openReview } from '../reviews/service.js';
 import { appendAdminAudit } from '../admin/audit.js';
 
@@ -464,9 +465,7 @@ export async function creditRedeemedTopupInTransaction(client, { topupId }, cont
       projectionType: await durablePaymentLogType(client, topupId), aggregateType: 'TOPUP', aggregateId: topupId,
       aggregateVersion: updated.state_version, surfaceKey: 'LOG_PAYMENTS', context,
     });
-    await enqueueProjection(client, { projectionType: 'TOPUP_RECEIPT', aggregateType: 'TOPUP',
-      aggregateId: topupId, aggregateVersion: updated.state_version,
-      surfaceKey: `DM:${topup.discord_user_id}`, context });
+    await enqueueCustomerTopupStatus(client, updated, context);
     return { topup: updated, wallet, transaction: ledger, idempotent: false };
 }
 
@@ -521,6 +520,7 @@ export async function reverseTopup({ topupId, reason }, context, options = {}) {
     await enqueueProjection(client, { projectionType: await durablePaymentLogType(client, topupId), aggregateType: 'TOPUP',
       aggregateId: topupId, aggregateVersion: updated.state_version,
       surfaceKey: 'LOG_PAYMENTS', context });
+    await enqueueCustomerTopupStatus(client, updated, context);
     return updated;
   });
 }

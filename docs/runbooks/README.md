@@ -15,7 +15,7 @@ Detect → Contain → Preserve evidence → Recover → Verify → Reopen → R
 | Financial DLQ | keep evidence/reservation; never discard | Owner replays with parent reference |
 | Non-financial DLQ | preserve delivery evidence | Owner replay/discard with reason/audit |
 | Quest schema/executor failure | pause affected Quest | pin compatible engine/contract, retest, reopen sale |
-| Customer-discovered Quest | keep it private; preserve the discovery record | Admin chooses **ทดสอบก่อน** or audited **ส่งประกาศ** from `LOG_QUEST_OPERATIONS`; never identify the customer in `quest-new` |
+| Customer-discovered Quest | preserve the Case and Quest link; customer Checkout stays independent | system searches all active Test Monitors first, tests only where visible; Admin may use **ตรวจและทดสอบอีกครั้ง** or audited **ส่งประกาศ**; never identify the customer in `quest-new` |
 | Monitor token invalid | quarantine account | Owner rotates credential and runs **เช็คระบบ Token** |
 | Discord surface 403 | preserve authoritative pointer/outbox/incident | Owner fixes Discord permission manually |
 | Discord outage / 429 | retain outbox; obey Retry-After | resume coalesced delivery after health recovery |
@@ -32,6 +32,7 @@ Detect → Contain → Preserve evidence → Recover → Verify → Reopen → R
 | Pre-launch closeout | keep store closed | compensate real financial tests; retain audit |
 | Receiver rotation | retain old snapshot for pending work | new work uses active receiver version; a first install without a receiver remains backoffice-accessible but cannot accept vouchers |
 | Customer leaves Guild with an active order | preserve Order, Wallet, reservation and Runner state; never cancel automatically | continue durable work; final DM is best-effort only and a failed DM is not a settlement failure |
+| Customer has DMs disabled during Top-up | preserve the durable Top-up and continue settlement; retry the single status card after 1, 5, 15, 60, 300 and 900 seconds | customer must enable DMs or contact Owner with Top-up ID; inspect Financial DLQ only after the next failed attempt |
 
 ## Quest Auto recovery details
 

@@ -43,6 +43,11 @@ test('same voucher submitted concurrently has one durable owner', async (t) => {
     WHERE p.projection_type='PAYMENT_LOG' AND p.surface_key='LOG_PAYMENTS'
       AND p.aggregate_id=$1`, [results[0].topup.id])).rows[0].count;
   assert.equal(Number(logEvents), 1);
+  const customerDm = (await pool.query(`SELECT count(*)::integer AS count FROM outbox_events o
+    JOIN message_projections p ON p.id=o.projection_id
+    WHERE p.projection_type='TOPUP_STATUS_DM' AND p.surface_key=$1 AND p.aggregate_id=$2`,
+  [`DM:${input.discordUserId}`, results[0].topup.id])).rows[0].count;
+  assert.equal(Number(customerDm), 1);
 });
 
 test('same voucher cannot reveal another customer durable top-up', async (t) => {

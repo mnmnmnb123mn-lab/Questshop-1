@@ -89,11 +89,17 @@ Confirm Order
 - ผล `HTTP 2xx` + `SUCCESS` ที่ยืนยันยอด THB เป็นบวกและผู้รับหนึ่งคน จะเพิ่มเครดิตได้แม้ TrueMoney
   ไม่ส่งเลขธุรกรรม: ระบบใช้ voucher HMAC กับ Top-up ID เป็นหลักฐานภายในและบันทึกเลขธุรกรรมเป็น `NULL`
   ตามความจริง หากหลักฐานข้อใดไม่ครบจะส่ง Owner ตรวจสอบแทน
+- หลังลูกค้าส่งลิงก์ซอง ระบบจะบันทึก Top-up ให้เสร็จก่อน แล้วตอบรับทันทีพร้อม Top-up ID โดยไม่รอ TrueMoney
+  จากนั้นเริ่มตรวจ **เฉพาะรายการนั้น** เบื้องหลังทันทีและส่ง DM การ์ดเดียวที่แก้ข้อความเดิมตามทุกสถานะ
+  ตั้งแต่กำลังตรวจจนถึงสำเร็จ ไม่สำเร็จ หรือรอ Owner ตรวจ ลูกค้าต้องเปิดรับ DM จากสมาชิกเซิร์ฟเวอร์;
+  หาก DM ส่งไม่ได้ Outbox จะลองส่งใหม่ตามรอบ 1, 5, 15, 60, 300 และ 900 วินาที ก่อนบันทึก Financial DLQ
+  โดยไม่กระทบเครดิต การเร่งนี้ยังใช้ lease,
+  dispatch checkpoint, การยืนยัน TrueMoney และ Wallet credit ชุดเดียวกับ Worker จึงไม่ข้ามการกันเครดิตซ้ำ
 - หนึ่ง Quest account มี active job ได้ไม่เกินหนึ่งงานทั่วระบบ
 - Monitor ทุกบัญชีทำ Scan + Test; Monitor-discovered Quest ยัง private จน test ผ่านหรือ Admin ใช้ audited **ส่งเลย**
-- customer-discovered Quest อาจถูกเสนอเฉพาะ account นั้นตาม policy แต่ไม่ประกาศ `quest-new` อัตโนมัติ:
-  Admin ตัดสินใจจาก `LOG_QUEST_OPERATIONS` ว่า **ส่งประกาศ** (audited override) หรือ **ทดสอบก่อน**;
-  public announcement ห้ามระบุตัวลูกค้า
+- customer-discovered Quest อาจถูกเสนอเฉพาะ account นั้นตาม policy โดยไม่ขึ้นกับประกาศหรือการพบใน Monitor.
+  ระบบสร้าง Case ใน `LOG_QUEST_OPERATIONS`, เก็บลิงก์ Quest และค้นทุกบัญชี Monitor แบบ read-only อัตโนมัติ;
+  พบแล้วจึงทดสอบ, ไม่พบจะแสดง **ตรวจและทดสอบอีกครั้ง** หรือ audited **ส่งประกาศ**. `quest-new` เป็นข่าวและห้ามระบุตัวลูกค้า
 
 ## Discord และสิทธิ์หลังบ้าน
 
@@ -112,8 +118,9 @@ Top-up ID”; Owner ยืนยัน Manual Review แบบนี้ได้
 `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` และ `LOG_SYSTEM` แสดงคำอธิบายภาษาไทยก่อนข้อมูลเทคนิคเสมอ:
 การ์ดบอกสิ่งที่เกิดขึ้น สถานะหรือผลกระทบ เหตุผลที่อ่านง่าย และปิดท้ายด้วย `ข้อมูลอ้างอิง` กับ `สรุป:`
 เพื่อให้ผู้ดูแลค้นต่อในฐานข้อมูลได้โดยไม่ต้องอ่านข้อความดิบใน Discord.
-การ์ดทั้งสามห้องมีแถบ `backoffice-log-banner.webp` ด้านล่าง; รูปขวาบนใช้ Quest artwork หรือ global Discord profile
-เมื่อมีข้อมูล และ `LOG_SYSTEM` ใช้โลโก้ GIF ที่ตรวจ integrity แล้ว.
+`LOG_QUEST_OPERATIONS` และ `LOG_SYSTEM` ใช้แถบ `backoffice-log-banner.webp` ด้านล่าง ส่วน `LOG_ADMIN`
+ใช้ `admin-log-banner.webp`; รูปขวาบนใช้ Quest artwork หรือ global Discord profileเมื่อมีข้อมูล และ `LOG_SYSTEM`
+ใช้โลโก้ GIF ที่ตรวจ integrity แล้ว.
 
 การติดตั้งครั้งแรกยังเปิดบอทและแผง Owner ได้แม้ยังไม่มี TrueMoney receiver: Health จะแสดง
 `MISSING_RECEIVER` และระบบรับซองจะปฏิเสธอย่างปลอดภัยจนกว่าจะเพิ่ม receiver ที่ Active. หาก Provider รับซองสำเร็จ

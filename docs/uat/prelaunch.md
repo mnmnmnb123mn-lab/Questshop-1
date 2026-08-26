@@ -65,6 +65,9 @@ same Quest payload/evidence; do not infer values from another bot or a screensho
 ## Financial proof
 
 - [ ] Real low-value TrueMoney success: `REDEEMED → CREDITED` exactly once.
+- [ ] Submit a new valid voucher and verify the customer interaction immediately confirms only the durable Top-up ID,
+      never waits for TrueMoney or polls in the Ephemeral window, then starts settlement for that exact Top-up without
+      taking another queued customer's voucher.
 - [ ] Real low-value TrueMoney success without a provider transaction ID (if Provider omits it): `REDEEMED → CREDITED`
       exactly once; the stored transaction ID stays `NULL` and the Payment Log identifies the encrypted voucher +
       Top-up ID settlement reference without exposing a raw response.
@@ -83,8 +86,15 @@ same Quest payload/evidence; do not infer values from another bot or a screensho
       rejection, Manual Review and reversal. After encrypted-payload retention, a deleted message recovers only as a
       masked card; the existing Discord message remains Owner-managed evidence.
 - [ ] `LOG_PAYMENTS` keeps the payer profile as its upper-right thumbnail and shows the approved
-      `payment-log-banner.webp` once as the lower embed image after every create or edit; no duplicate attachment remains.
-- [ ] After the interaction wait window, a `MANUAL_REVIEW` or Owner `REJECTED` result reaches the customer as a DM.
+      `payment-log-banner.png` once as the lower embed image after every create or edit; no duplicate attachment remains.
+- [ ] One `TOPUP_STATUS_DM` message is created or edited for queued, processing, retry, credited, terminal failure,
+      Manual Review, Owner decision and reversal; it has the payer thumbnail, `payment-log-banner.png` once, safe
+      Thai copy and no voucher URL, sender PII, raw JSON or duplicate attachment. Customer DM must not show the
+      payment-attempt count, promotion name, TrueMoney transaction reference or Wallet transaction reference; those
+      diagnostic references remain available in `LOG_PAYMENTS` and PostgreSQL.
+- [ ] Disable customer DMs and verify the acceptance reply warns the customer, Outbox retries at 1, 5, 15, 60, 300 and
+      900 seconds, then records a Financial DLQ on the next failed attempt without changing the Top-up, Wallet or ledger
+      settlement. Enable DM before the final attempt and verify the same status message delivers the latest state instead.
 - [ ] Multi-Quest order captures successful Items and releases definite failures without losing cents.
 - [ ] Worker crash/restart around settlement produces no duplicate Ledger mutation.
 
@@ -98,6 +108,9 @@ Use masked voucher identity only. Full voucher links belong only in the validate
 - [ ] Real supported Desktop Quest verifies progress and ends at manual claim URL only.
 - [ ] Monitor-discovered Quest remains private until current-contract test pass or audited **ส่งเลย**.
 - [ ] Customer-discovered public announcement does not identify the customer or raw Token.
+- [ ] A customer-only Quest creates one `LOG_QUEST_OPERATIONS` Case with its Quest link, searches every active Test Monitor without blocking Checkout, and reports found/not-found/incomplete accurately.
+- [ ] A customer-only Quest that is absent from every Monitor has no Test mutation, retains **ตรวจและทดสอบอีกครั้ง**, and may be announced only with the explicit backoffice action.
+- [ ] A Quest visible to a Monitor is tested only on visible eligible accounts; a passed test updates the same Case and queues one informational `quest-new` announcement.
 - [ ] Quest History keeps the profile thumbnail, links `Quest — progress%` to the matching Quest URL, and shows the
       approved `quest-history-banner.png` below every status card without duplicate attachments.
 - [ ] Discord 404/429/5xx behavior preserves surface/outbox contracts.
@@ -113,8 +126,9 @@ Use masked voucher identity only. Full voucher links belong only in the validate
       no token, cookie, credential, ciphertext, nonce or auth tag appears.
 - [ ] In `LOG_SYSTEM`, simulate one temporary Discord failure and one operator-action incident. Verify one updated card
       per incident/scope, Thai explanation, green resolved state, no raw JSON, and advice only where an operator must act.
-- [ ] Verify every `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` and `LOG_SYSTEM` event card shows `backoffice-log-banner.webp`
-      once below the Embed on desktop and mobile, including a missing-aggregate fallback card.
+- [ ] Verify every `LOG_QUEST_OPERATIONS` and `LOG_SYSTEM` event card shows `backoffice-log-banner.webp`, while every
+      `LOG_ADMIN` event card shows `admin-log-banner.webp`, once below the Embed on desktop and mobile, including a
+      missing-aggregate fallback card.
 - [ ] Verify Checkout/Discovery/Runner/Admin-user cards show the applicable global Discord profile or safe Quest artwork
       at upper-right when available; failed profile lookup must still deliver the card.
 - [ ] Verify every `LOG_SYSTEM` card and a `LOG_ADMIN` card authored by `SYSTEM` animate

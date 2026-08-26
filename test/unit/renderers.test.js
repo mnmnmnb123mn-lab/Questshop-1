@@ -13,9 +13,10 @@ import {
   loadPaymentLogBanner,
 } from '../../src/discord/surfaces/payment-log-media.js';
 import {
+  ADMIN_LOG_BANNER_ATTACHMENT_URL, ADMIN_LOG_BANNER_FILENAME, ADMIN_LOG_BANNER_SIZE,
   BACKOFFICE_LOG_BANNER_ATTACHMENT_URL, BACKOFFICE_LOG_BANNER_FILENAME, BACKOFFICE_LOG_BANNER_SIZE,
   LOG_SYSTEM_THUMBNAIL_ATTACHMENT_URL, LOG_SYSTEM_THUMBNAIL_FILENAME, LOG_SYSTEM_THUMBNAIL_SIZE,
-  loadBackofficeLogBanner, loadLogSystemThumbnail,
+  loadAdminLogBanner, loadBackofficeLogBanner, loadLogSystemThumbnail,
 } from '../../src/discord/surfaces/backoffice-log-media.js';
 
 test('history projection renders truthful released and review terminal states', async () => {
@@ -50,20 +51,30 @@ test('Quest History banner is the exact RGB 461x8 PNG asset', async () => {
   assert.equal(banner[25], 2);
 });
 
-test('Payment Log banner is the exact supplied WebP asset', async () => {
+test('Payment Log banner is the exact supplied RGB 461x8 PNG asset', async () => {
   const banner = await loadPaymentLogBanner();
   assert.equal(banner.length, PAYMENT_LOG_BANNER_SIZE);
-  assert.equal(banner.subarray(0, 4).toString(), 'RIFF');
-  assert.equal(banner.subarray(8, 12).toString(), 'WEBP');
+  assert.deepEqual([...banner.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  assert.equal(banner.readUInt32BE(16), 461);
+  assert.equal(banner.readUInt32BE(20), 8);
+  assert.equal(banner[24], 8);
+  assert.equal(banner[25], 2);
 });
 
-test('backoffice banner and system thumbnail are the exact supplied assets', async () => {
-  const [banner, thumbnail] = await Promise.all([loadBackofficeLogBanner(), loadLogSystemThumbnail()]);
+test('backoffice, Admin and system thumbnail assets are exact supplied files', async () => {
+  const [banner, adminBanner, thumbnail] = await Promise.all([
+    loadBackofficeLogBanner(), loadAdminLogBanner(), loadLogSystemThumbnail(),
+  ]);
   assert.equal(banner.length, BACKOFFICE_LOG_BANNER_SIZE);
   assert.equal(banner.subarray(0, 4).toString(), 'RIFF');
   assert.equal(banner.subarray(8, 12).toString(), 'WEBP');
   assert.equal(banner.readUIntLE(24, 3) + 1, 1_536);
   assert.equal(banner.readUIntLE(27, 3) + 1, 26);
+  assert.equal(adminBanner.length, ADMIN_LOG_BANNER_SIZE);
+  assert.equal(adminBanner.subarray(0, 4).toString(), 'RIFF');
+  assert.equal(adminBanner.subarray(8, 12).toString(), 'WEBP');
+  assert.equal(adminBanner.readUIntLE(24, 3) + 1, 1_536);
+  assert.equal(adminBanner.readUIntLE(27, 3) + 1, 26);
   assert.equal(thumbnail.length, LOG_SYSTEM_THUMBNAIL_SIZE);
   assert.equal(thumbnail.subarray(0, 6).toString(), 'GIF89a');
   assert.equal(thumbnail.readUInt16LE(6), 498);
@@ -187,6 +198,77 @@ test('customer receives a safe status DM for manual review or a rejected top-up'
   assert.match(rejected.embeds[0].data.description, /ไม่ได้เพิ่มเครดิต/);
 });
 
+test('customer Top-up DM is one detailed receipt card without voucher or provider PII', async () => {
+  const now = new Date();
+  const body = await renderProjection({ query: async () => ({ rows: [{
+    id: 'topup', status: 'CREDITED', discord_user_id: '123456789012345678', created_at: now, updated_at: now,
+    credited_at: now, amount_cents: 5_000, bonus_cents: 500, promotion_name: 'โบนัสสมาชิกใหม่',
+    provider_transaction_id: 'provider-transaction', attempts: 2, wallet_transaction_id: 'wallet-transaction',
+    available_before_cents: 1_000, available_after_cents: 6_500, wallet_available_cents: 6_500,
+    failure_code: null, warning_code: null,
+  }] }) }, { projection_type: 'TOPUP_STATUS_DM', aggregate_id: 'topup' }, {
+    client: { users: { fetch: async () => ({ displayAvatarURL: () => 'https://cdn.discordapp.com/avatar.png' }) } },
+  });
+  assert.equal(body.embeds[0].data.title, '✅ เติมเครดิตสำเร็จ');
+  assert.match(body.embeds[0].data.description, /ยอดก่อนเติม:\*\* 10\.00 บาท/);
+  assert.match(body.embeds[0].data.description, /ได้รับทั้งหมด:\*\* 55\.00 บาท/);
+  assert.doesNotMatch(body.embeds[0].data.description,
+    /จำนวนครั้งที่ตรวจ|\*\*โปรโมชั่น:\*\*|ข้อมูลอ้างอิง|รายการ TrueMoney|รายการ Wallet|provider-transaction|wallet-transaction/);
+  assert.doesNotMatch(body.embeds[0].data.description, /gift\.truemoney\.com|sender_phone|ciphertext|null|undefined/);
+  assert.equal(body.embeds[0].data.thumbnail.url, 'https://cdn.discordapp.com/avatar.png');
+  assert.equal(body.embeds[0].data.image.url, PAYMENT_LOG_BANNER_ATTACHMENT_URL);
+  assert.equal(body.files[0].name, PAYMENT_LOG_BANNER_FILENAME);
+  assert.deepEqual(body.attachments, []);
+  assert.deepEqual(body.allowedMentions, { parse: [] });
+});
+
+test('customer Top-up DM uses safe Thai copy and the promised color for every customer-visible state', async () => {
+  const now = new Date();
+  const cases = [
+    ['PAYMENT_QUEUED', 0x5865f2, /รับรายการเติมเงินแล้ว/],
+    ['PROCESSING', 0x5865f2, /กำลังตรวจสอบซอง/],
+    ['RETRY_WAIT', 0xf0b232, /กำลังลองตรวจสอบใหม่/],
+    ['REDEEMED', 0x5865f2, /รับเงินจากซองแล้ว/],
+    ['CREDITED', 0x23a55a, /เติมเครดิตสำเร็จ/],
+    ['MANUAL_REVIEW', 0xf0b232, /กำลังตรวจสอบ/],
+    ['REJECTED', 0xf23f43, /ไม่ได้รับอนุมัติ/],
+    ['INVALID', 0xf23f43, /ใช้ซองนี้ไม่ได้/],
+    ['EXPIRED', 0xf23f43, /ซองหมดอายุ/],
+    ['ALREADY_REDEEMED', 0xf23f43, /ซองถูกใช้ไปแล้ว/],
+    ['FAILED', 0xf23f43, /เติมเครดิตไม่สำเร็จ/],
+    ['REVERSED', 0xf23f43, /เครดิตถูกย้อนกลับ/],
+  ];
+  for (const [status, expectedColor, expectedTitle] of cases) {
+    const body = await renderProjection({ query: async () => ({ rows: [{
+      id: 'topup', status, discord_user_id: '123456789012345678', created_at: now, updated_at: now,
+      credited_at: status === 'CREDITED' ? now : null, amount_cents: 5_000, bonus_cents: 500,
+      promotion_name: null, provider_transaction_id: null, attempts: 1, wallet_transaction_id: null,
+      available_before_cents: 1_000, available_after_cents: 6_500, wallet_available_cents: 6_500,
+      failure_code: status === 'ALREADY_REDEEMED' ? 'VOUCHER_OUT_OF_STOCK' : null, warning_code: null,
+    }] }) }, { projection_type: 'TOPUP_STATUS_DM', aggregate_id: 'topup' }, {
+      client: { users: { fetch: async () => { throw new Error('DM avatar unavailable'); } } },
+    });
+    assert.equal(body.embeds[0].data.color, expectedColor, status);
+    assert.match(body.embeds[0].data.title, expectedTitle, status);
+    assert.doesNotMatch(body.embeds[0].data.description, /PAYMENT_QUEUED|RETRY_WAIT|null|undefined|@everyone/, status);
+    assert.equal(body.files.length, 1, status);
+    assert.deepEqual(body.attachments, [], status);
+  }
+});
+
+test('credited customer Top-up omits provider and wallet references', async () => {
+  const now = new Date();
+  const body = await renderProjection({ query: async () => ({ rows: [{
+    id: 'topup-without-provider-id', status: 'CREDITED', discord_user_id: 'customer', created_at: now, updated_at: now,
+    credited_at: now, amount_cents: 5_000, bonus_cents: 0, promotion_name: null, provider_transaction_id: null,
+    attempts: 1, wallet_transaction_id: 'wallet-id', available_before_cents: 0, available_after_cents: 5_000,
+    wallet_available_cents: 5_000, failure_code: null, warning_code: null,
+  }] }) }, { projection_type: 'TOPUP_STATUS_DM', aggregate_id: 'topup-without-provider-id' });
+  assert.match(body.embeds[0].data.description, /Top-up ID/);
+  assert.doesNotMatch(body.embeds[0].data.description,
+    /จำนวนครั้งที่ตรวจ|\*\*โปรโมชั่น:\*\*|ข้อมูลอ้างอิง|รายการ TrueMoney|รายการ Wallet|การอ้างอิงการรับเงิน|wallet-id|null|undefined/);
+});
+
 test('order DM uses Discord link buttons instead of markdown action links', async () => {
   const pool = { query: async (sql) => {
     if (sql.includes('FROM order_aggregates')) return { rows: [{ id: 'order', account_username: 'Account',
@@ -302,16 +384,17 @@ test('backoffice thumbnails use safe stored, fetched, and system-logo sources', 
   const admin = await renderProjection({ query: async () => ({ rows: [{ id: 'audit', actor_id: 'SYSTEM', target_type: 'CONFIG',
     target_id: 'config', action: 'RUNTIME_CONFIG_CHANGE', reason: 'system update', before_state: {}, after_state: {},
     correlation_code: 'reference', trace_id: 'trace', created_at: now }] }) }, { projection_type: 'ADMIN_AUDIT', aggregate_id: 'audit' });
-  assert.equal(admin.embeds[0].data.image.url, BACKOFFICE_LOG_BANNER_ATTACHMENT_URL);
+  assert.equal(admin.embeds[0].data.image.url, ADMIN_LOG_BANNER_ATTACHMENT_URL);
   assert.equal(admin.embeds[0].data.thumbnail.url, LOG_SYSTEM_THUMBNAIL_ATTACHMENT_URL);
-  assert.deepEqual(admin.files.map((file) => file.name), [BACKOFFICE_LOG_BANNER_FILENAME, LOG_SYSTEM_THUMBNAIL_FILENAME]);
+  assert.deepEqual(admin.files.map((file) => file.name), [ADMIN_LOG_BANNER_FILENAME, LOG_SYSTEM_THUMBNAIL_FILENAME]);
 
   const adminUser = await renderProjection({ query: async () => ({ rows: [{ id: 'audit', actor_id: '523456789012345678',
     target_type: 'CONFIG', target_id: 'config', action: 'RUNTIME_CONFIG_CHANGE', reason: 'update',
     before_state: {}, after_state: {}, correlation_code: 'reference', trace_id: 'trace', created_at: now }] }) },
   { projection_type: 'ADMIN_AUDIT', aggregate_id: 'audit' }, { client });
   assert.equal(adminUser.embeds[0].data.thumbnail.url, 'https://cdn.discordapp.com/523456789012345678.png');
-  assert.deepEqual(adminUser.files.map((file) => file.name), [BACKOFFICE_LOG_BANNER_FILENAME]);
+  assert.equal(adminUser.embeds[0].data.image.url, ADMIN_LOG_BANNER_ATTACHMENT_URL);
+  assert.deepEqual(adminUser.files.map((file) => file.name), [ADMIN_LOG_BANNER_FILENAME]);
 });
 
 test('credited payment log matches the confirmed Thai format and profile thumbnail', async () => {
@@ -410,7 +493,7 @@ test('backoffice renderer branches keep fallbacks, statuses, and diagnostics saf
 
   assert.equal((await render('TOPUP_STATUS_DM', null)).embeds[0].data.title, 'ไม่พบสถานะเติมเงิน');
   const genericStatus = await render('TOPUP_STATUS_DM', { id: 'topup', status: 'PROCESSING', updated_at: now });
-  assert.match(genericStatus.embeds[0].data.title, /อัปเดตสถานะ/);
+  assert.match(genericStatus.embeds[0].data.title, /กำลังตรวจสอบซอง/);
   assert.doesNotMatch(genericStatus.embeds[0].data.description, /เหตุผล/);
   assert.equal((await render('QUEST_OPERATION', null)).embeds[0].data.title, 'ไม่พบ Quest Operation');
   const quest = await render('QUEST_OPERATION', { quest_id: 'quest', name: 'Quest', analysis_state: 'SUPPORTED',
@@ -574,4 +657,17 @@ test('customer-discovery case keeps the Quest link and offers a safe full retry 
   assert.equal(body.components[0].components[0].data.label, 'ตรวจและทดสอบอีกครั้ง');
   assert.equal(body.components[0].components[1].data.label, 'ส่งประกาศ');
   assert.equal(body.embeds[0].data.thumbnail.url, 'https://cdn.discordapp.com/avatar.png');
+});
+
+test('customer-discovery case explains when background testing is disabled without blocking Checkout', async () => {
+  const body = await renderProjection({ query: async () => ({ rows: [{
+    id: '11111111-1111-7111-8111-111111111112', quest_id: 'quest-waiting', name: 'Waiting Quest',
+    task_type: 'WATCH_VIDEO', url: 'https://discord.com/quests/waiting', latest_account_username: 'Account',
+    latest_account_id: 'account', first_discord_user_id: '123456789012345678', sighting_count: 1,
+    verification_state: 'CHECK_QUEUED', announcement_state: 'NOT_ANNOUNCED',
+    background_testing_enabled: false, last_result: { total: 2, found: 0, testable: 0, notFound: 0, failed: 0 },
+    trace_id: '019fc886-ffcd-70e3-bd14-fb61772e84c7', created_at: new Date(), updated_at: new Date(),
+  }] }) }, { projection_type: 'CUSTOMER_QUEST_DISCOVERY_CASE', aggregate_id: '11111111-1111-7111-8111-111111111112' });
+  assert.match(body.embeds[0].data.description, /ระบบทดสอบ.*ปิดอยู่/);
+  assert.equal(body.components.length, 0);
 });

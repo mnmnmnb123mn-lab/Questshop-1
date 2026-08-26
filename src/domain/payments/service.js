@@ -8,6 +8,7 @@ import { recordTransition } from '../shared/transition.js';
 import { openReview } from '../reviews/service.js';
 import { TOPUP_TRANSITIONS } from './states.js';
 import { enqueueProjection } from '../outbox/service.js';
+import { enqueueCustomerTopupStatus } from './customer-notification.js';
 import {
   assertDailyTopupAdmissionInTransaction,
   DEFAULT_PAYMENT_POLICY,
@@ -21,13 +22,6 @@ export const AUTO_CREDIT_MAX_CENTS = DEFAULT_PAYMENT_POLICY.autoCreditMaxCents;
 
 export function topupAmountNeedsReview(amountCents, policy = DEFAULT_PAYMENT_POLICY) {
   return paymentPolicyNeedsReview(amountCents, policy);
-}
-
-async function enqueueCustomerTopupStatus(client, topup, context) {
-  if (!['MANUAL_REVIEW', 'REJECTED'].includes(topup.status)) return;
-  await enqueueProjection(client, { projectionType: 'TOPUP_STATUS_DM', aggregateType: 'TOPUP',
-    aggregateId: topup.id, aggregateVersion: topup.state_version, surfaceKey: `DM:${topup.discord_user_id}`,
-    topic: 'TOPUP_STATUS_DM', context });
 }
 
 async function findVoucher(client, hashes) {
@@ -188,6 +182,7 @@ export async function submitVoucher({ discordUserId, voucherUrl, env }, context,
       await enqueueProjection(client, { projectionType: 'PAYMENT_LOG', aggregateType: 'TOPUP',
         aggregateId: topup.id, aggregateVersion: topup.state_version,
         surfaceKey: 'LOG_PAYMENTS', context });
+      await enqueueCustomerTopupStatus(client, topup, context);
       return { topup, idempotent: false };
     });
   } catch (error) {
@@ -198,12 +193,17 @@ export async function submitVoucher({ discordUserId, voucherUrl, env }, context,
   }
 }
 
-export async function acquirePaymentJob({ holder, ttlSeconds = 30 }, options = {}) {
+// `topupId` is used only for the just-submitted customer Top-up path.  It
+// lets that request start settlement immediately after its transaction has
+// committed, without letting it take an older customer's queued voucher.
+// Normal workers keep passing no id and retain FIFO acquisition.
+export async function acquirePaymentJob({ holder, ttlSeconds = 30, topupId = null }, options = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
     const result = await client.query(`
       WITH candidate AS (
         SELECT t.id FROM topups t
         WHERE t.status = 'PAYMENT_QUEUED' AND t.available_at <= clock_timestamp()
+          AND ($3::uuid IS NULL OR t.id = $3)
           AND NOT EXISTS (
             SELECT 1 FROM topup_daily_locks l
             WHERE l.discord_user_id=t.discord_user_id AND l.expires_at>clock_timestamp()
@@ -216,13 +216,19 @@ export async function acquirePaymentJob({ holder, ttlSeconds = 30 }, options = {
         fencing_token = fencing_token + 1, attempt_count = attempt_count + 1,
         updated_at = clock_timestamp()
       FROM candidate WHERE t.id = candidate.id RETURNING t.*
-    `, [holder, ttlSeconds]);
+    `, [holder, ttlSeconds, topupId]);
     const topup = result.rows[0] ?? null;
     if (topup) {
       await client.query(`INSERT INTO state_transitions(id,aggregate_type,aggregate_id,from_state,to_state,
         state_version,actor_type,actor_id,trace_id,reason_code)
         VALUES($1,'TOPUP',$2,'PAYMENT_QUEUED','PROCESSING',$3,'SYSTEM',$4,$5,'PAYMENT_LEASED')`,
       [uuidv7(), topup.id, topup.state_version, holder, topup.trace_id]);
+      await enqueueCustomerTopupStatus(client, topup, {
+        traceId: topup.trace_id,
+        causationId: null,
+        actorType: 'SYSTEM',
+        actorId: holder,
+      });
     }
     return topup;
   });

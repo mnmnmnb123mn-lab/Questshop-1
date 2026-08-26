@@ -88,14 +88,21 @@ async function enqueueFailureAlert(client, batch, quest, error, context) {
     aggregateVersion: alert.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context,
   });
   if (batch.customer_discovery_case_id) {
+    const beforeCase = (await client.query(`SELECT verification_state FROM customer_quest_discovery_cases
+      WHERE id=$1 FOR UPDATE`, [batch.customer_discovery_case_id])).rows[0];
     const updatedCase = (await client.query(`UPDATE customer_quest_discovery_cases SET verification_state='TEST_FAILED',
       state_version=state_version+1,current_test_batch_id=$2,last_result=$3,trace_id=$4,updated_at=clock_timestamp()
       WHERE id=$1 RETURNING *`, [batch.customer_discovery_case_id, batch.id, {
       code: errorPayload.code, message: errorPayload.message,
     }, context.traceId])).rows[0];
-    if (updatedCase) await enqueueProjection(client, { projectionType: 'CUSTOMER_QUEST_DISCOVERY_CASE',
-      aggregateType: 'CUSTOMER_QUEST_DISCOVERY_CASE', aggregateId: updatedCase.id,
-      aggregateVersion: updatedCase.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context });
+    if (updatedCase) {
+      await recordTransition(client, { aggregateType: 'CUSTOMER_QUEST_DISCOVERY_CASE', aggregateId: updatedCase.id,
+        fromState: beforeCase?.verification_state ?? null, toState: 'TEST_FAILED', stateVersion: updatedCase.state_version,
+        reasonCode: errorPayload.code, context });
+      await enqueueProjection(client, { projectionType: 'CUSTOMER_QUEST_DISCOVERY_CASE',
+        aggregateType: 'CUSTOMER_QUEST_DISCOVERY_CASE', aggregateId: updatedCase.id,
+        aggregateVersion: updatedCase.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context });
+    }
   }
   return alert;
 }
@@ -122,15 +129,20 @@ export async function createMonitorTestBatch(client, {
   if (await questDeadlinePassed(client, quest)) {
     return { batch: null, queued: null, reused: false, skipped: 'QUEST_EXPIRED' };
   }
-  const existing = (await client.query(`SELECT * FROM quest_test_batches
-    WHERE quest_id=$1 AND contract_hash IS NOT DISTINCT FROM $2
-    ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [quest.quest_id, quest.current_contract_hash])).rows[0];
+  // Customer discovery owns its Test batch.  Reusing a generic or completed
+  // batch would either test accounts that did not see the Quest or leave the
+  // Case stuck waiting for a terminal batch to transition again.
+  const existing = customerDiscoveryCaseId
+    ? (await client.query(`SELECT * FROM quest_test_batches
+      WHERE quest_id=$1 AND contract_hash IS NOT DISTINCT FROM $2
+        AND customer_discovery_case_id=$3 AND state IN ('QUEUED','RUNNING')
+      ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [quest.quest_id, quest.current_contract_hash,
+      customerDiscoveryCaseId])).rows[0]
+    : (await client.query(`SELECT * FROM quest_test_batches
+      WHERE quest_id=$1 AND contract_hash IS NOT DISTINCT FROM $2
+        AND customer_discovery_case_id IS NULL
+      ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [quest.quest_id, quest.current_contract_hash])).rows[0];
   if (existing && (ACTIVE_BATCH_STATES.has(existing.state) || !force)) {
-    if (customerDiscoveryCaseId && !existing.customer_discovery_case_id) {
-      await client.query(`UPDATE quest_test_batches SET customer_discovery_case_id=$2,updated_at=clock_timestamp()
-        WHERE id=$1`, [existing.id, customerDiscoveryCaseId]);
-      existing.customer_discovery_case_id = customerDiscoveryCaseId;
-    }
     return { batch: existing, queued: null, reused: true };
   }
   const availableMonitors = await activeTestMonitorIds(client);
@@ -165,7 +177,13 @@ export async function advanceMonitorTestBatch(client, { run, quest, error, conte
   }
   const monitorOrder = batch.monitor_order ?? [];
   const currentIndex = Math.max(0, monitorOrder.indexOf(run.target_monitor_id ?? run.monitor_id));
-  const sameMonitor = Number(run.attempt_in_monitor ?? 1) < Number(batch.max_attempts_per_monitor);
+  // A Quest disappearing, or being completed, is specific to this Monitor.
+  // Do not spend retry attempts on the same account and do not call it a
+  // contract failure; continue with the next account that saw the Quest.
+  const accountSpecific = Boolean(error?.accountSpecific)
+    || ['TEST_QUEST_MISSING', 'MONITOR_QUEST_ALREADY_COMPLETED'].includes(error?.code);
+  const sameMonitor = !accountSpecific
+    && Number(run.attempt_in_monitor ?? 1) < Number(batch.max_attempts_per_monitor);
   const target = sameMonitor
     ? await activeMonitorAt(client, monitorOrder, currentIndex)
     : await activeMonitorAt(client, monitorOrder, currentIndex + 1);
@@ -199,12 +217,17 @@ export async function markMonitorTestBatchPassed(client, { run, context }) {
     aggregateVersion: alert.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context,
   });
   if (batch.customer_discovery_case_id) {
+    const beforeCase = (await client.query(`SELECT verification_state FROM customer_quest_discovery_cases
+      WHERE id=$1 FOR UPDATE`, [batch.customer_discovery_case_id])).rows[0];
     const updatedCase = (await client.query(`UPDATE customer_quest_discovery_cases SET verification_state='PASSED',
       announcement_state=CASE WHEN announcement_state='NOT_ANNOUNCED' THEN 'QUEUED' ELSE announcement_state END,
       state_version=state_version+1,current_test_batch_id=$2,last_result=last_result||$3::jsonb,
       trace_id=$4,updated_at=clock_timestamp() WHERE id=$1 RETURNING *`, [batch.customer_discovery_case_id, batch.id,
     { test: 'PASSED', testedMonitorId: run.monitor_id, attempts: run.attempt_in_monitor }, context.traceId])).rows[0];
     if (updatedCase) {
+      await recordTransition(client, { aggregateType: 'CUSTOMER_QUEST_DISCOVERY_CASE', aggregateId: updatedCase.id,
+        fromState: beforeCase?.verification_state ?? null, toState: 'PASSED', stateVersion: updatedCase.state_version,
+        reasonCode: 'MONITOR_TEST_PASSED', context });
       if (updatedCase.announcement_state === 'QUEUED') await enqueueProjection(client, {
         projectionType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: batch.quest_id,
         aggregateVersion: updatedCase.state_version, surfaceKey: 'QUEST_NEW', context,

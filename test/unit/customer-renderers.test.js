@@ -5,8 +5,7 @@ import {
   renderOrderConfirmation,
   renderQuote,
   renderSelection,
-  renderTopupProcessing,
-  renderTopupResult,
+  renderTopupAccepted,
 } from '../../src/discord/renderers/checkout.js';
 import { adminNavigationComponents } from '../../src/discord/renderers/admin.js';
 
@@ -80,21 +79,16 @@ test('order confirmation is a receipt and links to durable history', () => {
   assert.equal(body.components[0].components[0].data.label, 'ดูความคืบหน้าการทำ Quest');
 });
 
-test('top-up result distinguishes credited, review and failure without guessing', () => {
-  const credited = renderTopupResult({ id: 'topup', status: 'CREDITED', amount_cents: 10_000,
-    bonus_cents: 1_000, available_before: 2_000, available_after: 13_000, promotion_name: 'โบนัส 10%' });
-  assert.match(credited.embeds[0].data.description, /ยอดก่อนเติม/);
-  assert.match(credited.embeds[0].data.description, /ได้รับทั้งหมด:\*\* 110\.00 บาท/);
-  const review = renderTopupResult({ id: 'topup', status: 'AMBIGUOUS' });
-  assert.match(review.embeds[0].data.title, /กำลังตรวจสอบ/);
-  assert.doesNotMatch(review.embeds[0].data.title, /ไม่สำเร็จ/);
-  const failed = renderTopupResult({ id: 'topup', status: 'ALREADY_REDEEMED' });
-  assert.match(failed.embeds[0].data.title, /ไม่สำเร็จ/);
-});
-
-test('top-up processing preserves the intended Discord warning color', () => {
-  const body = renderTopupProcessing('topup');
-  assert.equal(body.embeds[0].data.color, Number.parseInt('f0b232', 16));
+test('top-up acknowledgement confirms durable acceptance and directs the customer to DM', () => {
+  const received = renderTopupAccepted({ topup: { id: 'topup', status: 'PAYMENT_QUEUED',
+    created_at: '2030-01-01T00:00:00.000Z' } });
+  assert.match(received.embeds[0].data.title, /รับรายการเติมเงินแล้ว/);
+  assert.match(received.embeds[0].data.description, /Top-up ID/);
+  assert.match(received.embeds[0].data.description, /ข้อความส่วนตัว/);
+  const existing = renderTopupAccepted({ idempotent: true, topup: { id: 'topup', status: 'CREDITED',
+    created_at: '2030-01-01T00:00:00.000Z' } });
+  assert.match(existing.embeds[0].data.title, /รายการเติมเงินเดิม/);
+  assert.match(existing.embeds[0].data.description, /ไม่เรียก TrueMoney เพิ่ม/);
 });
 
 test('admin navigation always includes category navigation and refresh controls', () => {

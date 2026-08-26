@@ -92,10 +92,12 @@ Source: `src/quest-engine/schema/normalizer.js`, `src/domain/catalog/service.js`
 
 - Customer-facing Quest announcements display Quest **start** (`starts_at`) and **expiry** (`expires_at`) times. They do
   not expose the scanner detection time or the mutable PostgreSQL `updated_at` value as customer copy.
-- A customer-discovered Quest remains private even when that customer's authenticated account may buy it. The durable
-  `CUSTOMER_QUEST_DISCOVERY` backoffice projection presents **ส่งประกาศ** and **ทดสอบก่อน** to an Administrator;
-  only the former creates public `QUEST_NEW` through an audited test-gate override. Its checkout-session foreign key is
-  cleared, not cascaded, during retention so the operational decision evidence remains available.
+- A customer-discovered Quest remains private even when that customer's authenticated account may buy it. One durable
+  Case per Quest keeps all customer sightings, the HTTPS Quest link and Monitor-search result. It starts a read-only
+  search across active Test Monitors automatically; only accounts where the Quest is visible may mutate it in a Test.
+  `not found` is a search result, not a contract failure. The Case has **ตรวจและทดสอบอีกครั้ง** and audited
+  **ส่งประกาศ** actions; announcements are informational and do not alter customer Checkout admission. Its source
+  checkout foreign key is cleared, not cascaded, during retention so the operational evidence remains available.
 - A Quest whose `expires_at` is already past remains valid catalog/history evidence but is terminal for active delivery:
   Monitor discovery marks it `EXPIRED` before creating a test batch, does not consume a Monitor Token, and does not
   enqueue `QUEST_NEW`.
@@ -138,7 +140,7 @@ available, verify the displayed range against its payload. Missing assets must r
 | Runtime / build identity | config, bootstrap, Node 22 | env/setup/startup tests | intended inwcloud build + restart |
 | PostgreSQL TLS / roles | pools, migrations, role sync/validator | PostgreSQL 16 role/TLS tests | Aiven role + CA verification |
 | Wallet / Ledger | wallet services, reservations, append-only tables | concurrency/settlement/refund tests | Owner compensation sign-off |
-| TrueMoney | adapter, payment worker/service | canonical URL/schema/ambiguity/crash tests | real low-value + ambiguous UAT |
+| TrueMoney | adapter, payment worker/service, customer Top-up DM projection | canonical URL/schema/ambiguity/crash/DM-coalescing tests | real low-value + ambiguous UAT, immediate acknowledgement and DM-disabled behavior |
 | Pricing / promotions | pricing resolver, Admin config service | category + promotion integration tests | Owner Admin pricing UAT |
 | Quest Auto storefront | renderer, surface setup/reconcile, exact GIF | price/media/surface tests | in-embed animation + visible refresh |
 | Quest new announcement | normalizer, catalog metadata, expiry/outbox guards, Quest renderer | Orb/media/current-revision/expired-filter tests | real Quest reward/time/artwork + historical-scan UAT |

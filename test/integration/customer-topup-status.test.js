@@ -1,7 +1,7 @@
 import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTestPool } from '../fixtures/postgres.js';
-import { loadCustomerTopup, waitForCustomerTopup } from '../../src/domain/payments/customer-status.js';
+import { loadCustomerTopup } from '../../src/domain/payments/customer-status.js';
 import { renderProjection } from '../../src/discord/renderers/projections.js';
 import { encryptSecret } from '../../src/adapters/crypto/keyring.js';
 
@@ -35,10 +35,19 @@ test('customer top-up status is ownership-bound and returns a credited result wi
   const loaded = await loadCustomerTopup({ topupId, discordUserId: 'customer' }, { pool });
   assert.equal(loaded.status, 'CREDITED');
   assert.equal(loaded.wallet_available_cents, '11000');
-  const settled = await waitForCustomerTopup({ topupId, discordUserId: 'customer', timeoutMs: 10 }, { pool });
-  assert.equal(settled.id, topupId);
   const receipt = await renderProjection(pool, { projection_type: 'TOPUP_RECEIPT', aggregate_id: topupId });
   assert.match(receipt.embeds[0].data.description, /ได้รับทั้งหมด:\*\* 110\.00 บาท/);
+  const customerDm = await renderProjection(pool, { projection_type: 'TOPUP_STATUS_DM', aggregate_id: topupId }, {
+    client: { users: { fetch: async () => null } },
+  });
+  assert.equal(customerDm.embeds[0].data.title, '✅ เติมเครดิตสำเร็จ');
+  assert.match(customerDm.embeds[0].data.description, /ได้รับทั้งหมด:\*\* 110\.00 บาท/);
+  assert.match(customerDm.embeds[0].data.description, /ยอดคงเหลือใหม่:\*\* 110\.00 บาท/);
+  assert.doesNotMatch(customerDm.embeds[0].data.description, /gift\.truemoney\.com|0812341234/);
+  assert.doesNotMatch(customerDm.embeds[0].data.description,
+    /จำนวนครั้งที่ตรวจ|\*\*โปรโมชั่น:\*\*|ข้อมูลอ้างอิง|รายการ TrueMoney|รายการ Wallet|null|undefined/);
+  assert.equal(customerDm.files.length, 1);
+  assert.deepEqual(customerDm.attachments, []);
   const paymentLog = await renderProjection(pool, { projection_type: 'PAYMENT_LOG', aggregate_id: topupId }, {
     env: { DATA_ENCRYPTION_KEYS_JSON: keyring, DISCORD_GUILD_ID: 'guild' },
     client: { users: { fetch: async () => null } },

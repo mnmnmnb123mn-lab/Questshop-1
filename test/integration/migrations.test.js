@@ -45,8 +45,9 @@ test('migration runner applies and verifies all checksums idempotently', async (
         'checkout_quest_options','order_items','runner_jobs')`);
   assert.equal(contractColumns.rowCount, 6);
   const activeBatchIndex = await pool.query(`SELECT indexdef FROM pg_indexes
-    WHERE schemaname='public' AND indexname='quest_test_batches_one_active_contract_idx'`);
+    WHERE schemaname='public' AND indexname='quest_test_batches_one_active_scope_idx'`);
   assert.match(activeBatchIndex.rows[0].indexdef, /quest_id, contract_hash/);
+  assert.match(activeBatchIndex.rows[0].indexdef, /customer_discovery_case_id/);
   const legacyBatchIndex = await pool.query(`SELECT indexdef FROM pg_indexes
     WHERE schemaname='public' AND indexname='quest_test_batches_one_active_null_contract_idx'`);
   assert.match(legacyBatchIndex.rows[0].indexdef, /contract_hash IS NULL/);

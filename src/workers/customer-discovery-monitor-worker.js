@@ -46,8 +46,14 @@ export async function processCustomerDiscoveryMonitorSearch({ env, pool, signal,
     } }, context, { pool });
   } catch (error) {
     await markMonitorFailure(pool, check.monitor_id, error);
-    await completeCustomerMonitorSearchCheck({ check, state: 'FAILED', evidence: {
-      result: 'FAILED', retryable: Boolean(error?.retryable || error?.category === 'NETWORK'),
+    const retryable = Boolean(error?.retryable || error?.category === 'NETWORK' || Number(error?.status) === 429);
+    // Quest reads are safe to repeat.  Keep the retry evidence durable and
+    // give a transient failure up to three worker acquisitions before the
+    // Case reports that this Monitor could not be checked.
+    const state = retryable && Number(check.attempt_count) < 3 ? 'PENDING' : 'FAILED';
+    await completeCustomerMonitorSearchCheck({ check, state, evidence: {
+      result: state === 'PENDING' ? 'RETRY_WAIT' : 'FAILED', retryable,
+      attempts: Number(check.attempt_count),
     }, errorClass: error?.code ?? error?.name ?? 'UNKNOWN' }, context, { pool });
   }
   return true;

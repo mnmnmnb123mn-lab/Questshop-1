@@ -227,3 +227,34 @@ test('fatal Monitor authentication failure quarantines before the batch chooses 
     { target_monitor_id: second, state: 'TEST_QUEUED', attempt_in_monitor: 1 },
   ]);
 });
+
+test('a Quest that disappears during a Monitor test moves straight to the next Monitor', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const traceId = uuidv7(); const first = uuidv7(); const second = uuidv7(); const batchId = uuidv7();
+  const runId = uuidv7(); const questId = `missing-quest-${runId.slice(0, 8)}`;
+  const context = createContext({ traceId, actorType: 'SYSTEM', actorId: 'quest-test', guildId: 'guild',
+    idempotencyKey: 'missing-quest-skips-monitor' });
+  await pool.query(`INSERT INTO monitor_accounts(id,account_id,capabilities,state,priority) VALUES
+    ($1,'missing-quest-a',ARRAY['TEST'],'ACTIVE',2),($2,'missing-quest-b',ARRAY['TEST'],'ACTIVE',1)`, [first, second]);
+  await pool.query(`INSERT INTO quests(quest_id,analysis_state,name,task_type,task_target,url,expires_at,
+    executor_id,engine_version,executor_version,contract_version)
+    VALUES($1,'SUPPORTED',$1,'WATCH_VIDEO',60,$2,clock_timestamp()+interval '1 day','video','1','1','1')`,
+  [questId, `https://discord.com/quests/${questId}`]);
+  await pool.query(`INSERT INTO quest_test_batches(id,quest_id,state,monitor_order,trace_id,requested_by)
+    VALUES($1,$2,'RUNNING',ARRAY[$3,$4]::uuid[],$5,'SYSTEM')`, [batchId, questId, first, second, traceId]);
+  await pool.query(`INSERT INTO quest_test_runs(id,quest_id,batch_id,target_monitor_id,state,engine_version,
+    executor_version,contract_version,attempt_in_monitor,trace_id)
+    VALUES($1,$2,$3,$4,'TEST_FAILED','1','1','1',1,$5)`, [runId, questId, batchId, first, traceId]);
+  const run = (await pool.query('SELECT * FROM quest_test_runs WHERE id=$1', [runId])).rows[0];
+  await withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (client) => {
+    const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [questId])).rows[0];
+    await advanceMonitorTestBatch(client, { run, quest,
+      error: { code: 'TEST_QUEST_MISSING', accountSpecific: true }, context });
+  });
+  const attempts = (await pool.query(`SELECT target_monitor_id,state,attempt_in_monitor FROM quest_test_runs
+    WHERE batch_id=$1 ORDER BY created_at,id`, [batchId])).rows;
+  assert.deepEqual(attempts, [
+    { target_monitor_id: first, state: 'TEST_FAILED', attempt_in_monitor: 1 },
+    { target_monitor_id: second, state: 'TEST_QUEUED', attempt_in_monitor: 1 },
+  ]);
+});

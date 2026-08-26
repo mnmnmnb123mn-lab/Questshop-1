@@ -39,7 +39,16 @@ function deadLetterCategory(event, projection) {
 function deliveryDisposition(event, projection, details) {
   const terminalDmFailure = projection?.projection_type === 'ORDER_DM'
     && projection.surface_key.startsWith('DM:');
-  const dead = !terminalDmFailure && (details.forbidden || event.attempt_count > BACKOFF.length);
+  // A customer may simply have DMs disabled (Discord 403/50007) when the
+  // Top-up status is first rendered.  Unlike the one-shot order summary,
+  // this financial status card must keep retrying so it can deliver the
+  // latest result when the customer enables DMs.  It reaches the Financial
+  // DLQ only after the same bounded retry budget as other Outbox work.
+  const retryableTopupDm = projection?.projection_type === 'TOPUP_STATUS_DM'
+    && projection.surface_key.startsWith('DM:');
+  const dead = !terminalDmFailure && (
+    (!retryableTopupDm && details.forbidden) || event.attempt_count > BACKOFF.length
+  );
   if (terminalDmFailure) return { terminalDmFailure, dead, nextState: 'DELIVERED' };
   return { terminalDmFailure, dead, nextState: dead ? 'DEAD_LETTER' : 'RETRY_WAIT' };
 }

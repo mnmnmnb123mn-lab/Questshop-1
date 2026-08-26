@@ -23,5 +23,5 @@ export function isRunnerVersionCompatible(value) {
 // Deployment applies migrations before starting the all-in-one process, so a
 // partially migrated database must fail readiness instead of failing later in
 // a payment/runner worker.
-export const MIN_COMPATIBLE_SCHEMA_VERSION = 33;
-export const MAX_COMPATIBLE_SCHEMA_VERSION = 33;
+export const MIN_COMPATIBLE_SCHEMA_VERSION = 34;
+export const MAX_COMPATIBLE_SCHEMA_VERSION = 34;
