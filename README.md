@@ -72,6 +72,10 @@ Discord nonce เป็นตัวช่วยกู้ anchor; footer แบ�
 ถ้าอนาคตเปลี่ยน bytes ของ GIF อย่างตั้งใจ ควรเปลี่ยน filename/version ด้วยเพื่อให้ Discord-side drift detection
 บังคับแทน attachment เดิมได้ชัดเจน.
 
+ไฟล์ภาพต้นฉบับที่ Owner ส่งให้จัดเก็บแยกไว้ใน `assets/owner-originals/` พร้อมชื่อที่สื่อความหมาย, SHA-256 และ
+ตารางจับคู่กับไฟล์ Runtime. โค้ดใช้งานเฉพาะไฟล์ใน `src/discord/assets/` ผ่าน integrity loader ไม่อ่านไฟล์ต้นฉบับ
+โดยตรง.
+
 ## กฎธุรกิจหลัก
 
 ```text
