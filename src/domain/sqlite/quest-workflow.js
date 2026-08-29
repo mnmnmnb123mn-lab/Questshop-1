@@ -3,7 +3,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { decryptCredential } from './crypto.js';
 import { enqueueJobInTransaction, completeJob, markJobPossiblySent, updateRunningJobPayload } from './jobs.js';
 import { enqueueNotificationInTransaction } from './notifications.js';
-import { markOrderItemRunning, settleOrderItem } from './orders.js';
+import { markOrderItemRunning, settleOrderItem, updateOrderItemProgress } from './orders.js';
 import { nowMs, withImmediateTransaction } from '../../db/sqlite.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { currentFeatureGates } from './gates.js';
@@ -177,7 +177,12 @@ async function runQuest(runtime, { credentialId, questId, job, onProgress }) {
   let quest = await findFresh();
   if (quest.completed) return { ...quest, completedBeforeRun: true, verifiedCompleted: true };
   let mutationAttempted = false;
-  const markPossibleMutation = () => { mutationAttempted = true; markJobPossiblySent(runtime.db, { jobId: job.id, leaseToken: job.lease_token }); };
+  const markPossibleMutation = () => {
+    mutationAttempted = true;
+    if (!markJobPossiblySent(runtime.db, { jobId: job.id, leaseToken: job.lease_token })) {
+      throw Object.assign(new Error('Quest lease lost before mutation'), { code: 'JOB_LEASE_LOST' });
+    }
+  };
   try {
   if (!quest.enrolled) {
     markPossibleMutation();
@@ -214,26 +219,26 @@ function isDefiniteQuestFailure(error) {
 }
 
 export async function processQuestRun(runtime, job) {
+  const workerJob = { jobId: job.id, leaseToken: job.lease_token };
   const item = runtime.db.prepare(`SELECT i.*,o.credential_id,o.trace_id,q.url FROM order_items i
     JOIN orders o ON o.id=i.order_id JOIN quests q ON q.quest_id=i.quest_id WHERE i.id=?`).get(job.subject_id);
   if (!item) return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED', errorCode: 'ORDER_ITEM_NOT_FOUND' });
-  markOrderItemRunning(runtime.db, { itemId: item.id });
+  markOrderItemRunning(runtime.db, { itemId: item.id, workerJob });
   try {
     const result = await runQuest(runtime, { credentialId: item.credential_id, questId: item.quest_id, job,
-      onProgress: (fresh) => runtime.db.prepare('UPDATE order_items SET progress_percent=?,updated_at=? WHERE id=?')
-        .run(Math.max(0, Math.min(100, Math.round(Number(fresh.progress ?? 0)))), nowMs(), item.id) });
+      onProgress: (fresh) => updateOrderItemProgress(runtime.db, { itemId: item.id, progressPercent: fresh.progress, workerJob }) });
     if (result.completedBeforeRun) {
       settleOrderItem(runtime.db, { itemId: item.id, outcome: 'FAILED', reason: 'EXTERNAL_COMPLETED_RELEASED',
-        evidence: { completedBeforeRun: true } });
+        evidence: { completedBeforeRun: true }, workerJob });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED', errorCode: 'EXTERNAL_COMPLETED_RELEASED' });
     }
     if (result.verifiedCompleted) {
       settleOrderItem(runtime.db, { itemId: item.id, outcome: 'SUCCESS', claimUrl: result.url ?? item.url, verified: true,
-        evidence: { verifiedCompleted: true } });
+        evidence: { verifiedCompleted: true }, workerJob });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
     }
     settleOrderItem(runtime.db, { itemId: item.id, outcome: 'REVIEW', reason: 'QUEST_COMPLETION_UNVERIFIED',
-      evidence: { completed: result.completed === true, progress: result.progress ?? null } });
+      evidence: { completed: result.completed === true, progress: result.progress ?? null }, workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
       errorCode: 'QUEST_COMPLETION_UNVERIFIED', checkpoint: 'POSSIBLY_SENT' });
   } catch (error) {
@@ -242,12 +247,12 @@ export async function processQuestRun(runtime, job) {
     // reserved and asks an Owner to review rather than guessing a release.
     if (isDefiniteQuestFailure(error)) {
       settleOrderItem(runtime.db, { itemId: item.id, outcome: 'FAILED', reason: error.code ?? 'QUEST_DEFINITE_FAILURE',
-        evidence: { definite: true } });
+        evidence: { definite: true }, workerJob });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED',
         errorCode: error.code ?? 'QUEST_DEFINITE_FAILURE', checkpoint: 'VERIFIED' });
     }
     settleOrderItem(runtime.db, { itemId: item.id, outcome: 'REVIEW', reason: error.code ?? 'QUEST_RESULT_AMBIGUOUS',
-      evidence: { possiblyMutated: error.questPossiblyMutated === true } });
+      evidence: { possiblyMutated: error.questPossiblyMutated === true }, workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
       errorCode: error.code ?? 'QUEST_RESULT_AMBIGUOUS', checkpoint: 'POSSIBLY_SENT' });
   }
@@ -258,16 +263,21 @@ export async function processMonitorTest(runtime, job) {
   try {
     const completed = await runQuest(runtime, { credentialId: payload.credentialId, questId: payload.questId, job });
     withImmediateTransaction(runtime.db, () => {
+      // A Quest already completed before this test is evidence that this
+      // account cannot verify *this run*.  It must never open the public
+      // announcement gate as a successful monitor mutation.
+      const passed = completed.verifiedCompleted === true && completed.completedBeforeRun !== true;
       insertQuestCheck(runtime.db, { questId: payload.questId, monitorAccountId: payload.monitorAccountId,
-        batchId: payload.batchId, type: 'TEST', state: completed.completed ? 'PASSED' : 'FAILED' });
+        batchId: payload.batchId, type: 'TEST', state: passed ? 'PASSED' : 'FAILED',
+        safeReason: completed.completedBeforeRun ? 'COMPLETED_BEFORE_MONITOR_TEST' : null });
       const quest = runtime.db.prepare('SELECT * FROM quests WHERE quest_id=?').get(payload.questId);
-      const passed = completed.completed === true;
+      const announce = passed && currentFeatureGates(runtime.db).QUEST_ANNOUNCEMENT_ENABLED;
       runtime.db.prepare(`UPDATE quests SET monitor_status=?,announcement_status=CASE WHEN ? AND announcement_status='NOT_ANNOUNCED' THEN 'QUEUED' ELSE announcement_status END,
         state_version=state_version+1,updated_at=? WHERE quest_id=? AND state_version=?`)
-        .run(passed ? 'TEST_PASSED' : 'TEST_FAILED', passed ? 1 : 0, nowMs(), payload.questId, quest?.state_version);
+        .run(passed ? 'TEST_PASSED' : 'TEST_FAILED', announce ? 1 : 0, nowMs(), payload.questId, quest?.state_version);
       enqueueNotificationInTransaction(runtime.db, { notificationType: 'CUSTOMER_QUEST_DISCOVERY', aggregateType: 'QUEST', aggregateId: payload.questId,
         destination: 'LOG_QUEST_OPERATIONS', payload: { questId: payload.questId, result: passed ? 'PASSED' : 'FAILED' }, timestamp: nowMs() });
-      if (passed && currentFeatureGates(runtime.db).QUEST_ANNOUNCEMENT_ENABLED) {
+      if (announce) {
         enqueueNotificationInTransaction(runtime.db, { notificationType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: payload.questId,
           destination: 'QUEST_NEW', payload: { questId: payload.questId, verifiedByMonitor: true }, timestamp: nowMs() });
       }
