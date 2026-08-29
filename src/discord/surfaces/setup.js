@@ -52,6 +52,11 @@ async function findSurfaceMarker(channel, surfaceKey) {
     if (byNonce) return byNonce;
     const oldest = values.at(-1);
     if (!oldest?.id || oldest.id === before || values.length < 100) break;
+    if (pageNumber === 99) {
+      const error = new Error('Surface nonce search reached its safe bound');
+      error.code = 'SURFACE_NONCE_SEARCH_INCOMPLETE';
+      throw error;
+    }
     before = oldest.id;
   }
   // Only after exhausting the stable nonce search may an old technical
@@ -64,7 +69,7 @@ async function findSurfaceMarker(channel, surfaceKey) {
   return null;
 }
 
-function claimDurableSurfaceOperation(db, surfaceKey, actorId) {
+function claimDurableSurfaceOperation(db, surfaceKey, actorId, targetChannelId, previousAnchor) {
   const timestamp = nowMs(); const key = `surface_operation:${surfaceKey}`;
   return withImmediateTransaction(db, () => {
     const current = db.prepare('SELECT * FROM settings WHERE key=?').get(key);
@@ -75,14 +80,15 @@ function claimDurableSurfaceOperation(db, surfaceKey, actorId) {
     }
     db.prepare(`INSERT INTO settings(key,value_json,updated_at,updated_by) VALUES(?,?,?,?)
       ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
-      .run(key, JSON.stringify({ state: 'INTENT_RECORDED', actorId, startedAt: timestamp, expiresAt: timestamp + 5 * 60_000 }), timestamp, actorId);
+      .run(key, JSON.stringify({ state: 'INTENT_RECORDED', actorId, targetChannelId, previousAnchor,
+        startedAt: timestamp, expiresAt: timestamp + 5 * 60_000 }), timestamp, actorId);
   });
 }
 
-function completeDurableSurfaceOperation(db, surfaceKey, actorId) {
+function saveDurableSurfaceOperation(db, surfaceKey, operation, actorId) {
   const timestamp = nowMs();
   withImmediateTransaction(db, () => db.prepare(`UPDATE settings SET value_json=?,updated_at=?,updated_by=? WHERE key=?`)
-    .run(JSON.stringify({ state: 'COMPLETED', completedAt: timestamp }), timestamp, actorId, `surface_operation:${surfaceKey}`));
+    .run(JSON.stringify({ ...operation, updatedAt: timestamp }), timestamp, actorId, `surface_operation:${surfaceKey}`));
 }
 
 export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, existingMessage = null) {
@@ -114,13 +120,16 @@ export async function setupSurface({ channel, surfaceKey, runtime, actorId }) {
   if (activeSurfaceOperations.has(surfaceKey)) {
     const error = new Error('Surface setup is already in progress'); error.code = 'SURFACE_SETUP_IN_PROGRESS'; throw error;
   }
-  claimDurableSurfaceOperation(runtime.db, surfaceKey, actorId);
+  const current = runtime.config.surfaces?.[surfaceKey] ?? null;
+  claimDurableSurfaceOperation(runtime.db, surfaceKey, actorId, channel.id, current);
   activeSurfaceOperations.add(surfaceKey);
   try {
-  const current = runtime.config.surfaces?.[surfaceKey] ?? null;
   const existing = current?.channelId === channel.id && current?.messageId
     ? await fetchSurfaceMessageFresh(channel, current.messageId) : null;
   const { message, recreated } = await updateOrCreateSurfaceAnchor(channel, surfaceKey, runtime.config, existing);
+  const operation = { state: 'NEW_READY', actorId, targetChannelId: channel.id, previousAnchor: current,
+    newAnchor: { channelId: channel.id, messageId: message.id, nonce: surfaceNonce(surfaceKey) } };
+  saveDurableSurfaceOperation(runtime.db, surfaceKey, operation, actorId);
   const timestamp = nowMs();
   withImmediateTransaction(runtime.db, () => {
     saveSurfaceInTransaction(runtime.db, surfaceKey, { channelId: channel.id, messageId: message.id, nonce: surfaceNonce(surfaceKey) }, actorId);
@@ -134,13 +143,42 @@ export async function setupSurface({ channel, surfaceKey, runtime, actorId }) {
   });
   runtime.config = { ...runtime.config, surfaces: { ...(runtime.config.surfaces ?? {}),
     [surfaceKey]: { channelId: channel.id, messageId: message.id, nonce: surfaceNonce(surfaceKey) } } };
+  operation.state = 'POINTER_SAVED'; saveDurableSurfaceOperation(runtime.db, surfaceKey, operation, actorId);
   // Persisting the replacement first means a failed move can never leave the
   // storefront without a usable anchor.
   await retireOldAnchor(runtime, surfaceKey, current, channel.id);
-  completeDurableSurfaceOperation(runtime.db, surfaceKey, actorId);
+  operation.state = 'OLD_RETIRED'; saveDurableSurfaceOperation(runtime.db, surfaceKey, operation, actorId);
+  operation.state = 'COMPLETED'; saveDurableSurfaceOperation(runtime.db, surfaceKey, operation, actorId);
   return { message, recreated };
   } finally {
     activeSurfaceOperations.delete(surfaceKey);
+  }
+}
+
+async function resumeSurfaceOperations(runtime) {
+  const rows = runtime.db.prepare("SELECT key,value_json FROM settings WHERE key LIKE 'surface_operation:%'").all();
+  for (const row of rows) {
+    let operation; try { operation = JSON.parse(row.value_json); } catch { continue; }
+    if (!operation || operation.state === 'COMPLETED' || !operation.targetChannelId) continue;
+    const surfaceKey = row.key.slice('surface_operation:'.length);
+    try {
+      const channel = await runtime.client.channels.fetch(operation.targetChannelId);
+      if (!channel?.isTextBased?.()) throw Object.assign(new Error('Surface channel unavailable'), { code: 'SURFACE_UNAVAILABLE' });
+      const saved = operation.newAnchor;
+      const existing = saved?.messageId ? await fetchSurfaceMessageFresh(channel, saved.messageId) : null;
+      const result = await updateOrCreateSurfaceAnchor(channel, surfaceKey, runtime.config, existing);
+      operation.newAnchor = { channelId: channel.id, messageId: result.message.id, nonce: surfaceNonce(surfaceKey) };
+      operation.state = 'NEW_READY'; saveDurableSurfaceOperation(runtime.db, surfaceKey, operation, 'SYSTEM');
+      withImmediateTransaction(runtime.db, () => saveSurfaceInTransaction(runtime.db, surfaceKey, operation.newAnchor, 'SYSTEM'));
+      runtime.config = { ...runtime.config, surfaces: { ...(runtime.config.surfaces ?? {}), [surfaceKey]: operation.newAnchor } };
+      operation.state = 'POINTER_SAVED'; saveDurableSurfaceOperation(runtime.db, surfaceKey, operation, 'SYSTEM');
+      await retireOldAnchor(runtime, surfaceKey, operation.previousAnchor, channel.id);
+      operation.state = 'OLD_RETIRED'; saveDurableSurfaceOperation(runtime.db, surfaceKey, operation, 'SYSTEM');
+      operation.state = 'COMPLETED'; saveDurableSurfaceOperation(runtime.db, surfaceKey, operation, 'SYSTEM');
+    } catch (error) {
+      recordSystemIncident(runtime.db, { code: error.code ?? error.status ?? 'SURFACE_SETUP_RESUME_FAILED', scope: surfaceKey,
+        severity: 'WARNING', details: { channelId: operation.targetChannelId } });
+    }
   }
 }
 
@@ -148,10 +186,17 @@ export async function setupSurface({ channel, surfaceKey, runtime, actorId }) {
  * SQLite runtime, never participates in a financial transaction. */
 export async function reconcileSurfaceAnchors({ runtime }) {
   runtime.config = loadRuntimeConfig(runtime.db);
+  await resumeSurfaceOperations(runtime);
   const entries = Object.entries(runtime.config.surfaces ?? {});
   for (const [surfaceKey, stored] of entries) {
     if (!stored?.channelId) continue;
-    const channel = await runtime.client.channels.fetch(stored.channelId).catch(() => null);
+    let channel;
+    try { channel = await runtime.client.channels.fetch(stored.channelId); }
+    catch (error) {
+      recordSystemIncident(runtime.db, { code: error.code ?? error.status ?? 'SURFACE_CHANNEL_FETCH_FAILED', scope: surfaceKey,
+        severity: 'WARNING', details: { channelId: stored.channelId } });
+      continue;
+    }
     if (!channel?.isTextBased?.()) continue;
     const existing = stored.messageId ? await fetchSurfaceMessageFresh(channel, stored.messageId) : null;
     let result;
