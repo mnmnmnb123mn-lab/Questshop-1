@@ -19,7 +19,7 @@ import { processQuestWorkflowJob } from '../../src/domain/sqlite/quest-workflow.
 import { processPaymentJob } from '../../src/workers/sqlite-worker-manager.js';
 import { deliverNotification } from '../../src/workers/sqlite-worker-manager.js';
 import { setupSurface, surfaceNonce, updateOrCreateSurfaceAnchor } from '../../src/discord/surfaces/setup.js';
-import { bindInteractionSessionMessage, consumeInteractionSession, createInteractionSession } from '../../src/domain/sqlite/interaction-sessions.js';
+import { bindInteractionSessionMessage, consumeInteractionSession, consumeModalInteractionSession, createInteractionSession } from '../../src/domain/sqlite/interaction-sessions.js';
 import { adjustWallet, adminOverview, configureReceiverPhone, queueMonitorScanAndTest, retryNotificationDlq, setQuestPrice, upsertMonitorAccount, upsertPromotion } from '../../src/domain/sqlite/admin.js';
 import { loadRuntimeConfig } from '../../src/config/runtime-config.js';
 import { recomputeHealthStatus } from '../../src/bootstrap/health-status.js';
@@ -464,6 +464,16 @@ test('server-side interaction sessions bind actor, location, message, operation 
     (error) => error.code === 'INTERACTION_CONTEXT_INVALID');
   assert.equal(consumeInteractionSession(fixture.db, { sessionId: id, actorId: 'admin', guildId: 'guild', channelId: 'channel', messageId: 'message', operation: 'TEST' }).payload.ok, true);
   assert.throws(() => consumeInteractionSession(fixture.db, { sessionId: id, actorId: 'admin', guildId: 'guild', channelId: 'channel', messageId: 'message', operation: 'TEST' }),
+    (error) => error.code === 'INTERACTION_EXPIRED');
+});
+
+test('modal sessions bind actor and context without trusting a client message id', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const id = createInteractionSession(fixture.db, { actorId: 'modal-user', guildId: 'guild', channelId: 'channel', messageId: 'origin',
+    operation: 'TOKEN_SUBMIT', payload: { origin: 'QUEST_AUTO' } });
+  const consumed = consumeModalInteractionSession(fixture.db, { sessionId: id, actorId: 'modal-user', guildId: 'guild', channelId: 'channel', operation: 'TOKEN_SUBMIT' });
+  assert.equal(consumed.payload.origin, 'QUEST_AUTO');
+  assert.throws(() => consumeModalInteractionSession(fixture.db, { sessionId: id, actorId: 'modal-user', guildId: 'guild', channelId: 'channel', operation: 'TOKEN_SUBMIT' }),
     (error) => error.code === 'INTERACTION_EXPIRED');
 });
 
