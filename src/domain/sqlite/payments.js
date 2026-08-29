@@ -95,7 +95,7 @@ function appendFinancialAudit(db, { actorId, action, topupId, reason = null, bef
 function assertPaymentWorkerLease(db, workerJob, topupId) {
   if (!workerJob) return;
   assertActiveJobLeaseInTransaction(db, { jobId: workerJob.jobId, leaseToken: workerJob.leaseToken,
-    subjectType: 'TOPUP', subjectId: topupId, expectedStateVersion: workerJob.expectedJobVersion ?? null });
+    subjectType: 'TOPUP', subjectId: topupId });
 }
 
 export function markTopupProcessing(db, topupId, { workerJob = null } = {}) {

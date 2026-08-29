@@ -118,48 +118,52 @@ export function updateRunningJobPayload(db, { jobId, leaseToken, payload, checkp
   });
 }
 
+/** Persist a final Quest result before settlement.  If the process stops after
+ * this point, recovery can capture/release without sending another mutation. */
+export function recordQuestVerifiedResult(db, { jobId, leaseToken, subjectId, result, now = nowMs() }) {
+  return withImmediateTransaction(db, () => {
+    const job = assertActiveJobLeaseInTransaction(db, {
+      jobId, leaseToken, subjectType: 'ORDER_ITEM', subjectId,
+    });
+    const payload = { ...JSON.parse(job.payload_json ?? '{}'), recoveryResult: result };
+    const changed = db.prepare(`UPDATE jobs SET payload_json=?,checkpoint='VERIFIED',state_version=state_version+1,updated_at=?
+      WHERE id=? AND state='RUNNING' AND lease_token=?`).run(JSON.stringify(payload), now, jobId, leaseToken);
+    if (!changed.changes) throw Object.assign(new Error('Worker lease is no longer authoritative'), { code: 'JOB_LEASE_LOST' });
+    appendExternalOperationEvidenceInTransaction(db, {
+      jobId, subjectType: 'ORDER_ITEM', subjectId, stage: 'VERIFIED_RESULT', evidence: result,
+      traceId: payload.traceId ?? job.operation_key, timestamp: now,
+    });
+    return db.prepare('SELECT * FROM jobs WHERE id=?').get(jobId);
+  });
+}
+
+export function recordQuestAmbiguity(db, { jobId, leaseToken, subjectId, evidence = {}, now = nowMs() }) {
+  return withImmediateTransaction(db, () => {
+    const job = assertActiveJobLeaseInTransaction(db, { jobId, leaseToken, subjectType: 'ORDER_ITEM', subjectId });
+    appendExternalOperationEvidenceInTransaction(db, {
+      jobId, subjectType: 'ORDER_ITEM', subjectId, stage: 'AMBIGUOUS', evidence,
+      traceId: JSON.parse(job.payload_json ?? '{}').traceId ?? job.operation_key, timestamp: now,
+    });
+  });
+}
+
 export function recoverInterruptedJobs(db, { now = nowMs() } = {}) {
   return withImmediateTransaction(db, () => {
     db.prepare(`UPDATE jobs SET state='PENDING',state_version=state_version+1,lease_token=NULL,lease_expires_at=NULL,next_run_at=?,updated_at=?
       WHERE state='RUNNING' AND checkpoint IN ('NOT_STARTED','INTENT_RECORDED') AND lease_expires_at<?`).run(now, now, now);
-    const interrupted = db.prepare(`SELECT * FROM jobs WHERE state='RUNNING' AND checkpoint='POSSIBLY_SENT' AND lease_expires_at<?`).all(now);
-    for (const job of interrupted) {
-      if (job.job_type === 'PAYMENT_SETTLE') {
-        const topup = db.prepare('SELECT * FROM topups WHERE id=?').get(job.subject_id);
-        if (topup?.status === 'REDEEMED') {
-          // The provider result is durable.  Requeue only the local credit;
-          // the worker recognizes REDEEMED and never contacts TrueMoney.
-          db.prepare(`UPDATE jobs SET state='PENDING',checkpoint='VERIFIED',state_version=state_version+1,lease_token=NULL,lease_expires_at=NULL,
-            next_run_at=?,last_error_code='RECOVER_REDEEMED_CREDIT',updated_at=? WHERE id=?`).run(now, now, job.id);
-          appendExternalOperationEvidenceInTransaction(db, { jobId: job.id, subjectType: job.subject_type, subjectId: job.subject_id,
-            stage: 'RECOVERY_DECISION', evidence: { decision: 'CREDIT_REDEEMED_WITHOUT_PROVIDER_RETRY' }, traceId: topup.trace_id, timestamp: now });
-          continue;
-        }
-        if (topup && !['CREDITED', 'FAILED', 'REVERSED', 'REVIEW'].includes(topup.status)) {
-          db.prepare(`UPDATE topups SET status='REVIEW',failure_reason='RESTART_AFTER_POSSIBLY_SENT',state_version=state_version+1,updated_at=?
-            WHERE id=? AND state_version=?`).run(now, topup.id, topup.state_version);
-          db.prepare(`INSERT INTO manual_reviews(id,subject_type,subject_id,category,state,reason_code,safe_reason,created_at,updated_at)
-            VALUES(?,?,?,'FINANCIAL','OPEN',?,?,?,?) ON CONFLICT(subject_type,subject_id) WHERE state='OPEN'
-            DO NOTHING`).run(randomUUID(), 'TOPUP', topup.id, 'RESTART_AFTER_POSSIBLY_SENT',
-            'คำขอ TrueMoney อาจถูกส่งแล้วและต้องตรวจสอบด้วยผู้ดูแล', now, now);
-          appendExternalOperationEvidenceInTransaction(db, { jobId: job.id, subjectType: job.subject_type, subjectId: job.subject_id,
-            stage: 'RECOVERY_DECISION', evidence: { decision: 'FINANCIAL_REVIEW_NO_PROVIDER_RETRY' }, traceId: topup.trace_id, timestamp: now });
-        }
-      } else if (job.job_type === 'QUEST_RUN') {
-        const item = db.prepare(`SELECT i.*,o.trace_id FROM order_items i JOIN orders o ON o.id=i.order_id WHERE i.id=?`).get(job.subject_id);
-        if (item && ['QUEUED', 'RUNNING'].includes(item.state)) {
-          db.prepare(`UPDATE order_items SET state='REVIEW',state_version=state_version+1,updated_at=? WHERE id=? AND state_version=?`)
-            .run(now, item.id, item.state_version);
-          db.prepare(`INSERT INTO manual_reviews(id,subject_type,subject_id,category,state,reason_code,safe_reason,created_at,updated_at)
-            VALUES(?,?,?,'OPERATIONAL','OPEN',?,?,?,?) ON CONFLICT(subject_type,subject_id) WHERE state='OPEN'
-            DO NOTHING`).run(randomUUID(), 'ORDER_ITEM', item.id, 'RESTART_AFTER_POSSIBLY_SENT',
-            'ผลการทำ Quest อาจเปลี่ยนแล้ว จึงคงยอดจองไว้เพื่อตรวจสอบ', now, now);
-          appendExternalOperationEvidenceInTransaction(db, { jobId: job.id, subjectType: job.subject_type, subjectId: job.subject_id,
-            stage: 'RECOVERY_DECISION', evidence: { decision: 'OPERATIONAL_REVIEW_RESERVED' }, traceId: item.trace_id, timestamp: now });
-        }
-      }
-      db.prepare(`UPDATE jobs SET state='REVIEW',state_version=state_version+1,lease_token=NULL,lease_expires_at=NULL,last_error_code='RESTART_AFTER_POSSIBLY_SENT',
-        completed_at=?,updated_at=? WHERE id=? AND state='RUNNING'`).run(now, now, job.id);
-    }
+    // Subject transitions are intentionally handled by the payment/order
+    // services in the worker.  This function only identifies expired work;
+    // keeping it here prevents a second, divergent Reserve/Capture/Release
+    // implementation in the job repository.
+    return db.prepare(`SELECT * FROM jobs WHERE state='RUNNING' AND checkpoint IN ('POSSIBLY_SENT','VERIFIED')
+      AND lease_expires_at<?`).all(now);
   });
+}
+
+export function finishRecoveredJob(db, { jobId, state, checkpoint = 'VERIFIED', errorCode = null, now = nowMs() }) {
+  return withImmediateTransaction(db, () => db.prepare(`UPDATE jobs SET state=?,checkpoint=?,state_version=state_version+1,
+    lease_token=NULL,lease_expires_at=NULL,last_error_code=?,completed_at=?,updated_at=?
+    WHERE id=? AND state='RUNNING' AND lease_expires_at<?`).run(
+    state, checkpoint, errorCode, ['COMPLETED', 'FAILED', 'REVIEW'].includes(state) ? now : null, now, jobId, now,
+  ).changes === 1);
 }

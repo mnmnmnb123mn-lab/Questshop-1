@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { decryptCredential } from './crypto.js';
-import { enqueueJobInTransaction, completeJob, markJobPossiblySent, updateRunningJobPayload } from './jobs.js';
+import { enqueueJobInTransaction, completeJob, markJobPossiblySent, recordQuestAmbiguity, recordQuestVerifiedResult, updateRunningJobPayload } from './jobs.js';
 import { enqueueNotificationInTransaction } from './notifications.js';
 import { markOrderItemRunning, settleOrderItem, updateOrderItemProgress } from './orders.js';
 import { nowMs, withImmediateTransaction } from '../../db/sqlite.js';
@@ -187,7 +187,7 @@ async function runQuest(runtime, { credentialId, questId, job, onProgress }) {
   if (!quest.enrolled) {
     markPossibleMutation();
     await api.enroll(quest.id, runtime.abortController.signal);
-    updateRunningJobPayload(runtime.db, { jobId: job.id, leaseToken: job.lease_token, payload: json(job.payload_json), checkpoint: 'VERIFIED' });
+    updateRunningJobPayload(runtime.db, { jobId: job.id, leaseToken: job.lease_token, payload: json(job.payload_json) });
     quest = await findFresh();
   }
   const { selectQuestExecutor } = await import('../../quest-engine/executors/registry.js');
@@ -202,7 +202,7 @@ async function runQuest(runtime, { credentialId, questId, job, onProgress }) {
     mutate: async (_kind, _evidence, execute) => {
       markPossibleMutation();
       const outcome = await execute();
-      updateRunningJobPayload(runtime.db, { jobId: job.id, leaseToken: job.lease_token, payload: json(job.payload_json), checkpoint: 'VERIFIED' });
+      updateRunningJobPayload(runtime.db, { jobId: job.id, leaseToken: job.lease_token, payload: json(job.payload_json) });
       return outcome;
     },
   });
@@ -228,15 +228,21 @@ export async function processQuestRun(runtime, job) {
     const result = await runQuest(runtime, { credentialId: item.credential_id, questId: item.quest_id, job,
       onProgress: (fresh) => updateOrderItemProgress(runtime.db, { itemId: item.id, progressPercent: fresh.progress, workerJob }) });
     if (result.completedBeforeRun) {
+      recordQuestVerifiedResult(runtime.db, { jobId: job.id, leaseToken: job.lease_token, subjectId: item.id,
+        result: { outcome: 'FAILED', reason: 'EXTERNAL_COMPLETED_RELEASED', evidence: { completedBeforeRun: true } } });
       settleOrderItem(runtime.db, { itemId: item.id, outcome: 'FAILED', reason: 'EXTERNAL_COMPLETED_RELEASED',
         evidence: { completedBeforeRun: true }, workerJob });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED', errorCode: 'EXTERNAL_COMPLETED_RELEASED' });
     }
     if (result.verifiedCompleted) {
+      recordQuestVerifiedResult(runtime.db, { jobId: job.id, leaseToken: job.lease_token, subjectId: item.id,
+        result: { outcome: 'SUCCESS', claimUrl: result.url ?? item.url, evidence: { verifiedCompleted: true } } });
       settleOrderItem(runtime.db, { itemId: item.id, outcome: 'SUCCESS', claimUrl: result.url ?? item.url, verified: true,
         evidence: { verifiedCompleted: true }, workerJob });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
     }
+    recordQuestAmbiguity(runtime.db, { jobId: job.id, leaseToken: job.lease_token, subjectId: item.id,
+      evidence: { reason: 'QUEST_COMPLETION_UNVERIFIED', completed: result.completed === true, progress: result.progress ?? null } });
     settleOrderItem(runtime.db, { itemId: item.id, outcome: 'REVIEW', reason: 'QUEST_COMPLETION_UNVERIFIED',
       evidence: { completed: result.completed === true, progress: result.progress ?? null }, workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
@@ -246,11 +252,15 @@ export async function processQuestRun(runtime, job) {
     // network ambiguity, so it deliberately keeps the customer's funds
     // reserved and asks an Owner to review rather than guessing a release.
     if (isDefiniteQuestFailure(error)) {
+      recordQuestVerifiedResult(runtime.db, { jobId: job.id, leaseToken: job.lease_token, subjectId: item.id,
+        result: { outcome: 'FAILED', reason: error.code ?? 'QUEST_DEFINITE_FAILURE', evidence: { definite: true } } });
       settleOrderItem(runtime.db, { itemId: item.id, outcome: 'FAILED', reason: error.code ?? 'QUEST_DEFINITE_FAILURE',
         evidence: { definite: true }, workerJob });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED',
         errorCode: error.code ?? 'QUEST_DEFINITE_FAILURE', checkpoint: 'VERIFIED' });
     }
+    recordQuestAmbiguity(runtime.db, { jobId: job.id, leaseToken: job.lease_token, subjectId: item.id,
+      evidence: { reason: error.code ?? 'QUEST_RESULT_AMBIGUOUS', possiblyMutated: error.questPossiblyMutated === true } });
     settleOrderItem(runtime.db, { itemId: item.id, outcome: 'REVIEW', reason: error.code ?? 'QUEST_RESULT_AMBIGUOUS',
       evidence: { possiblyMutated: error.questPossiblyMutated === true }, workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',

@@ -16,8 +16,7 @@ import { parseBahtToCents, percentageBonusHalfUp } from '../../src/shared/money.
 import { encryptCredential, voucherHmac, voucherIdentityHmac } from '../../src/domain/sqlite/crypto.js';
 import { claimDueJob, completeJob, enqueueJob, markJobPossiblySent, recoverInterruptedJobs, renewJobLease, updateRunningJobPayload } from '../../src/domain/sqlite/jobs.js';
 import { processQuestWorkflowJob } from '../../src/domain/sqlite/quest-workflow.js';
-import { processPaymentJob } from '../../src/workers/sqlite-worker-manager.js';
-import { deliverNotification } from '../../src/workers/sqlite-worker-manager.js';
+import { deliverNotification, processPaymentJob, recoverInterruptedSubjects } from '../../src/workers/sqlite-worker-manager.js';
 import { setupSurface, surfaceNonce, updateOrCreateSurfaceAnchor } from '../../src/discord/surfaces/setup.js';
 import { bindInteractionSessionMessage, consumeInteractionSession, consumeModalInteractionSession, createInteractionSession } from '../../src/domain/sqlite/interaction-sessions.js';
 import { adjustWallet, adminOverview, configureReceiverPhone, queueMonitorScanAndTest, retryNotificationDlq, setQuestPrice, upsertMonitorAccount, upsertPromotion } from '../../src/domain/sqlite/admin.js';
@@ -535,7 +534,10 @@ test('SQLite Admin services configure price, receiver, monitor, promotion and au
   }
   assert.deepEqual(loadRuntimeConfig(fixture.db).priceRange, { minCents: 500, maxCents: 500 });
   assert.equal(configureReceiverPhone(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { phone: '0912345678', actorId: 'admin' }).last4, '5678');
-  assert.equal(upsertMonitorAccount(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { accountId: '12345678901234567', label: 'Monitor A', token: 'monitor-token', actorId: 'admin' }).state, 'ACTIVE');
+  const monitor = upsertMonitorAccount(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { accountId: '12345678901234567', label: 'Monitor A', token: 'monitor-token', actorId: 'admin' });
+  assert.equal(monitor.state, 'ACTIVE');
+  const rotated = upsertMonitorAccount(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { accountId: '12345678901234567', label: 'Monitor A', token: 'rotated-monitor-token', actorId: 'admin' });
+  assert.equal(rotated.credential_id, monitor.credential_id);
   assert.equal(upsertPromotion(fixture.db, { name: 'โบนัส', state: 'ACTIVE', minimumCents: 100, basisPoints: 500, actorId: 'admin' }).state, 'ACTIVE');
   const movement = adjustWallet(fixture.db, { discordUserId: '12345678901234567', availableDeltaCents: 700, actorId: 'admin', reason: 'UAT funding' });
   assert.equal(Number(movement.wallet.available_cents), 700);
@@ -620,7 +622,7 @@ test('custom IDs and payload normalization protect transport boundaries', () => 
   assert.match(normalized.content, /@\u200beveryone/);
 });
 
-test('job checkpoints recover safe reads and quarantine possibly sent mutations', async (t) => {
+test('job checkpoints requeue safe reads and identify possibly sent mutations for subject recovery', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const first = enqueueJob(fixture.db, { jobType: 'SAFE_READ', subjectType: 'TEST', subjectId: 'safe', operationKey: 'safe-read' });
   const claimed = claimDueJob(fixture.db);
@@ -633,8 +635,9 @@ test('job checkpoints recover safe reads and quarantine possibly sent mutations'
   const uncertain = claimDueJob(fixture.db);
   assert.equal(markJobPossiblySent(fixture.db, { jobId: uncertain.id, leaseToken: uncertain.lease_token }), true);
   fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(uncertain.id);
-  recoverInterruptedJobs(fixture.db);
-  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(uncertain.id).state, 'REVIEW');
+  const interrupted = recoverInterruptedJobs(fixture.db);
+  assert.equal(interrupted.some((job) => job.id === uncertain.id), true);
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(uncertain.id).state, 'RUNNING');
 
   enqueueJob(fixture.db, { jobType: 'READ', subjectType: 'TEST', subjectId: 'restart', operationKey: 'safe-restart' });
   const safe = claimDueJob(fixture.db);
@@ -645,7 +648,7 @@ test('job checkpoints recover safe reads and quarantine possibly sent mutations'
   assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(safe.id).state, 'PENDING');
 });
 
-test('subject-aware recovery creates reviews and requeues only durable redeemed credit', async (t) => {
+test('subject-aware recovery creates reviews and settles only durable redeemed credit', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const env = { QUESTSHOP_SECRET_KEY: secret };
   const uncertain = submitTopup(fixture.db, env, { discordUserId: 'recovery-customer',
@@ -654,7 +657,7 @@ test('subject-aware recovery creates reviews and requeues only durable redeemed 
   markTopupProcessing(fixture.db, uncertain.id);
   markJobPossiblySent(fixture.db, { jobId: uncertainJob.id, leaseToken: uncertainJob.lease_token });
   fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(uncertainJob.id);
-  recoverInterruptedJobs(fixture.db);
+  recoverInterruptedSubjects({ db: fixture.db });
   assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(uncertain.id).status, 'REVIEW');
   assert.equal(fixture.db.prepare("SELECT category FROM manual_reviews WHERE subject_type='TOPUP' AND subject_id=? AND state='OPEN'").get(uncertain.id).category, 'FINANCIAL');
   assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(uncertainJob.id).state, 'REVIEW');
@@ -666,11 +669,22 @@ test('subject-aware recovery creates reviews and requeues only durable redeemed 
   const redeemedJob = claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' });
   markJobPossiblySent(fixture.db, { jobId: redeemedJob.id, leaseToken: redeemedJob.lease_token });
   fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(redeemedJob.id);
-  recoverInterruptedJobs(fixture.db);
-  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(redeemedJob.id).state, 'PENDING');
-  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(redeemed.id).status, 'REDEEMED');
+  recoverInterruptedSubjects({ db: fixture.db });
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(redeemedJob.id).state, 'COMPLETED');
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(redeemed.id).status, 'CREDITED');
   const evidence = fixture.db.prepare("SELECT evidence_json FROM external_operation_evidence WHERE job_id=? AND stage='RECOVERY_DECISION'").get(redeemedJob.id);
   assert.match(evidence.evidence_json, /CREDIT_REDEEMED_WITHOUT_PROVIDER_RETRY/);
+});
+
+test('a stale payment lease cannot mutate its Top-up', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const topup = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'lease-customer',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=8123456789abcdef0123456789abcdef01' }).topup;
+  const job = claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' });
+  fixture.db.prepare("UPDATE jobs SET lease_token='replacement-lease' WHERE id=?").run(job.id);
+  assert.throws(() => markTopupProcessing(fixture.db, topup.id, { workerJob: { jobId: job.id, leaseToken: job.lease_token } }),
+    (error) => error.code === 'JOB_LEASE_LOST');
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(topup.id).status, 'PENDING');
 });
 
 test('gates are closed by default and Notification recovery/defer preserves a durable projection', async (t) => {
