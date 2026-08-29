@@ -94,3 +94,16 @@ export function recoverSendingNotifications(db, { now = nowMs() } = {}) {
   return withImmediateTransaction(db, () => db.prepare(`UPDATE notifications SET state='RETRY_WAIT',lease_token=NULL,
     lease_expires_at=NULL,next_run_at=?,updated_at=? WHERE state='SENDING' AND lease_expires_at<?`).run(now, now, now).changes);
 }
+
+/** A dead-lettered Discord projection can be retried by an Administrator.
+ * It preserves the same logical notification/nonce, so a crash recovery will
+ * edit the original message instead of creating a second projection. */
+export function retryDeadLetterNotification(db, { notificationId, now = nowMs() }) {
+  return withImmediateTransaction(db, () => {
+    const row = db.prepare("SELECT * FROM notifications WHERE id=? AND state='DEAD_LETTER'").get(notificationId);
+    if (!row) return null;
+    db.prepare(`UPDATE notifications SET state='PENDING',attempt_count=0,attempt_version=0,next_run_at=?,last_error_code=NULL,
+      lease_token=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND state='DEAD_LETTER'`).run(now, now, notificationId);
+    return db.prepare('SELECT * FROM notifications WHERE id=?').get(notificationId);
+  });
+}

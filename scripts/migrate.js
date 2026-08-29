@@ -2,12 +2,14 @@ import '../src/config/load-local-environment.js';
 import path from 'node:path';
 import { access, constants, stat } from 'node:fs/promises';
 import { loadEnvironment } from '../src/config/env.js';
-import { fullIntegrityCheck, openSqliteDatabase, closeSqliteDatabase } from '../src/db/sqlite.js';
+import { acquireSingleInstanceLock, ensureSqliteDirectory, fullIntegrityCheck, openSqliteDatabase, closeSqliteDatabase } from '../src/db/sqlite.js';
 import { migrateSqlite } from '../src/db/sqlite-migrations.js';
 import { createRotatedSqliteBackup } from '../src/db/sqlite-backup.js';
 
 const env = loadEnvironment();
 const migrationDirectory = path.resolve('migrations/sqlite');
+await ensureSqliteDirectory(env.SQLITE_PATH);
+const migrationLock = await acquireSingleInstanceLock(env.SQLITE_PATH);
 
 async function hasExistingDatabase() {
   try {
@@ -18,8 +20,8 @@ async function hasExistingDatabase() {
   }
 }
 
-const databaseExisted = await hasExistingDatabase();
-const db = await openSqliteDatabase({ databasePath: env.SQLITE_PATH, secret: env.QUESTSHOP_SECRET_KEY });
+let databaseExisted = false;
+let db;
 
 async function preMigrationBackup(label) {
   if (!databaseExisted) return null;
@@ -29,6 +31,8 @@ async function preMigrationBackup(label) {
 }
 
 try {
+  databaseExisted = await hasExistingDatabase();
+  db = await openSqliteDatabase({ databasePath: env.SQLITE_PATH, secret: env.QUESTSHOP_SECRET_KEY });
   const before = fullIntegrityCheck(db);
   // A newly-created SQLite file has no schema yet. It becomes verifiable after
   // the initial atomic migration.
@@ -42,4 +46,5 @@ try {
   console.log(JSON.stringify({ ok: true, ...result, sqlitePath: env.SQLITE_PATH }));
 } finally {
   closeSqliteDatabase(db);
+  await migrationLock.release();
 }

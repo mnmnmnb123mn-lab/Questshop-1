@@ -36,7 +36,7 @@ export function claimDueJob(db, { now = nowMs(), leaseMs = 30_000, jobType = nul
       ORDER BY CASE WHEN j.job_type='PAYMENT_SETTLE' THEN 0 ELSE 1 END,j.next_run_at,j.created_at LIMIT 1`).get(now, ...(jobType ? [jobType] : []), ...exclusions);
     if (!due) return null;
     const leaseToken = randomUUID();
-    const updated = db.prepare(`UPDATE jobs SET state='RUNNING',lease_token=?,lease_expires_at=?,attempt_count=attempt_count+1,
+    const updated = db.prepare(`UPDATE jobs SET state='RUNNING',state_version=state_version+1,lease_token=?,lease_expires_at=?,attempt_count=attempt_count+1,
       updated_at=? WHERE id=? AND state IN ('PENDING','RETRY_WAIT')`).run(leaseToken, now + leaseMs, now, due.id);
     return updated.changes ? db.prepare('SELECT * FROM jobs WHERE id=?').get(due.id) : null;
   });
@@ -48,7 +48,7 @@ export function completeJob(db, { jobId, leaseToken, state = 'COMPLETED', checkp
     const row = db.prepare('SELECT * FROM jobs WHERE id=?').get(jobId);
     if (!row || row.lease_token !== leaseToken || row.state !== 'RUNNING') return null;
     const nextState = retryAt == null ? state : 'RETRY_WAIT';
-    db.prepare(`UPDATE jobs SET state=?,checkpoint=?,last_error_code=?,next_run_at=?,lease_token=NULL,lease_expires_at=NULL,
+    db.prepare(`UPDATE jobs SET state=?,checkpoint=?,state_version=state_version+1,last_error_code=?,next_run_at=?,lease_token=NULL,lease_expires_at=NULL,
       completed_at=?,updated_at=? WHERE id=?`).run(nextState, checkpoint, errorCode, retryAt ?? now,
       nextState === 'COMPLETED' || nextState === 'FAILED' || nextState === 'REVIEW' ? now : null, now, jobId);
     return db.prepare('SELECT * FROM jobs WHERE id=?').get(jobId);
@@ -57,7 +57,7 @@ export function completeJob(db, { jobId, leaseToken, state = 'COMPLETED', checkp
 
 export function markJobPossiblySent(db, { jobId, leaseToken, now = nowMs() }) {
   return withImmediateTransaction(db, () => {
-    const result = db.prepare(`UPDATE jobs SET checkpoint='POSSIBLY_SENT',updated_at=?
+    const result = db.prepare(`UPDATE jobs SET checkpoint='POSSIBLY_SENT',state_version=state_version+1,updated_at=?
       WHERE id=? AND state='RUNNING' AND lease_token=?`).run(now, jobId, leaseToken);
     return result.changes === 1;
   });
@@ -65,7 +65,7 @@ export function markJobPossiblySent(db, { jobId, leaseToken, now = nowMs() }) {
 
 export function renewJobLease(db, { jobId, leaseToken, leaseMs = 30_000, now = nowMs() }) {
   return withImmediateTransaction(db, () => {
-    const changed = db.prepare(`UPDATE jobs SET lease_expires_at=?,updated_at=?
+    const changed = db.prepare(`UPDATE jobs SET lease_expires_at=?,state_version=state_version+1,updated_at=?
       WHERE id=? AND state='RUNNING' AND lease_token=?`).run(now + leaseMs, now, jobId, leaseToken);
     return changed.changes === 1;
   });
@@ -76,7 +76,7 @@ export function renewJobLease(db, { jobId, leaseToken, leaseMs = 30_000, now = n
  * safe read or a verified mutation response. */
 export function updateRunningJobPayload(db, { jobId, leaseToken, payload, checkpoint = null, now = nowMs() }) {
   return withImmediateTransaction(db, () => {
-    const changed = db.prepare(`UPDATE jobs SET payload_json=?,checkpoint=COALESCE(?,checkpoint),updated_at=?
+    const changed = db.prepare(`UPDATE jobs SET payload_json=?,checkpoint=COALESCE(?,checkpoint),state_version=state_version+1,updated_at=?
       WHERE id=? AND state='RUNNING' AND lease_token=?`).run(JSON.stringify(payload), checkpoint, now, jobId, leaseToken);
     return changed.changes === 1 ? db.prepare('SELECT * FROM jobs WHERE id=?').get(jobId) : null;
   });
@@ -84,9 +84,9 @@ export function updateRunningJobPayload(db, { jobId, leaseToken, payload, checkp
 
 export function recoverInterruptedJobs(db, { now = nowMs() } = {}) {
   return withImmediateTransaction(db, () => {
-    db.prepare(`UPDATE jobs SET state='PENDING',lease_token=NULL,lease_expires_at=NULL,next_run_at=?,updated_at=?
+    db.prepare(`UPDATE jobs SET state='PENDING',state_version=state_version+1,lease_token=NULL,lease_expires_at=NULL,next_run_at=?,updated_at=?
       WHERE state='RUNNING' AND checkpoint IN ('NOT_STARTED','INTENT_RECORDED') AND lease_expires_at<?`).run(now, now, now);
-    db.prepare(`UPDATE jobs SET state='REVIEW',lease_token=NULL,lease_expires_at=NULL,last_error_code='RESTART_AFTER_POSSIBLY_SENT',
+    db.prepare(`UPDATE jobs SET state='REVIEW',state_version=state_version+1,lease_token=NULL,lease_expires_at=NULL,last_error_code='RESTART_AFTER_POSSIBLY_SENT',
       completed_at=?,updated_at=? WHERE state='RUNNING' AND checkpoint='POSSIBLY_SENT' AND lease_expires_at<?`).run(now, now, now);
   });
 }
