@@ -75,7 +75,7 @@ function updateRuntimeValuesInTransaction(db, values, actorId, timestamp) {
     .run(JSON.stringify(version), timestamp, actorId);
 }
 
-export function setQuestPrice(db, { taskType, amountCents, actorId, reason = '' }) {
+export function setQuestPrice(db, { taskType, amountCents, actorId, reason = '', expectedConfigVersion = null }) {
   const normalizedType = String(taskType ?? '').toUpperCase();
   const amount = Number(amountCents);
   if (!supportedTaskTypes().includes(normalizedType) || !Number.isSafeInteger(amount) || amount <= 0) {
@@ -83,6 +83,10 @@ export function setQuestPrice(db, { taskType, amountCents, actorId, reason = '' 
   }
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
+    const currentVersion = Number(db.prepare("SELECT value_json FROM settings WHERE key='runtime_config_version'").get()?.value_json ?? '1');
+    if (expectedConfigVersion != null && Number(expectedConfigVersion) !== currentVersion) {
+      throw new QuestshopError('CONFIG_CONFLICT', 'การตั้งค่าราคาถูกเปลี่ยนแล้ว กรุณาเปิดเมนูใหม่');
+    }
     const row = db.prepare("SELECT value_json FROM settings WHERE key='runtime_config'").get();
     let values = {};
     try { values = JSON.parse(row?.value_json ?? '{}'); } catch { /* fail closed to empty owner configuration */ }
@@ -100,6 +104,9 @@ export function configureReceiverPhone(db, env, { phone, actorId, reason = '' })
   if (!/^0\d{9}$/.test(String(phone ?? ''))) throw new QuestshopError('RECEIVER_INVALID', 'เบอร์รับเงินต้องเป็นหมายเลขไทย 10 หลัก');
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
+    const previous = db.prepare("SELECT value_json FROM settings WHERE key='receiver_credential_id'").get();
+    let previousCredentialId = null;
+    try { previousCredentialId = JSON.parse(previous?.value_json ?? '{}').credentialId ?? null; } catch { /* replace malformed pointer safely */ }
     const credentialId = randomUUID();
     const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, phone);
     db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
@@ -108,6 +115,10 @@ export function configureReceiverPhone(db, env, { phone, actorId, reason = '' })
     db.prepare(`INSERT INTO settings(key,value_json,updated_at,updated_by) VALUES('receiver_credential_id',?,?,?)
       ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
       .run(JSON.stringify({ credentialId }), timestamp, actorId);
+    if (previousCredentialId && previousCredentialId !== credentialId) {
+      db.prepare(`DELETE FROM credentials WHERE id=? AND credential_type='RECEIVER_PHONE'
+        AND NOT EXISTS (SELECT 1 FROM settings WHERE key='receiver_credential_id' AND value_json LIKE '%' || credentials.id || '%')`).run(previousCredentialId);
+    }
     appendAdminAuditInTransaction(db, { actorId, action: 'RECEIVER_UPDATED', targetType: 'RECEIVER', targetId: credentialId, reason,
       after: { last4: String(phone).slice(-4) }, timestamp });
     return { credentialId, last4: String(phone).slice(-4) };
@@ -119,12 +130,14 @@ export function upsertMonitorAccount(db, env, { accountId, label, token, actorId
     || !['ACTIVE', 'COOLDOWN', 'DISABLED'].includes(state)) throw new QuestshopError('MONITOR_INVALID', 'ข้อมูลบัญชีทดสอบไม่ถูกต้อง');
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
-    const credentialId = randomUUID();
+    const before = db.prepare('SELECT * FROM monitor_accounts WHERE account_id=?').get(accountId);
+    const credentialId = before?.credential_id ?? randomUUID();
     const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, token);
     db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
-      VALUES(?,?,?,'MONITOR_TOKEN','PERSISTENT',?,?,?,?,?)`).run(credentialId, 'MONITOR', accountId,
+      VALUES(?,?,?,'MONITOR_TOKEN','PERSISTENT',?,?,?,?,?)
+      ON CONFLICT(subject_type,subject_id,credential_type) DO UPDATE SET ciphertext=excluded.ciphertext,nonce=excluded.nonce,
+        auth_tag=excluded.auth_tag,updated_at=excluded.updated_at`).run(credentialId, 'MONITOR', accountId,
       encrypted.ciphertext, encrypted.nonce, encrypted.authTag, timestamp, timestamp);
-    const before = db.prepare('SELECT * FROM monitor_accounts WHERE account_id=?').get(accountId);
     db.prepare(`INSERT INTO monitor_accounts(account_id,label,state,credential_id,cooldown_until,last_checked_at,updated_at)
       VALUES(?,?,?,?,NULL,NULL,?) ON CONFLICT(account_id) DO UPDATE SET label=excluded.label,state=excluded.state,
       credential_id=excluded.credential_id,cooldown_until=NULL,updated_at=excluded.updated_at`)
