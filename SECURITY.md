@@ -76,11 +76,13 @@ anchor; this presentation repair does not mutate Wallet, Ledger, Order or paymen
 ### Money and payment
 
 - Money is integer satang; floating point is forbidden for authoritative amounts.
-- Financial state and Wallet mutations commit in one SQLite `BEGIN IMMEDIATE` transaction with idempotency keys.
+- Financial state and Wallet mutations commit in one SQLite `BEGIN IMMEDIATE` transaction with idempotency keys,
+  state-version compare-and-swap and correlation evidence.
 - Wallet cannot become negative. Reserved balance changes only through Reserve/Capture/Release.
 - Ledger/Admin audit/release evidence are append-only; corrections use compensating entries.
 - `REDEEMED` and `CREDITED` are separate and recovery credits exactly once.
-- Ambiguous payment is Manual Review; a possibly-sent request is never blind-retried.
+- External outcomes are `SUCCESS`, `DEFINITE_FAILURE` or `AMBIGUOUS`; ambiguous payment is Manual Review and a
+  possibly-sent request is never blind-retried.
 - Invalid provider schema/receiver/currency/amount fails closed without credit.
 - Financial/Audit DLQ may be replayed but cannot be discarded.
 
@@ -88,8 +90,8 @@ anchor; this presentation repair does not mutate Wallet, Ledger, Order or paymen
 
 - Customer token lifecycle: receive → validate → encrypt → scoped use → delete after terminal work.
 - Monitor credentials remain encrypted and have no Admin plaintext-read route.
-- AES-256-GCM uses random nonce, versioned keyrings and context-specific AAD.
-- Voucher identity uses versioned HMAC + uniqueness constraints.
+- AES-256-GCM uses a random nonce and domain-separated keys derived from the persistent application secret.
+- Voucher proof uses a versioned HMAC; a separate stable identity HMAC has a unique constraint across proof versions.
 - Setup creates persistent Status/Data/Voucher secrets once; restart/redeploy never silently replaces them.
 - Central logger redaction must be used for structured fields, strings and serialized errors.
 
@@ -97,17 +99,17 @@ anchor; this presentation repair does not mutate Wallet, Ledger, Order or paymen
 
 - Production uses `/data/questshop.db`, WAL mode, `synchronous=FULL`, `foreign_keys=ON` and owner-only `0600` files.
 - A process lock permits one Runtime instance only; concurrent workers are not supported.
-- `wallet_transactions` and `admin_audit` have SQLite triggers blocking `UPDATE` and `DELETE`.
+- `wallet_transactions`, `settlement_evidence` and `admin_audit` have SQLite triggers blocking `UPDATE` and `DELETE`.
 - Migration uses a verified online backup, `BEGIN IMMEDIATE`, schema verification and `user_version` commit.
 
 ### Discord, workers and external mutations
 
 - Ephemeral is not authorization; side effects reauthorize actor/guild/channel/message and durable state.
-- Component IDs are opaque/versioned and server-session bound.
+- Component IDs are opaque/versioned and server-session bound to actor, Guild, channel, message, operation, expiry and state version.
 - Allowed mentions deny-by-default.
 - External calls never execute inside a DB transaction.
 - Each external mutation has durable intent/checkpoint and fresh post-send verification.
-- Worker commits require lease owner, fencing token and state version; stale owners stop.
+- Worker commits require lease owner, fencing token and desired/state version; stale owners stop before a newer delivery writes.
 - Runtime permission-drift auto-repair is intentionally absent; Discord 403 creates/preserves an incident for manual
   Owner repair.
 

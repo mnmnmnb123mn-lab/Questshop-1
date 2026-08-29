@@ -10,8 +10,20 @@ over Discord, TrueMoney or Quest I/O.
 PENDING → PROCESSING → REDEEMED → CREDITED
 ```
 
-Success separates `REDEEMED` from `CREDITED`. A request that may have reached TrueMoney is never blindly retried.
-Uncertain results enter Owner-only Manual Review.
+All external adapters return exactly one outcome: `SUCCESS`, `DEFINITE_FAILURE` or `AMBIGUOUS`, plus a safe provider
+reference, reason and evidence. Success separates `REDEEMED` from `CREDITED`; only a verified `SUCCESS` may cross that
+boundary. A request that may have reached TrueMoney is never blindly retried. `AMBIGUOUS` enters Owner-only Manual
+Review and `DEFINITE_FAILURE` reaches `FAILED` without Wallet credit.
+
+Voucher rows retain a versioned proof HMAC and a stable, unique identity HMAC. The identity prevents the same raw
+voucher from being submitted again after a future proof-key version changes.
+
+```text
+Manual Review: OPEN → RESOLVED_SUCCESS | RESOLVED_FAILURE
+```
+
+Resolution records actor, reason, timestamp and evidence. Replaying the same resolver is idempotent and cannot make a
+second Wallet mutation.
 
 After `PENDING` commits, the customer interaction acknowledges only the durable Top-up ID and starts a targeted
 background settlement. `TOPUP_STATUS_DM` is one Outbox projection per Top-up and is refreshed for each meaningful
@@ -22,7 +34,9 @@ backoff 6 รอบก่อนเข้า Financial DLQ.
 
 Successful Quest work ends at `READY_TO_CLAIM`; there is no Automatic Claim transition.
 Definite failures/external-completion paths release Wallet reservations when policy proves release is safe.
-Ambiguous completion/provenance remains Reserved for Manual Review.
+Ambiguous completion/provenance remains Reserved for Manual Review. `RESOLVED_SUCCESS` captures only with explicit
+verified-completion evidence; `RESOLVED_FAILURE` releases once. Once every Item has ended, the Order terminal state
+releases its active Quest-account lock.
 
 Runner rate limits are explicit: leased/running work may enter `WAITING_RATE_LIMIT` with provider Retry-After,
 then recovery returns it through `QUEUED`. Ordinary transient failures use `WAITING_RETRY` with bounded backoff.
@@ -34,6 +48,11 @@ PENDING → SENDING → DELIVERED | RETRY_WAIT | DEAD_LETTER
 ```
 
 Financial and Audit DLQ records cannot be discarded.
+
+Each Notification has a durable nonce/logical identity, lease token and desired/sending/delivered version. A worker
+reconciles nonce before a new send, does not publish after a newer desired version supersedes its lease, and may create
+a new message only after Discord explicitly reports `404 Unknown Message`. Permission, timeout and network failures
+retry the same logical identity.
 
 ## Discord durable surfaces
 
@@ -57,6 +76,12 @@ For `QUEST_AUTO`:
 
 Current presentation healing is triggered by setup/restart and the normal Maintenance reconciliation path,
 approximately once every 60 seconds.
+
+## Interaction authorization
+
+Persistent component IDs are opaque and each server-side session validates actor, Guild, channel, message, operation,
+expiry and state version before a side effect. Admin side effects re-read the Discord `Administrator` permission and
+acknowledge the interaction exactly once.
 ## Customer-discovered Quest verification
 
 - Quest ที่ดึงจาก Token ของลูกค้าใช้สำหรับ Checkout ของบัญชีนั้นโดยตรง หลังตรวจข้อมูล ราคา Contract และเวลาคงเหลือ; สถานะประกาศหรือการพบใน Monitor ไม่ใช่เงื่อนไขบล็อก Checkout

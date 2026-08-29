@@ -23,7 +23,7 @@ npm ci --omit=dev && npm run deploy && npm start
 Discord commands. ไม่ต้องตั้งค่า Aiven, PostgreSQL role, TLS หรือ database URL.
 
 > [!IMPORTANT]
-> สถานะ release ปัจจุบันคือ **implemented-but-unverified** จนกว่า Discord, TrueMoney, Quest,
+> สถานะ release ปัจจุบันคือ **migration-in-progress** จนกว่า source/test migration จะครบ และ Discord, TrueMoney, Quest,
 > inwcloud และ Owner UAT จะผ่านบน build เดียวกันตาม [Pre-launch UAT](docs/uat/prelaunch.md).
 
 > [!WARNING]
@@ -103,8 +103,13 @@ Confirm Order
 
 - เงินใช้ integer satang (`INTEGER`) เท่านั้น
 - Wallet ห้ามติดลบ; ไม่มีถอน/โอน; Refund เป็น Wallet credit
-- Ledger / Admin audit / release evidence เป็น append-only ตาม contract
+- Ledger, Admin audit และ settlement evidence เป็น append-only ตาม contract
 - TrueMoney หลัง request อาจส่งสำเร็จแล้วห้าม blind retry
+- Adapter ภายนอกคืนเพียง `SUCCESS`, `DEFINITE_FAILURE` หรือ `AMBIGUOUS` พร้อม evidence ที่ปลอดภัย;
+  `SUCCESS` เท่านั้นที่ทำ `REDEEMED → CREDITED`, ส่วน `AMBIGUOUS` เข้า review และ `DEFINITE_FAILURE` จบโดยไม่ credit
+- Manual Review จบได้ครั้งเดียวเป็น `RESOLVED_SUCCESS` หรือ `RESOLVED_FAILURE` พร้อม actor/reason/time/evidence;
+  การกด resolver ซ้ำไม่สร้าง Wallet movement ซ้ำ
+- Voucher เก็บ proof HMAC ตาม version และ identity HMAC คงที่ที่ unique ข้าม version เพื่อกันนำซองเดิมมายื่นซ้ำหลังหมุน version
 - ผล `HTTP 2xx` + `SUCCESS` ที่ยืนยันยอด THB เป็นบวกและผู้รับหนึ่งคน จะเพิ่มเครดิตได้แม้ TrueMoney
   ไม่ส่งเลขธุรกรรม: ระบบใช้ voucher HMAC กับ Top-up ID เป็นหลักฐานภายในและบันทึกเลขธุรกรรมเป็น `NULL`
   ตามความจริง หากหลักฐานข้อใดไม่ครบจะส่ง Owner ตรวจสอบแทน
@@ -154,12 +159,13 @@ Top-up ID”; Owner ยืนยัน Manual Review แบบนี้ได้
 | `OWNER_ID` | Discord User ID ของ Owner |
 | `SQLITE_PATH` | ไฟล์ฐานข้อมูลถาวร เช่น `/data/questshop.db` |
 | `QUESTSHOP_SECRET_KEY` | Secret ถาวรอย่างน้อย 32 ตัวอักษร ใช้ตรวจ verifier/เข้ารหัส/HMAC |
+| `VOUCHER_HMAC_ACTIVE_VERSION` | version ของ voucher proof HMAC (เริ่มต้น `v1`; เปลี่ยนเฉพาะ migration ที่ตรวจสอบแล้ว) |
 | `GIT_SHA` | Git commit SHA 40 ตัวใน Production |
 | `STATUS_TOKEN` | Bearer token ของ `/statusz`, อย่างน้อย 32 ตัวอักษร |
 | `PRELAUNCH` | UAT ใช้ `true` |
 | `TIMEZONE` | `Asia/Bangkok` |
-| `RUNNER_CONCURRENCY` | ค่าเริ่มต้น `2` |
-| `RUNNER_CONCURRENCY_HARD_MAX` | เพดานสูงสุด `5` |
+| `RUNNER_CONCURRENCY` | ค่าเริ่มต้น `1` |
+| `RUNNER_CONCURRENCY_HARD_MAX` | เพดานสูงสุด `1` (กำหนดได้ไม่เกิน `5`) |
 | `PORT` | health server, ค่าเริ่มต้น `3000` |
 
 ห้าม commit `.env` หรือ paste Bot/User token, database file, `QUESTSHOP_SECRET_KEY`, cookie, voucher secret หรือ private key
@@ -219,6 +225,7 @@ start         → Questshop SQLite runtime ready
 
 ```bash
 npm run check
+npm run check:imports
 npm run lint
 npm test
 git diff --check
@@ -230,7 +237,8 @@ Full gate:
 npm run test:coverage
 npm run load:test
 npm audit --audit-level=high
-docker build -t questshop:local .
+git diff --check
+docker build --build-arg GIT_SHA=<exact-40-character-sha> -t questshop:local .
 ```
 
 tests ใช้ SQLite file ชั่วคราวเท่านั้น; ห้ามชี้ `SQLITE_PATH` ของ test หรือ load test ไป `/data/questshop.db`.

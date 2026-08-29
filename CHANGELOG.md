@@ -1,11 +1,15 @@
 # Changelog
 
-## Unreleased
+## Current migration status
+
+- SQLite migration remains **migration-in-progress**. This source has not passed same-SHA live UAT and must not be described as production-ready.
+- Money settlement fails closed through `SUCCESS`, `DEFINITE_FAILURE` and `AMBIGUOUS`: unknown TrueMoney outcomes create financial review; Quest capture requires verified completion; pre-completed and definite-failure Items release their reservation with append-only settlement evidence.
+- Added server-side interaction sessions, SQLite Admin controls for gates/prices/receiver/promotions/Monitor/Wallet/reviews, stable nonce recovery with desired-version fencing, safe 404-only surface replacement, SQLite prelaunch closeout and relative-import verification.
 
 - Added durable customer Quest discovery cases with automatic Monitor visibility checks before tests, one backoffice card per Quest, safe retry, and informational announcements decoupled from customer checkout.
 
-Questshop follows Keep a Changelog conventions while the package remains in development `0.1.x`.
-There is no production release/tag evidence yet; current work remains under `[Unreleased]`.
+These notes describe the current source worktree. There is no production release/tag evidence; only the `[Unreleased]`
+section below is normative when its statements conflict with older migration notes.
 
 ## [Unreleased]
 
@@ -16,7 +20,7 @@ There is no production release/tag evidence yet; current work remains under `[Un
   append-only wallet/admin audit tables, online backups and single-instance locking.
 - Replaced PostgreSQL/Aiven workers, roles, TLS, S3 backup and Outbox dependencies with SQLite Jobs and Notifications.
   Customer Top-up acknowledgement, editable DM status, Payment Log and Quest History now use the SQLite projection path.
-- This remains **implemented-but-unverified**. No live database, Discord, TrueMoney or Quest action was performed.
+- This remains **migration-in-progress**. No live database, Discord, TrueMoney or Quest action was performed.
 
 ### Current operational baseline
 
@@ -25,7 +29,8 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - `LOG_PAYMENTS` may render a full voucher link by Owner policy. Backoffice human visibility is Owner-managed;
   runtime neither performs a privacy preflight nor changes Discord permissions.
 - No Automatic Claim; successful Quest work ends at `READY_TO_CLAIM` with customer-side claim URL.
-- Release state remains **implemented-but-unverified** until live UAT passes on one deployed build.
+- After all required automated checks pass on one committed SHA, the release state is **implemented-but-unverified**
+  until same-SHA live UAT passes.
 
 ### Added
 
@@ -91,8 +96,7 @@ There is no production release/tag evidence yet; current work remains under `[Un
   the next payment-worker tick and waits only about eight seconds in the same ephemeral window. The target lease cannot
   claim another customer's queued voucher; unresolved work remains durable and follows up through the existing Worker/DM path.
 
-- `GIT_SHA` is no longer a required deployment Environment Variable. Production starts without it, setup does not
-  import or request it, and pre-launch evidence uses the internal `untracked` marker when no source revision is available.
+- `GIT_SHA` is required for Production and must contain the exact 40-character candidate revision.
 
 - TrueMoney success handling now accepts a verified `HTTP 2xx` / `SUCCESS` settlement without a provider transaction
   ID when the exact positive THB amount and one intended receiver are confirmed. Voucher HMAC plus Top-up ID is the
@@ -126,7 +130,7 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - Quest History cards now keep the account profile thumbnail, link the `Quest — progress%` line to the matching
   Discord Quest URL, and render the bundled `quest-history-banner.png` image below every status card. Internal Account
   ID and Support code are no longer customer-facing; the Order and credit/service details remain visible.
-- `QUEST_AUTO` no longer hardcodes `5 บาท`; it reads active supported `TYPE` price rules from PostgreSQL.
+- `QUEST_AUTO` no longer hardcodes `5 บาท`; it reads active supported `TYPE` price rules from SQLite.
 - Quest Auto media now appears **inside the embed** as an animated GIF instead of a standalone MP4/video attachment
   block above the storefront.
 - Quest Auto no longer exposes `Questshop Surface • QUEST_AUTO` to customers. Recovery uses the stable surface nonce,
@@ -159,8 +163,7 @@ There is no production release/tag evidence yet; current work remains under `[Un
   of a configured Admin Role ID.
 - Surface setup/reconciliation recreate only on confirmed missing-message errors; permission/network/rate-limit errors
   preserve the authoritative pointer and incident evidence.
-- Runtime/PostgreSQL role synchronization and TLS CA handling remain fail-closed and do not use the old
-  `NODE_EXTRA_CA_CERTS` workaround.
+- PostgreSQL role/TLS configuration is no longer a runtime dependency.
 - TrueMoney submit now creates the customer Wallet up front, hides durable top-up identity from other users, permits only
   one pending top-up per customer and re-checks the Bangkok daily lock before a queued voucher can be claimed.
 - TrueMoney success now requires successful HTTP status, positive amount, consistent single-recipient evidence and a
@@ -176,8 +179,7 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - A Quest Manual Review retry checks expiry before requeueing and resolves an expired review without creating a test run.
 - Maintenance commits runner, monitor, payment, lock and notification recovery in bounded independent transactions;
   24-hour reminders record evidence without changing an Admin review into an Owner-only review.
-- PostgreSQL pool idle-client errors are caught, redacted and projected into health as `DEGRADED` instead of becoming
-  an unhandled process-level error.
+- SQLite worker/database degradation contributes to readiness and system incident state.
 - Quest Auto reconciliation now requires the exact approved GIF filename, byte size and matching remote attachment URL
   before preserving an existing Discord upload.
 
@@ -204,10 +206,10 @@ There is no production release/tag evidence yet; current work remains under `[Un
 
 ### Automated evidence
 
-Every candidate build must freshly pass syntax/check, lint, PostgreSQL-backed coverage, LCOV upload,
-fake-adapter load test, `npm audit --audit-level=high` and Docker build. Record the exact passing workflow run with UAT;
-a previous green SHA is not evidence for a newer candidate.
+Every candidate build must freshly pass syntax/check, unresolved-import check, lint, SQLite coverage, fake-adapter
+load test, `npm audit --audit-level=high`, diff check and Docker build. Record the exact passing SHA with UAT; a
+previous green SHA is not evidence for a newer candidate.
 
 These are source/CI results only. Discord GIF rendering, Quest reward/start/expiry/artwork fidelity, first-run historical
-Quest filtering, visible price refresh, TrueMoney, live Quest execution, Aiven/inwcloud restart and Owner UAT remain live
-evidence boundaries.
+Quest filtering, visible price refresh, TrueMoney, live Quest execution, SQLite/inwcloud restart and Owner UAT remain
+live evidence boundaries.

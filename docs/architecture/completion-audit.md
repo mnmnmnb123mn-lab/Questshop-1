@@ -15,3 +15,8 @@ the candidate commit:
 Live evidence remains required: persistent `/data`, single-instance restart, redeploy, backup restore, Discord commands
 and embeds on desktop/mobile, DM-disabled retry, real low-value TrueMoney handling and monitored Quest workflow.
 Do not describe source-only results as production ready.
+
+Current implementation note: financial ambiguity, verified Quest settlement, idempotent review resolution, SQLite Admin
+sessions, nonce-based notification recovery with desired-version fencing, 404-only surface replacement, announcement
+metadata and SQLite operations scripts have source/test changes in the worktree. Candidate-commit Node 22 evidence,
+load/audit/Docker checks and same-SHA UAT remain release blockers.

@@ -7,6 +7,7 @@ Required environment values:
 ```text
 SQLITE_PATH=/data/questshop.db
 QUESTSHOP_SECRET_KEY=<one permanent secret, at least 32 characters>
+VOUCHER_HMAC_ACTIVE_VERSION=v1
 GIT_SHA=<exact 40-character source SHA>
 DISCORD_BOT_TOKEN=<secret>
 DISCORD_CLIENT_ID=<application id>
@@ -26,3 +27,13 @@ npm ci --omit=dev && npm run deploy && npm start
 applies the atomic schema migration, verifies integrity and registers commands.
 It does not prove Discord or TrueMoney behaviour. Do not enable financial gates
 until the exact `GIT_SHA` completes the PRELAUNCH UAT.
+
+Before choosing the candidate SHA, run under Node `22.22.x`:
+
+```bash
+npm run check && npm run check:imports && npm run lint && npm test
+npm run test:coverage && npm run load:test
+npm audit --audit-level=high
+git diff --check
+docker build --build-arg GIT_SHA="$GIT_SHA" -t questshop:local .
+```

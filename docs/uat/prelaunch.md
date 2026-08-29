@@ -21,7 +21,8 @@ keyrings or a full voucher URL in UAT evidence.
 - [ ] Bot has Discord `Administrator`.
 - [ ] Owner has manually configured backoffice channel privacy; no automated human-visibility guard is assumed.
 - [ ] Receiver and Monitor credentials are valid; record IDs only.
-- [ ] `npm run check`, `npm run lint`, SQLite coverage/tests, load test, `npm audit --audit-level=high` and Docker build passed for this build.
+- [ ] `npm run check`, `npm run check:imports`, `npm run lint`, `npm test`, SQLite coverage/tests, load test,
+      `npm audit --audit-level=high`, `git diff --check` and Docker build using this exact `GIT_SHA` passed for this build.
 
 ## Quest Auto storefront UAT
 
@@ -84,6 +85,8 @@ same Quest payload/evidence; do not infer values from another bot or a screensho
       HTTP 400 remains `MANUAL_REVIEW` with no blind retry.
 - [ ] Provider timeout after possible send: `AMBIGUOUS`, no blind retry.
 - [ ] Owner resolves ambiguous payment with audit.
+- [ ] Resolve each review once to `RESOLVED_SUCCESS` or `RESOLVED_FAILURE`, then replay the same resolver and verify
+      that Wallet, settlement evidence and active-account lock do not change a second time.
 - [ ] Owner Manual Review with no provider transaction ID is available only when the recorded 2xx/SUCCESS, exact THB
       amount and intended receiver evidence are complete; it still requires two matching Owner confirmations.
 - [ ] A dispatch-checkpoint failure sends no provider request and remains retryable; every timeout, socket abort or
@@ -105,6 +108,8 @@ Use masked voucher identity only. Full voucher links belong only in the validate
 
 - [ ] Mobile checkout over 25 Quest options: pagination, selection and quote work.
 - [ ] Wrong-user, forged and expired components fail closed without side effects.
+- [ ] Actor, Guild, channel, message, operation and state-version mismatch fail closed; change an Admin's Discord
+      Administrator permission between panel display and action and verify no Admin side effect occurs.
 - [ ] Real supported Video Quest verifies progress and ends at manual claim URL only.
 - [ ] Real supported Desktop Quest verifies progress and ends at manual claim URL only.
 - [ ] Monitor-discovered Quest remains private until current-contract test pass or audited **ส่งเลย**.
@@ -144,6 +149,8 @@ Use masked voucher identity only. Full voucher links belong only in the validate
       writing to the database.
 - [ ] Simulate Discord DM failure and a channel timeout. Verify notifications retry/edit the same message and never
       change Wallet, Top-up, Order or Quest results.
+- [ ] Simulate Discord `403`, timeout and network failure for an existing durable surface; verify the same nonce/anchor
+      is retried and a replacement is created only after Discord `404 Unknown Message`.
 - [ ] Verify `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` and `LOG_SYSTEM` render safe Thai text and do not expose Token,
       voucher, cookie, credential, ciphertext, nonce or auth tag.
 - [ ] Runtime restart recovers queued Jobs, Notifications and Review state according to their checkpoints.
@@ -154,7 +161,7 @@ Use masked voucher identity only. Full voucher links belong only in the validate
 ## Closeout
 
 - [ ] Run `CONFIRM_PRELAUNCH_CLOSEOUT=I_UNDERSTAND_COMPENSATING_TRANSACTIONS npm run prelaunch:closeout`.
-- [ ] Record resulting release-evidence ID and confirm financial/Admin audit evidence was not deleted.
+- [ ] Record the closeout report and confirm settlement/Admin audit evidence was not deleted.
 - [ ] Owner sets `PRELAUNCH=false` only after closeout and all required live rows pass/receive an approved forward-fix.
 
 ## Final decision
