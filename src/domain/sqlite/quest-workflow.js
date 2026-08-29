@@ -43,7 +43,13 @@ function safeQuestRecord(quest) {
     id: String(quest.id), name: String(quest.name ?? quest.id).slice(0, 200), taskType: String(quest.eventName ?? 'UNKNOWN'),
     url: String(quest.url), artworkUrl: typeof quest.artworkUrl === 'string' && quest.artworkUrl.startsWith('https://')
       ? quest.artworkUrl : null,
+    thumbnailUrl: typeof quest.thumbnailUrl === 'string' && quest.thumbnailUrl.startsWith('https://') ? quest.thumbnailUrl : null,
+    startsAt: Number.isFinite(Date.parse(quest.startsAt)) ? Date.parse(quest.startsAt) : null,
     expiresAt: Number.isFinite(Date.parse(quest.expiresAt)) ? Date.parse(quest.expiresAt) : null,
+    targetValue: Number.isSafeInteger(Number(quest.secondsNeeded)) && Number(quest.secondsNeeded) >= 0 ? Number(quest.secondsNeeded) : null,
+    orbs: Number.isSafeInteger(Number(quest.orbs)) && Number(quest.orbs) >= 0 ? Number(quest.orbs) : null,
+    orbMin: Number.isSafeInteger(Number(quest.orbReward?.minOrbs)) && Number(quest.orbReward.minOrbs) >= 0 ? Number(quest.orbReward.minOrbs) : null,
+    orbMax: Number.isSafeInteger(Number(quest.orbReward?.maxOrbs)) && Number(quest.orbReward.maxOrbs) >= 0 ? Number(quest.orbReward.maxOrbs) : null,
     contractHash: typeof quest.contractHash === 'string' ? quest.contractHash.slice(0, 128) : null,
   };
 }
@@ -54,13 +60,15 @@ function upsertCustomerQuests(db, { quests, discordUserId = null, accountId = nu
     if (!sourceQuest?.id || !sourceQuest?.url?.startsWith('https://')) continue;
     const quest = safeQuestRecord(sourceQuest);
     const existing = db.prepare('SELECT * FROM quests WHERE quest_id=?').get(quest.id);
-    db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,artwork_url,expires_at,contract_hash,source,first_discovered_by,last_discovered_by,first_account_id,last_account_id,first_seen_at,last_seen_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,'CUSTOMER',?,?,?,?,?,?,?)
+    db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,artwork_url,thumbnail_url,starts_at,expires_at,target_value,orbs,orb_min,orb_max,contract_hash,source,first_discovered_by,last_discovered_by,first_account_id,last_account_id,first_seen_at,last_seen_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'CUSTOMER',?,?,?,?,?,?,?)
       ON CONFLICT(quest_id) DO UPDATE SET name=excluded.name,task_type=excluded.task_type,url=excluded.url,
-       artwork_url=excluded.artwork_url,expires_at=excluded.expires_at,contract_hash=excluded.contract_hash,
+       artwork_url=excluded.artwork_url,thumbnail_url=excluded.thumbnail_url,starts_at=excluded.starts_at,expires_at=excluded.expires_at,
+       target_value=excluded.target_value,orbs=excluded.orbs,orb_min=excluded.orb_min,orb_max=excluded.orb_max,contract_hash=excluded.contract_hash,
        source='CUSTOMER',discovery_count=quests.discovery_count+1,last_discovered_by=excluded.last_discovered_by,
        last_account_id=excluded.last_account_id,last_seen_at=excluded.last_seen_at,state_version=quests.state_version+1,updated_at=excluded.updated_at`)
-      .run(quest.id, quest.name, quest.taskType, quest.url, quest.artworkUrl, quest.expiresAt, quest.contractHash,
+      .run(quest.id, quest.name, quest.taskType, quest.url, quest.artworkUrl, quest.thumbnailUrl, quest.startsAt, quest.expiresAt,
+        quest.targetValue, quest.orbs, quest.orbMin, quest.orbMax, quest.contractHash,
         discordUserId, discordUserId, accountId, accountId, timestamp, timestamp, timestamp);
     discovered.push({ ...quest, isNew: !existing });
   }
@@ -96,7 +104,7 @@ export async function processCustomerDiscovery(runtime, job) {
   withImmediateTransaction(runtime.db, () => {
     discovered = upsertCustomerQuests(runtime.db, { quests, discordUserId: payload.discordUserId, accountId, timestamp });
     const resultPayload = { ...payload, accountId, questIds: discovered.map((item) => item.id), completedAt: timestamp };
-    runtime.db.prepare(`UPDATE jobs SET payload_json=?,updated_at=? WHERE id=? AND state='RUNNING' AND lease_token=?`)
+    runtime.db.prepare(`UPDATE jobs SET payload_json=?,state_version=state_version+1,updated_at=? WHERE id=? AND state='RUNNING' AND lease_token=?`)
       .run(JSON.stringify(resultPayload), timestamp, job.id, job.lease_token);
     logDiscovery(runtime.db, { checkoutId: job.subject_id, discordUserId: payload.discordUserId, accountId, discovered, timestamp });
     queueMonitorSearches(runtime.db, discovered, job.subject_id, { discordUserId: payload.discordUserId, accountId, timestamp });
@@ -167,9 +175,12 @@ async function runQuest(runtime, { credentialId, questId, job, onProgress }) {
     return fresh;
   };
   let quest = await findFresh();
-  if (quest.completed) return quest;
+  if (quest.completed) return { ...quest, completedBeforeRun: true, verifiedCompleted: true };
+  let mutationAttempted = false;
+  const markPossibleMutation = () => { mutationAttempted = true; markJobPossiblySent(runtime.db, { jobId: job.id, leaseToken: job.lease_token }); };
+  try {
   if (!quest.enrolled) {
-    markJobPossiblySent(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
+    markPossibleMutation();
     await api.enroll(quest.id, runtime.abortController.signal);
     updateRunningJobPayload(runtime.db, { jobId: job.id, leaseToken: job.lease_token, payload: json(job.payload_json), checkpoint: 'VERIFIED' });
     quest = await findFresh();
@@ -178,18 +189,28 @@ async function runQuest(runtime, { credentialId, questId, job, onProgress }) {
   const executor = selectQuestExecutor(quest);
   const valid = executor.validate(quest);
   if (!valid.ok || !executor.supportsAutomaticProgress) throw new QuestshopError('QUEST_NOT_AUTOMATABLE', 'Quest นี้ยังไม่รองรับการทำอัตโนมัติ');
-  return executor.execute({
+  const result = await executor.execute({
     quest, api, signal: runtime.abortController.signal, now: Date.now,
     sleep: (milliseconds, signal) => sleep(milliseconds, undefined, { signal }),
     fetchFreshQuest: async () => findFresh(),
     onServerProgress: async (fresh) => onProgress?.(fresh),
     mutate: async (_kind, _evidence, execute) => {
-      markJobPossiblySent(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
+      markPossibleMutation();
       const outcome = await execute();
       updateRunningJobPayload(runtime.db, { jobId: job.id, leaseToken: job.lease_token, payload: json(job.payload_json), checkpoint: 'VERIFIED' });
       return outcome;
     },
   });
+  return { ...result, completedBeforeRun: false, verifiedCompleted: result?.completed === true };
+  } catch (error) {
+    error.questPossiblyMutated = mutationAttempted;
+    throw error;
+  }
+}
+
+function isDefiniteQuestFailure(error) {
+  return error?.definite === true || error?.category === 'DEFINITE_FAILURE'
+    || (!error?.questPossiblyMutated && ['QUEST_NOT_VISIBLE', 'QUEST_NOT_AUTOMATABLE', 'QUEST_EXPIRED'].includes(error?.code));
 }
 
 export async function processQuestRun(runtime, job) {
@@ -198,16 +219,35 @@ export async function processQuestRun(runtime, job) {
   if (!item) return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED', errorCode: 'ORDER_ITEM_NOT_FOUND' });
   markOrderItemRunning(runtime.db, { itemId: item.id });
   try {
-    await runQuest(runtime, { credentialId: item.credential_id, questId: item.quest_id, job,
+    const result = await runQuest(runtime, { credentialId: item.credential_id, questId: item.quest_id, job,
       onProgress: (fresh) => runtime.db.prepare('UPDATE order_items SET progress_percent=?,updated_at=? WHERE id=?')
         .run(Math.max(0, Math.min(100, Math.round(Number(fresh.progress ?? 0)))), nowMs(), item.id) });
-    settleOrderItem(runtime.db, { itemId: item.id, outcome: 'SUCCESS', claimUrl: item.url });
-    return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
+    if (result.completedBeforeRun) {
+      settleOrderItem(runtime.db, { itemId: item.id, outcome: 'FAILED', reason: 'EXTERNAL_COMPLETED_RELEASED',
+        evidence: { completedBeforeRun: true } });
+      return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED', errorCode: 'EXTERNAL_COMPLETED_RELEASED' });
+    }
+    if (result.verifiedCompleted) {
+      settleOrderItem(runtime.db, { itemId: item.id, outcome: 'SUCCESS', claimUrl: result.url ?? item.url, verified: true,
+        evidence: { verifiedCompleted: true } });
+      return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
+    }
+    settleOrderItem(runtime.db, { itemId: item.id, outcome: 'REVIEW', reason: 'QUEST_COMPLETION_UNVERIFIED',
+      evidence: { completed: result.completed === true, progress: result.progress ?? null } });
+    return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
+      errorCode: 'QUEST_COMPLETION_UNVERIFIED', checkpoint: 'POSSIBLY_SENT' });
   } catch (error) {
     // A worker cannot prove whether a Quest API mutation happened after a
     // network ambiguity, so it deliberately keeps the customer's funds
     // reserved and asks an Owner to review rather than guessing a release.
-    settleOrderItem(runtime.db, { itemId: item.id, outcome: 'REVIEW', reason: error.code ?? 'QUEST_RESULT_AMBIGUOUS' });
+    if (isDefiniteQuestFailure(error)) {
+      settleOrderItem(runtime.db, { itemId: item.id, outcome: 'FAILED', reason: error.code ?? 'QUEST_DEFINITE_FAILURE',
+        evidence: { definite: true } });
+      return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED',
+        errorCode: error.code ?? 'QUEST_DEFINITE_FAILURE', checkpoint: 'VERIFIED' });
+    }
+    settleOrderItem(runtime.db, { itemId: item.id, outcome: 'REVIEW', reason: error.code ?? 'QUEST_RESULT_AMBIGUOUS',
+      evidence: { possiblyMutated: error.questPossiblyMutated === true } });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
       errorCode: error.code ?? 'QUEST_RESULT_AMBIGUOUS', checkpoint: 'POSSIBLY_SENT' });
   }

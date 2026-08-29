@@ -31,9 +31,14 @@ export function renderQuestAuto(config = {}) {
 
 export function renderAdminPanel() {
   return { embeds: [new EmbedBuilder().setColor(COLORS.primary).setTitle('แผงควบคุม Questshop')
-    .setDescription('ผู้ดูแลใช้แผงนี้เพื่อตรวจสอบงาน การเงิน และการตั้งค่าร้าน')],
+    .setDescription('ผู้ดูแลใช้แผงนี้เพื่อตรวจสอบงาน การเงิน และการตั้งค่าร้าน\nทุกคำสั่งตรวจสิทธิ์ Administrator ใหม่ทุกครั้ง')],
   components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(customId('admin'))
-    .setPlaceholder('แผงผู้ดูแล').addOptions({ label: 'กำลังย้ายระบบ SQLite', value: 'sqlite' }))], allowedMentions: { parse: [] } };
+    .setPlaceholder('เลือกการจัดการร้าน').addOptions(
+      { label: 'ภาพรวมระบบ', value: 'overview' }, { label: 'Feature gates', value: 'gates' },
+      { label: 'ตั้งราคา Quest', value: 'prices' }, { label: 'ตั้งค่าเบอร์รับเงิน', value: 'receiver' },
+      { label: 'โปรโมชั่น', value: 'promotions' }, { label: 'ปรับ Wallet', value: 'wallet' },
+      { label: 'บัญชี Monitor', value: 'monitors' }, { label: 'Manual reviews', value: 'reviews' }, { label: 'งานค้างส่ง (DLQ)', value: 'dlq' },
+    ))], allowedMentions: { parse: [] } };
 }
 
 export function renderSurfaceAnchor(surfaceKey, config = {}) {

@@ -8,6 +8,8 @@ import {
   loadAdminLogBanner, loadBackofficeLogBanner, loadLogSystemThumbnail,
 } from '../surfaces/backoffice-log-media.js';
 import { customId } from '../components/custom-id.js';
+import { priceForQuest } from '../../domain/sqlite/pricing.js';
+import { loadRuntimeConfig } from '../../config/runtime-config.js';
 import { decryptCredential } from '../../domain/sqlite/crypto.js';
 import { ADMIN_AUDIT_ALLOWED_FIELDS } from '../../domain/sqlite/admin.js';
 import { QUEST_HISTORY_BANNER_ATTACHMENT_URL, QUEST_HISTORY_BANNER_FILENAME, loadQuestHistoryBanner } from '../surfaces/quest-history-media.js';
@@ -219,14 +221,22 @@ async function renderAdmin(db, client, notification) {
 async function renderQuestAnnouncement(db, notification) {
   const quest = db.prepare('SELECT * FROM quests WHERE quest_id=?').get(notification.aggregate_id);
   if (!quest) throw Object.assign(new Error('Quest announcement projection is missing'), { code: 'QUEST_ANNOUNCEMENT_MISSING' });
+  const task = { WATCH_VIDEO: 'ดูวิดีโอ', WATCH_VIDEO_ON_MOBILE: 'ดูวิดีโอบนมือถือ', PLAY_ON_DESKTOP: 'เล่นบนคอมพิวเตอร์', PLAY_ON_DESKTOP_V2: 'เล่นบนคอมพิวเตอร์' }[quest.task_type] ?? 'Quest Discord';
+  const price = priceForQuest(loadRuntimeConfig(db).values, quest.task_type);
+  const reward = quest.orbs != null ? `${quest.orbs} Discord Orbs`
+    : quest.orb_min != null && quest.orb_max != null ? `${quest.orb_min}-${quest.orb_max} Discord Orbs` : null;
   const embed = new EmbedBuilder().setColor(COLORS.success).setTitle(`🎉 พบ Quest ใหม่: ${safeDiscordText(quest.name)}`)
     .setDescription([
-      `ประเภท: ${safeDiscordText(quest.task_type)}`,
-      `เริ่ม Quest ได้จากปุ่มด้านล่าง`,
+      `ประเภท: ${task}`,
+      quest.target_value != null ? `เป้าหมาย: ${quest.target_value}` : null,
+      reward ? `รางวัล: ${reward}` : null,
+      price != null ? `ค่าบริการ: ${baht(price)}` : 'ค่าบริการ: ยังไม่พร้อม',
+      quest.starts_at ? `เริ่ม: ${timestamp(quest.starts_at)}` : null,
       quest.expires_at ? `หมดอายุ: ${timestamp(quest.expires_at)}` : null,
       'สรุป: Quest นี้เป็นข้อมูลประกาศ ไม่ได้ยืนยันว่าจะปรากฏในทุกบัญชี Discord',
-    ].filter(Boolean).join('\n')).setTimestamp(new Date(Number(quest.updated_at)));
+    ].filter(Boolean).join('\n'));
   if (typeof quest.artwork_url === 'string' && quest.artwork_url.startsWith('https://')) embed.setImage(quest.artwork_url);
+  if (typeof quest.thumbnail_url === 'string' && quest.thumbnail_url.startsWith('https://')) embed.setThumbnail(quest.thumbnail_url);
   return { embeds: [embed], components: [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(quest.url).setLabel('ดู Quest ได้ที่นี่'),
   )], allowedMentions: { parse: [] } };
