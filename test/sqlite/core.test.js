@@ -674,6 +674,26 @@ test('subject-aware recovery creates reviews and settles only durable redeemed c
   assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(redeemed.id).status, 'CREDITED');
   const evidence = fixture.db.prepare("SELECT evidence_json FROM external_operation_evidence WHERE job_id=? AND stage='RECOVERY_DECISION'").get(redeemedJob.id);
   assert.match(evidence.evidence_json, /CREDIT_REDEEMED_WITHOUT_PROVIDER_RETRY/);
+
+  const failed = submitTopup(fixture.db, env, { discordUserId: 'recovery-customer',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=9123456789abcdef0123456789abcdef01' }).topup;
+  failTopup(fixture.db, { topupId: failed.id, reasonCode: 'VOUCHER_USED' });
+  const failedJob = claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' });
+  markJobPossiblySent(fixture.db, { jobId: failedJob.id, leaseToken: failedJob.lease_token });
+  fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(failedJob.id);
+  recoverInterruptedSubjects({ db: fixture.db });
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(failedJob.id).state, 'FAILED');
+
+  const credited = submitTopup(fixture.db, env, { discordUserId: 'recovery-customer',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=a123456789abcdef0123456789abcdef01' }).topup;
+  markTopupProcessing(fixture.db, credited.id);
+  recordRedeemedTopup(fixture.db, { topupId: credited.id, principalCents: 500 });
+  creditRedeemedTopup(fixture.db, { topupId: credited.id });
+  const creditedJob = claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' });
+  markJobPossiblySent(fixture.db, { jobId: creditedJob.id, leaseToken: creditedJob.lease_token });
+  fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(creditedJob.id);
+  recoverInterruptedSubjects({ db: fixture.db });
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(creditedJob.id).state, 'COMPLETED');
 });
 
 test('a stale payment lease cannot mutate its Top-up', async (t) => {
@@ -685,6 +705,56 @@ test('a stale payment lease cannot mutate its Top-up', async (t) => {
   assert.throws(() => markTopupProcessing(fixture.db, topup.id, { workerJob: { jobId: job.id, leaseToken: job.lease_token } }),
     (error) => error.code === 'JOB_LEASE_LOST');
   assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(topup.id).status, 'PENDING');
+});
+
+test('Quest recovery settles a durable verified result without another mutation', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const timestamp = Date.now();
+  appendWalletTransaction(fixture.db, { discordUserId: 'quest-recovery', transactionType: 'TOPUP', availableDeltaCents: 500,
+    referenceType: 'TEST', referenceId: 'quest-recovery-funds', idempotencyKey: 'quest-recovery-funds', traceId: randomUUID() });
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?)`).run('quest-recovery', 'Recoverable Quest', 'WATCH_VIDEO', 'https://discord.com/quests/recovery', 'CUSTOMER', timestamp, timestamp, timestamp);
+  const order = createOrder(fixture.db, { discordUserId: 'quest-recovery', questAccountId: 'quest-recovery-account',
+    items: [{ questId: 'quest-recovery', priceCents: 500 }] });
+  const item = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(order.id);
+  const job = claimDueJob(fixture.db, { jobType: 'QUEST_RUN' });
+  fixture.db.prepare("UPDATE jobs SET checkpoint='VERIFIED',payload_json=?,lease_expires_at=0 WHERE id=?").run(
+    JSON.stringify({ recoveryResult: { outcome: 'SUCCESS', claimUrl: 'https://discord.com/quests/recovery', evidence: { verifiedCompleted: true } } }), job.id);
+  recoverInterruptedSubjects({ db: fixture.db });
+  assert.equal(fixture.db.prepare('SELECT state FROM order_items WHERE id=?').get(item.id).state, 'READY_TO_CLAIM');
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(job.id).state, 'COMPLETED');
+
+  appendWalletTransaction(fixture.db, { discordUserId: 'quest-release', transactionType: 'TOPUP', availableDeltaCents: 500,
+    referenceType: 'TEST', referenceId: 'quest-release-funds', idempotencyKey: 'quest-release-funds', traceId: randomUUID() });
+  const releaseOrder = createOrder(fixture.db, { discordUserId: 'quest-release', questAccountId: 'quest-release-account',
+    items: [{ questId: 'quest-recovery', priceCents: 500 }] });
+  const releaseItem = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(releaseOrder.id);
+  const releaseJob = claimDueJob(fixture.db, { jobType: 'QUEST_RUN' });
+  fixture.db.prepare("UPDATE jobs SET checkpoint='VERIFIED',payload_json=?,lease_expires_at=0 WHERE id=?").run(
+    JSON.stringify({ recoveryResult: { outcome: 'FAILED', reason: 'EXTERNAL_COMPLETED_RELEASED', evidence: { completedBeforeRun: true } } }), releaseJob.id);
+  recoverInterruptedSubjects({ db: fixture.db });
+  assert.equal(fixture.db.prepare('SELECT state FROM order_items WHERE id=?').get(releaseItem.id).state, 'FAILED');
+
+  const missingTopup = enqueueJob(fixture.db, { jobType: 'PAYMENT_SETTLE', subjectType: 'TOPUP', subjectId: 'missing-topup', operationKey: 'missing-topup-recovery' });
+  const missingTopupJob = claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' });
+  markJobPossiblySent(fixture.db, { jobId: missingTopupJob.id, leaseToken: missingTopupJob.lease_token });
+  fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(missingTopup.id);
+  recoverInterruptedSubjects({ db: fixture.db });
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(missingTopup.id).state, 'FAILED');
+
+  const missingQuest = enqueueJob(fixture.db, { jobType: 'QUEST_RUN', subjectType: 'ORDER_ITEM', subjectId: 'missing-item', operationKey: 'missing-item-recovery' });
+  const missingQuestJob = claimDueJob(fixture.db, { jobType: 'QUEST_RUN' });
+  markJobPossiblySent(fixture.db, { jobId: missingQuestJob.id, leaseToken: missingQuestJob.lease_token });
+  fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(missingQuest.id);
+  recoverInterruptedSubjects({ db: fixture.db });
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(missingQuest.id).state, 'FAILED');
+
+  const completedQuest = enqueueJob(fixture.db, { jobType: 'QUEST_RUN', subjectType: 'ORDER_ITEM', subjectId: item.id, operationKey: 'completed-item-recovery' });
+  const completedQuestJob = claimDueJob(fixture.db, { jobType: 'QUEST_RUN' });
+  markJobPossiblySent(fixture.db, { jobId: completedQuestJob.id, leaseToken: completedQuestJob.lease_token });
+  fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(completedQuest.id);
+  recoverInterruptedSubjects({ db: fixture.db });
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(completedQuest.id).state, 'COMPLETED');
 });
 
 test('gates are closed by default and Notification recovery/defer preserves a durable projection', async (t) => {
