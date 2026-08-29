@@ -4,21 +4,38 @@ import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { setTimeout as sleep } from 'node:timers/promises';
+import { setImmediate as nextTurn, setTimeout as sleep } from 'node:timers/promises';
 import { acquireSingleInstanceLock, closeSqliteDatabase, configureSecretVerifier, fullIntegrityCheck, openSqliteDatabase, quickIntegrityCheck, withImmediateTransaction } from '../../src/db/sqlite.js';
 import { migrateSqlite } from '../../src/db/sqlite-migrations.js';
 import { appendWalletTransaction } from '../../src/domain/sqlite/wallet.js';
 import { creditRedeemedTopup, creditVerifiedTopup, recordRedeemedTopup, resolveTopupFinancialReview, reverseCreditedTopup, submitTopup, markTopupProcessing, moveTopupToReview, failTopup } from '../../src/domain/sqlite/payments.js';
-import { createOrder, settleOrderItem } from '../../src/domain/sqlite/orders.js';
+import { createOrder, resolveOrderItemReview, settleOrderItem } from '../../src/domain/sqlite/orders.js';
 import { claimDueNotification, enqueueNotification, finishNotificationDelivery } from '../../src/domain/sqlite/notifications.js';
 import { createRotatedSqliteBackup, replaceDatabaseFromBackup } from '../../src/db/sqlite-backup.js';
 import { parseBahtToCents, percentageBonusHalfUp } from '../../src/shared/money.js';
-import { encryptCredential } from '../../src/domain/sqlite/crypto.js';
+import { encryptCredential, voucherHmac, voucherIdentityHmac } from '../../src/domain/sqlite/crypto.js';
 import { claimDueJob, completeJob, enqueueJob, markJobPossiblySent, recoverInterruptedJobs, renewJobLease, updateRunningJobPayload } from '../../src/domain/sqlite/jobs.js';
 import { processQuestWorkflowJob } from '../../src/domain/sqlite/quest-workflow.js';
+import { processPaymentJob } from '../../src/workers/sqlite-worker-manager.js';
+import { deliverNotification } from '../../src/workers/sqlite-worker-manager.js';
+import { setupSurface, surfaceNonce, updateOrCreateSurfaceAnchor } from '../../src/discord/surfaces/setup.js';
+import { bindInteractionSessionMessage, consumeInteractionSession, createInteractionSession } from '../../src/domain/sqlite/interaction-sessions.js';
+import { adjustWallet, adminOverview, configureReceiverPhone, queueMonitorScanAndTest, retryNotificationDlq, setQuestPrice, upsertMonitorAccount, upsertPromotion } from '../../src/domain/sqlite/admin.js';
+import { loadRuntimeConfig } from '../../src/config/runtime-config.js';
+import { recomputeHealthStatus } from '../../src/bootstrap/health-status.js';
+import { renderQuestAuto } from '../../src/discord/renderers/surfaces.js';
+import { renderSurfaceAnchor, questAutoPriceRangeLabel } from '../../src/discord/renderers/surfaces.js';
+import { renderSqliteNotification } from '../../src/discord/renderers/sqlite-projections.js';
+import { normalizeDiscordPayload } from '../../src/discord/payload.js';
+import { customId, parseCustomId } from '../../src/discord/components/custom-id.js';
 import { assertCustomerAccess, assertGate, currentFeatureGates } from '../../src/domain/sqlite/gates.js';
-import { deferNotification, recoverSendingNotifications } from '../../src/domain/sqlite/notifications.js';
+import { deferNotification, recoverSendingNotifications, retryDeadLetterNotification } from '../../src/domain/sqlite/notifications.js';
 import { refundReadyOrderItem } from '../../src/domain/sqlite/orders.js';
+import { assertQuestExecutorContract, defineQuestExecutor, executeQuestExecutor } from '../../src/quest-engine/executors/contract.js';
+import { listExecutorCapabilities, selectQuestExecutor } from '../../src/quest-engine/executors/registry.js';
+import { nextVideoTimestamp, videoExecutor } from '../../src/quest-engine/executors/video.js';
+import { desktopExecutor } from '../../src/quest-engine/executors/desktop.js';
+import { EXTERNAL_OUTCOME, externalOutcome } from '../../src/domain/sqlite/external-outcome.js';
 
 const secret = 'sqlite-test-secret-key-which-is-at-least-32-characters';
 
@@ -33,11 +50,20 @@ async function database() {
 test('SQLite migration creates strict financial schema and append-only audit', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const tables = fixture.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'").get();
-  assert.equal(Number(tables.count), 16);
+  assert.equal(Number(tables.count), 18);
   assert.equal(fullIntegrityCheck(fixture.db).ok, true);
   appendWalletTransaction(fixture.db, { discordUserId: 'customer-a', transactionType: 'TOPUP', availableDeltaCents: 500,
     referenceType: 'TEST', referenceId: 'one', idempotencyKey: 'append-only-one', traceId: randomUUID() });
   assert.throws(() => fixture.db.prepare('DELETE FROM wallet_transactions').run(), /append-only/);
+});
+
+test('external outcome and surface fallbacks reject unsafe data without changing customer contracts', () => {
+  assert.deepEqual(externalOutcome({ outcome: EXTERNAL_OUTCOME.AMBIGUOUS, evidence: null }), {
+    outcome: 'AMBIGUOUS', providerReference: null, reason: null, evidence: {},
+  });
+  assert.throws(() => externalOutcome({ outcome: 'RETRY' }), /Invalid external outcome/);
+  assert.equal(questAutoPriceRangeLabel({ minCents: -1, maxCents: 500 }), null);
+  assert.equal(renderSurfaceAnchor('UNRECOGNIZED').embeds[0].data.title, 'Questshop');
 });
 
 test('SQLite primitive rejects asynchronous transactions and a mismatched persistent secret', async () => {
@@ -65,6 +91,20 @@ test('voucher ownership is private and verified credit/reversal are exactly once
   const reversed = reverseCreditedTopup(fixture.db, { topupId: first.topup.id });
   assert.equal(reversed.topup.status, 'REVERSED');
   assert.equal(Number(reversed.wallet.available_cents), 0);
+});
+
+test('versioned voucher proofs retain one stable identity across rotations', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const url = 'https://gift.truemoney.com/campaign/?v=f123456789abcdef0123456789abcdef01';
+  const first = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret, VOUCHER_HMAC_ACTIVE_VERSION: 'v1' },
+    { discordUserId: 'rotated-owner', voucherUrl: url });
+  const replay = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret, VOUCHER_HMAC_ACTIVE_VERSION: 'v2' },
+    { discordUserId: 'rotated-owner', voucherUrl: url });
+  assert.equal(replay.idempotent, true);
+  const code = new URL(url).searchParams.get('v');
+  assert.notDeepEqual(voucherHmac(secret, code, 'v1'), voucherHmac(secret, code, 'v2'));
+  assert.deepEqual(Buffer.from(fixture.db.prepare('SELECT voucher_identity_hmac FROM topups WHERE id=?').get(first.topup.id).voucher_identity_hmac),
+    voucherIdentityHmac(secret, code));
 });
 
 test('REDEEMED is a durable boundary and restart recovery can credit it exactly once', async (t) => {
@@ -99,7 +139,7 @@ test('financial review requires two confirmations and credits only with complete
   const credited = resolveTopupFinancialReview(fixture.db, { reviewId: review.id, actorId: 'owner', decision: 'CREDIT', principalCents: 500,
     providerEvidence: { httpStatus: 200, providerCode: 'SUCCESS', receiverConfirmation: 'REQUEST_BOUND_SUCCESS', receiverLast4: '1234' } });
   assert.equal(credited.status, 'CREDITED');
-  assert.equal(fixture.db.prepare('SELECT state FROM manual_reviews WHERE id=?').get(review.id).state, 'RESOLVED');
+  assert.equal(fixture.db.prepare('SELECT state FROM manual_reviews WHERE id=?').get(review.id).state, 'RESOLVED_SUCCESS');
 });
 
 test('promotion snapshots, rejected reviews, and insufficient reversals retain the correct financial state', async (t) => {
@@ -121,6 +161,8 @@ test('promotion snapshots, rejected reviews, and insufficient reversals retain t
   const rejectReview = fixture.db.prepare("SELECT * FROM manual_reviews WHERE subject_id=? AND state='OPEN'").get(rejected.id);
   resolveTopupFinancialReview(fixture.db, { reviewId: rejectReview.id, actorId: 'owner', decision: 'REJECT' });
   assert.equal(resolveTopupFinancialReview(fixture.db, { reviewId: rejectReview.id, actorId: 'owner', decision: 'REJECT' }).status, 'FAILED');
+  assert.equal(fixture.db.prepare('SELECT state FROM manual_reviews WHERE id=?').get(rejectReview.id).state, 'RESOLVED_FAILURE');
+  assert.equal(resolveTopupFinancialReview(fixture.db, { reviewId: rejectReview.id, actorId: 'owner', decision: 'REJECT' }).idempotent, true);
 
   const reversal = reverseCreditedTopup(fixture.db, { topupId: first.id });
   assert.equal(reversal.topup.status, 'REVERSED');
@@ -156,7 +198,9 @@ test('order settlement moves reserved credit atomically', async (t) => {
   let wallet = fixture.db.prepare('SELECT * FROM wallets WHERE discord_user_id=?').get('buyer');
   assert.deepEqual([Number(wallet.available_cents), Number(wallet.reserved_cents)], [1_500, 500]);
   const item = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(order.id);
-  settleOrderItem(fixture.db, { itemId: item.id, outcome: 'SUCCESS', claimUrl: 'https://discord.com/quests/claim' });
+  assert.throws(() => settleOrderItem(fixture.db, { itemId: item.id, outcome: 'SUCCESS', claimUrl: 'https://discord.com/quests/claim' }),
+    (error) => error.code === 'SETTLEMENT_VERIFICATION_REQUIRED');
+  settleOrderItem(fixture.db, { itemId: item.id, outcome: 'SUCCESS', verified: true, claimUrl: 'https://discord.com/quests/claim' });
   wallet = fixture.db.prepare('SELECT * FROM wallets WHERE discord_user_id=?').get('buyer');
   assert.deepEqual([Number(wallet.available_cents), Number(wallet.reserved_cents)], [1_500, 0]);
   const failedOrder = createOrder(fixture.db, { discordUserId: 'buyer', questAccountId: 'account', traceId: randomUUID(),
@@ -177,7 +221,7 @@ test('a ready-to-claim item refunds once with its Wallet movement in the same tr
   const order = createOrder(fixture.db, { discordUserId: 'refund-buyer', questAccountId: 'refund-account', traceId: randomUUID(),
     items: [{ questId: 'refund-quest', priceCents: 500 }] });
   const item = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(order.id);
-  settleOrderItem(fixture.db, { itemId: item.id, outcome: 'SUCCESS', claimUrl: 'https://discord.com/quests/refund' });
+  settleOrderItem(fixture.db, { itemId: item.id, outcome: 'SUCCESS', verified: true, claimUrl: 'https://discord.com/quests/refund' });
   assert.equal(refundReadyOrderItem(fixture.db, { itemId: item.id, actorId: 'owner' }).item.state, 'REFUNDED');
   assert.equal(refundReadyOrderItem(fixture.db, { itemId: item.id, actorId: 'owner' }).idempotent, true);
   assert.equal(fixture.db.prepare('SELECT available_cents FROM wallets WHERE discord_user_id=?').get('refund-buyer').available_cents, 900);
@@ -317,7 +361,7 @@ test('an unusable Monitor is reported as incomplete rather than pretending Quest
   assert.equal(fixture.db.prepare("SELECT state FROM quest_checks WHERE quest_id='incomplete-quest'").get().state, 'UNAVAILABLE');
 });
 
-test('Quest runner captures a completed Quest once and preserves its claim link', async (t) => {
+test('Quest already completed before a paid run is released without capture', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const now = Date.now();
   appendWalletTransaction(fixture.db, { discordUserId: 'runner-buyer', transactionType: 'TOPUP', availableDeltaCents: 600,
@@ -336,10 +380,233 @@ test('Quest runner captures a completed Quest once and preserves its claim link'
   const job = claimDueJob(fixture.db);
   await processQuestWorkflowJob(runtime, job);
   const item = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(order.id);
-  assert.equal(item.state, 'READY_TO_CLAIM');
-  assert.equal(item.claim_url, 'https://discord.com/quests/runner-quest');
+  assert.equal(item.state, 'FAILED');
+  assert.equal(item.claim_url, null);
   const wallet = fixture.db.prepare('SELECT available_cents,reserved_cents FROM wallets WHERE discord_user_id=?').get('runner-buyer');
-  assert.deepEqual([Number(wallet.available_cents), Number(wallet.reserved_cents)], [100, 0]);
+  assert.deepEqual([Number(wallet.available_cents), Number(wallet.reserved_cents)], [600, 0]);
+  assert.equal(fixture.db.prepare("SELECT outcome FROM settlement_evidence WHERE subject_id=?").get(item.id).outcome, 'RELEASED');
+});
+
+test('an incomplete Quest result remains reserved for operational review', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const now = Date.now();
+  appendWalletTransaction(fixture.db, { discordUserId: 'incomplete-buyer', transactionType: 'TOPUP', availableDeltaCents: 600,
+    referenceType: 'TEST', referenceId: 'incomplete-fund', idempotencyKey: 'incomplete-fund', traceId: randomUUID() });
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?)`).run('incomplete-runner-quest', 'Incomplete', 'WATCH_VIDEO', 'https://discord.com/quests/incomplete-runner-quest', 'CUSTOMER', now, now, now);
+  const credentialId = randomUUID(); const sealed = encryptCredential(secret, 'incomplete-token');
+  fixture.db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,cleanup_after,created_at,updated_at)
+    VALUES(?,?,?,'CUSTOMER_QUEST_TOKEN','TEMPORARY',?,?,?,?,?,?)`).run(credentialId, 'CHECKOUT', credentialId,
+    sealed.ciphertext, sealed.nonce, sealed.authTag, now + 60_000, now, now);
+  const order = createOrder(fixture.db, { discordUserId: 'incomplete-buyer', questAccountId: 'incomplete-account', credentialId,
+    traceId: randomUUID(), items: [{ questId: 'incomplete-runner-quest', priceCents: 500 }] });
+  const runtime = { db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret, RUNNER_CONCURRENCY: 1 }, abortController: new AbortController(),
+    questApiFactory: () => ({ fetchQuests: async () => [{ id: 'incomplete-runner-quest', eventName: 'WATCH_VIDEO', enrolled: true, completed: false,
+      progressSecs: 10, secondsNeeded: 10, url: 'https://discord.com/quests/incomplete-runner-quest' }] }) };
+  await processQuestWorkflowJob(runtime, claimDueJob(fixture.db));
+  const item = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(order.id);
+  assert.equal(item.state, 'REVIEW');
+  assert.deepEqual(Object.values(fixture.db.prepare('SELECT available_cents,reserved_cents FROM wallets WHERE discord_user_id=?').get('incomplete-buyer')).slice(0, 2).map(Number), [100, 500]);
+  assert.equal(fixture.db.prepare("SELECT state FROM manual_reviews WHERE subject_id=?").get(item.id).state, 'OPEN');
+});
+
+test('unknown TrueMoney provider outcomes become financial review rather than failure', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const topup = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'ambiguous-payer',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=7123456789abcdef0123456789abcdef01' }).topup;
+  const job = claimDueJob(fixture.db);
+  const runtime = { db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret }, abortController: new AbortController(),
+    paymentProvider: async () => ({ outcome: 'AMBIGUOUS', providerCode: 'UNKNOWN_PROVIDER_RESULT', httpStatus: 400, providerEvidence: {} }) };
+  await processPaymentJob(runtime, job);
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(topup.id).status, 'REVIEW');
+  assert.equal(fixture.db.prepare("SELECT state FROM manual_reviews WHERE subject_type='TOPUP' AND subject_id=?").get(topup.id).state, 'OPEN');
+});
+
+test('payment worker credits verified success and fails only explicit terminal voucher outcomes', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  configureReceiverPhone(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { phone: '0912345678', actorId: 'owner' });
+  const success = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'payment-success',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=9123456789abcdef0123456789abcdef01' }).topup;
+  await processPaymentJob({ db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret }, abortController: new AbortController(),
+    paymentProvider: async () => ({ outcome: 'SUCCESS', currency: 'THB', amountCents: 250, providerTransactionId: 'payment-success-id', providerEvidence: { httpStatus: 200 } }) }, claimDueJob(fixture.db));
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(success.id).status, 'CREDITED');
+  const rejected = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'payment-reject',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=a123456789abcdef0123456789abcdef01' }).topup;
+  await processPaymentJob({ db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret }, abortController: new AbortController(),
+    paymentProvider: async () => ({ outcome: 'DEFINITE_FAILURE', reason: 'VOUCHER_EXPIRED', httpStatus: 400, providerEvidence: {} }) }, claimDueJob(fixture.db));
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(rejected.id).status, 'FAILED');
+});
+
+test('operational review releases once or captures only with explicit verification', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const now = Date.now();
+  appendWalletTransaction(fixture.db, { discordUserId: 'review-buyer', transactionType: 'TOPUP', availableDeltaCents: 500,
+    referenceType: 'TEST', referenceId: 'review-fund', idempotencyKey: 'review-fund', traceId: randomUUID() });
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?)`).run('reviewable', 'Review', 'TYPE', 'https://discord.com/quests/reviewable', 'CUSTOMER', now, now, now);
+  const order = createOrder(fixture.db, { discordUserId: 'review-buyer', questAccountId: 'review-account', traceId: randomUUID(),
+    items: [{ questId: 'reviewable', priceCents: 300 }] });
+  const item = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(order.id);
+  settleOrderItem(fixture.db, { itemId: item.id, outcome: 'REVIEW', reason: 'AMBIGUOUS' });
+  const review = fixture.db.prepare("SELECT * FROM manual_reviews WHERE subject_id=? AND state='OPEN'").get(item.id);
+  assert.throws(() => resolveOrderItemReview(fixture.db, { reviewId: review.id, actorId: 'owner', decision: 'CAPTURE' }),
+    (error) => error.code === 'REVIEW_EVIDENCE_INCOMPLETE');
+  assert.equal(resolveOrderItemReview(fixture.db, { reviewId: review.id, actorId: 'owner', decision: 'RELEASE' }).item.state, 'FAILED');
+  assert.equal(resolveOrderItemReview(fixture.db, { reviewId: review.id, actorId: 'owner', decision: 'RELEASE' }).idempotent, true);
+});
+
+test('server-side interaction sessions bind actor, location, message, operation and one-time use', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const id = createInteractionSession(fixture.db, { actorId: 'admin', guildId: 'guild', channelId: 'channel', operation: 'TEST', payload: { ok: true } });
+  assert.equal(bindInteractionSessionMessage(fixture.db, { sessionId: id, messageId: 'message' }), true);
+  assert.throws(() => consumeInteractionSession(fixture.db, { sessionId: id, actorId: 'other', guildId: 'guild', channelId: 'channel', messageId: 'message', operation: 'TEST' }),
+    (error) => error.code === 'INTERACTION_CONTEXT_INVALID');
+  assert.equal(consumeInteractionSession(fixture.db, { sessionId: id, actorId: 'admin', guildId: 'guild', channelId: 'channel', messageId: 'message', operation: 'TEST' }).payload.ok, true);
+  assert.throws(() => consumeInteractionSession(fixture.db, { sessionId: id, actorId: 'admin', guildId: 'guild', channelId: 'channel', messageId: 'message', operation: 'TEST' }),
+    (error) => error.code === 'INTERACTION_EXPIRED');
+});
+
+test('surface permission errors do not create a replacement durable anchor', async () => {
+  let sent = 0;
+  const channel = { messages: { fetch: async () => new Map() }, send: async () => { sent += 1; return { id: 'new' }; } };
+  const existing = { edit: async () => { throw Object.assign(new Error('forbidden'), { status: 403 }); } };
+  await assert.rejects(() => updateOrCreateSurfaceAnchor(channel, 'ADMIN_PANEL', {}, existing), (error) => Number(error.status) === 403);
+  assert.equal(sent, 0);
+});
+
+test('surface reconciliation paginates nonce markers, supports legacy footer once, and replaces only confirmed deletion', async () => {
+  const pageOne = new Map(Array.from({ length: 100 }, (_, index) => [`p${index}`, { id: `p${index}` }]));
+  const nonceMessage = { id: 'nonce-anchor', nonce: surfaceNonce('ADMIN_PANEL'), edit: async () => nonceMessage };
+  let pages = 0;
+  const paginated = { messages: { fetch: async () => (++pages === 1 ? pageOne : new Map([['nonce', nonceMessage]])) },
+    send: async () => { throw new Error('must find nonce'); } };
+  assert.equal((await updateOrCreateSurfaceAnchor(paginated, 'ADMIN_PANEL', {})).message.id, 'nonce-anchor');
+  assert.equal(pages, 2);
+
+  const legacyMessage = { id: 'legacy-anchor', embeds: [{ footer: { text: 'Questshop Surface • ADMIN_PANEL' } }], edit: async () => legacyMessage };
+  const legacy = { messages: { fetch: async () => new Map([['legacy', legacyMessage]]) }, send: async () => { throw new Error('must migrate footer'); } };
+  assert.equal((await updateOrCreateSurfaceAnchor(legacy, 'ADMIN_PANEL', {})).message.id, 'legacy-anchor');
+
+  let replacements = 0;
+  const deleted = { edit: async () => { throw Object.assign(new Error('gone'), { status: 404, code: 10008 }); } };
+  const replacementChannel = { messages: { fetch: async () => new Map() }, send: async () => ({ id: `replacement-${++replacements}` }) };
+  assert.equal((await updateOrCreateSurfaceAnchor(replacementChannel, 'ADMIN_PANEL', {}, deleted)).recreated, true);
+  assert.equal(replacements, 1);
+  const timeout = { edit: async () => { throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }); } };
+  await assert.rejects(() => updateOrCreateSurfaceAnchor(replacementChannel, 'ADMIN_PANEL', {}, timeout), /timeout/);
+  assert.equal(replacements, 1);
+});
+
+test('setup moves one durable anchor and rejects overlapping setup for the same surface', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  let retired = 0; let resolveSend;
+  const oldMessage = { id: 'old-anchor', edit: async () => { retired += 1; return oldMessage; } };
+  const oldChannel = { id: 'old-channel', isTextBased: () => true, messages: { fetch: async () => oldMessage } };
+  const newMessage = { id: 'new-anchor', edit: async () => newMessage };
+  const newChannel = { id: 'new-channel', isTextBased: () => true, messages: { fetch: async () => new Map() },
+    send: async () => new Promise((resolve) => { resolveSend = () => resolve(newMessage); }) };
+  const runtime = { db: fixture.db, config: { surfaces: { ADMIN_PANEL: { channelId: 'old-channel', messageId: 'old-anchor' } } },
+    client: { channels: { fetch: async () => oldChannel } } };
+  const first = setupSurface({ channel: newChannel, surfaceKey: 'ADMIN_PANEL', runtime, actorId: 'owner' });
+  await nextTurn();
+  await assert.rejects(() => setupSurface({ channel: newChannel, surfaceKey: 'ADMIN_PANEL', runtime, actorId: 'owner' }),
+    (error) => error.code === 'SURFACE_SETUP_IN_PROGRESS');
+  resolveSend();
+  assert.equal((await first).message.id, 'new-anchor');
+  assert.equal(retired, 1);
+  assert.deepEqual(JSON.parse(fixture.db.prepare("SELECT value_json FROM settings WHERE key='discord_surfaces'").get().value_json).ADMIN_PANEL.channelId, 'new-channel');
+});
+
+test('SQLite Admin services configure price, receiver, monitor, promotion and audited wallet adjustment', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  for (const taskType of ['PLAY_ON_DESKTOP', 'PLAY_ON_DESKTOP_V2', 'WATCH_VIDEO', 'WATCH_VIDEO_ON_MOBILE']) {
+    setQuestPrice(fixture.db, { taskType, amountCents: 500, actorId: 'admin', reason: 'UAT' });
+  }
+  assert.deepEqual(loadRuntimeConfig(fixture.db).priceRange, { minCents: 500, maxCents: 500 });
+  assert.equal(configureReceiverPhone(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { phone: '0912345678', actorId: 'admin' }).last4, '5678');
+  assert.equal(upsertMonitorAccount(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { accountId: '12345678901234567', label: 'Monitor A', token: 'monitor-token', actorId: 'admin' }).state, 'ACTIVE');
+  assert.equal(upsertPromotion(fixture.db, { name: 'โบนัส', state: 'ACTIVE', minimumCents: 100, basisPoints: 500, actorId: 'admin' }).state, 'ACTIVE');
+  const movement = adjustWallet(fixture.db, { discordUserId: '12345678901234567', availableDeltaCents: 700, actorId: 'admin', reason: 'UAT funding' });
+  assert.equal(Number(movement.wallet.available_cents), 700);
+  assert.deepEqual(adminOverview(fixture.db), { openReviews: 0, pendingJobs: 0, deadLetters: 0, activeMonitors: 1, receiverConfigured: true });
+  assert.equal(fixture.db.prepare("SELECT count(*) AS count FROM admin_audit WHERE action IN ('PRICE_UPDATED','RECEIVER_UPDATED','MONITOR_UPDATED','PROMOTION_UPDATED','WALLET_ADJUSTMENT')").get().count >= 8, true);
+});
+
+test('Quest Auto and public Quest announcement render stored Thai metadata without internal identifiers', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const now = Date.now();
+  for (const taskType of ['PLAY_ON_DESKTOP', 'PLAY_ON_DESKTOP_V2', 'WATCH_VIDEO', 'WATCH_VIDEO_ON_MOBILE']) {
+    setQuestPrice(fixture.db, { taskType, amountCents: 500, actorId: 'admin' });
+  }
+  const storefront = renderQuestAuto(loadRuntimeConfig(fixture.db));
+  assert.match(storefront.embeds[0].data.description, /5 บาท/);
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,thumbnail_url,starts_at,expires_at,target_value,orb_min,orb_max,source,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run('internal-quest-id', 'Quest สาธารณะ', 'WATCH_VIDEO', 'https://discord.com/quests/public',
+    'https://cdn.discordapp.com/thumb.png', now, now + 60_000, 120, 10, 20, 'CUSTOMER', now, now, now);
+  const notification = enqueueNotification(fixture.db, { notificationType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: 'internal-quest-id', destination: 'QUEST_NEW' });
+  const payload = await renderSqliteNotification({ db: fixture.db, client: {} }, notification);
+  const data = payload.embeds[0].data;
+  assert.match(data.description, /ประเภท: ดูวิดีโอ/);
+  assert.match(data.description, /10-20 Discord Orbs/);
+  assert.doesNotMatch(data.description, /internal-quest-id/);
+});
+
+test('notification delivery reuses a nonce-matched message after an uncertain checkpoint', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const pending = enqueueNotification(fixture.db, { notificationType: 'SYSTEM_LOG', aggregateType: 'SYSTEM', aggregateId: 'incident', destination: 'LOG_SYSTEM', payload: { code: 'X' } });
+  const notification = claimDueNotification(fixture.db);
+  let sends = 0; let edits = 0;
+  const existing = { id: 'existing-message', nonce: notification.nonce, edit: async () => { edits += 1; return existing; } };
+  const channel = { isTextBased: () => true, messages: { fetch: async () => new Map([[existing.id, existing]]) }, send: async () => { sends += 1; return { id: 'new-message' }; } };
+  await deliverNotification({ db: fixture.db, config: { surfaces: { LOG_SYSTEM: { channelId: 'channel' } } }, client: { channels: { fetch: async () => channel } } }, notification);
+  assert.deepEqual([edits, sends], [1, 0]);
+  assert.equal(fixture.db.prepare('SELECT state,message_id FROM notifications WHERE id=?').get(pending.id).message_id, 'existing-message');
+});
+
+test('health becomes degraded when a runtime component fails and recovers only with ready checks', () => {
+  const health = { ready: true, checks: { database: 'OK', discord: 'OK' } };
+  assert.equal(recomputeHealthStatus({ health }), 'HEALTHY');
+  health.checks.database = 'DEGRADED';
+  assert.equal(recomputeHealthStatus({ health }), 'DEGRADED');
+  health.ready = false;
+  assert.equal(recomputeHealthStatus({ health }), 'NOT_READY');
+});
+
+test('notification renderers cover customer, payment, order, operations and admin projections', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const client = { users: { fetch: async (id) => ({ displayAvatarURL: () => `https://cdn.discordapp.com/${id}.png` }) } };
+  const topup = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'render-user',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=8123456789abcdef0123456789abcdef01' }).topup;
+  creditVerifiedTopup(fixture.db, { topupId: topup.id, principalCents: 500 });
+  const topupNotification = fixture.db.prepare("SELECT * FROM notifications WHERE notification_type='TOPUP_STATUS_DM' AND aggregate_id=?").get(topup.id);
+  assert.equal((await renderSqliteNotification({ db: fixture.db, client }, topupNotification)).embeds.length, 1);
+  const paymentLog = fixture.db.prepare("SELECT * FROM notifications WHERE notification_type='PAYMENT_LOG' AND aggregate_id=?").get(topup.id);
+  assert.equal((await renderSqliteNotification({ db: fixture.db, client }, paymentLog)).files.length, 1);
+
+  appendWalletTransaction(fixture.db, { discordUserId: 'render-buyer', transactionType: 'TOPUP', availableDeltaCents: 600,
+    referenceType: 'TEST', referenceId: 'render-fund', idempotencyKey: 'render-fund', traceId: randomUUID() });
+  const now = Date.now();
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?)`).run('render-quest', 'Render Quest', 'WATCH_VIDEO', 'https://discord.com/quests/render', 'CUSTOMER', now, now, now);
+  const order = createOrder(fixture.db, { discordUserId: 'render-buyer', questAccountId: 'render-account', traceId: randomUUID(), items: [{ questId: 'render-quest', priceCents: 500 }] });
+  const item = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(order.id);
+  settleOrderItem(fixture.db, { itemId: item.id, outcome: 'SUCCESS', verified: true, claimUrl: 'https://discord.com/quests/render' });
+  const orderNotification = fixture.db.prepare("SELECT * FROM notifications WHERE notification_type='ORDER_STATUS_DM' AND aggregate_id=?").get(order.id);
+  assert.equal((await renderSqliteNotification({ db: fixture.db, client, config: { surfaces: {} }, env: { DISCORD_GUILD_ID: 'guild' } }, orderNotification)).components.length, 1);
+  const operationNotification = fixture.db.prepare("SELECT * FROM notifications WHERE notification_type='QUEST_OPERATION_LOG' AND aggregate_id=?").get(item.id);
+  assert.equal((await renderSqliteNotification({ db: fixture.db, client }, operationNotification)).embeds.length, 1);
+  adjustWallet(fixture.db, { discordUserId: '12345678901234567', availableDeltaCents: 1, actorId: 'admin', reason: 'render audit' });
+  const auditNotification = fixture.db.prepare("SELECT * FROM notifications WHERE notification_type='ADMIN_LOG' ORDER BY created_at DESC LIMIT 1").get();
+  assert.equal((await renderSqliteNotification({ db: fixture.db, client }, auditNotification)).embeds.length, 1);
+});
+
+test('custom IDs and payload normalization protect transport boundaries', () => {
+  const id = customId('checkout_open');
+  assert.equal(parseCustomId(id).route, 'checkout_open');
+  assert.equal(parseCustomId('bad'), null);
+  const normalized = normalizeDiscordPayload({ content: '@everyone', allowedMentions: { parse: ['everyone'] }, embeds: [{ title: 'x', description: 'y' }] });
+  assert.equal(normalized.allowedMentions.parse.length, 0);
+  assert.match(normalized.content, /@\u200beveryone/);
 });
 
 test('job checkpoints recover safe reads and quarantine possibly sent mutations', async (t) => {
@@ -400,6 +667,27 @@ test('notification delivery preserves a newer desired version', async (t) => {
   assert.equal(Number(done.desired_version), 2);
 });
 
+test('a notification worker does not publish after its desired revision is superseded', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const notification = enqueueNotification(fixture.db, { notificationType: 'SYSTEM_LOG', aggregateType: 'SYSTEM', aggregateId: 'stale-worker', destination: 'LOG_SYSTEM' });
+  const sending = claimDueNotification(fixture.db);
+  let sent = 0;
+  const channel = {
+    isTextBased: () => true,
+    messages: { fetch: async () => {
+      enqueueNotification(fixture.db, { notificationType: 'SYSTEM_LOG', aggregateType: 'SYSTEM', aggregateId: 'stale-worker', destination: 'LOG_SYSTEM', payload: { revision: 2 } });
+      return new Map();
+    } },
+    send: async () => { sent += 1; return { id: 'must-not-send' }; },
+  };
+  await deliverNotification({ db: fixture.db, config: { surfaces: { LOG_SYSTEM: { channelId: 'system-channel' } } },
+    client: { channels: { fetch: async () => channel } } }, sending);
+  const updated = fixture.db.prepare('SELECT * FROM notifications WHERE id=?').get(notification.id);
+  assert.equal(sent, 0);
+  assert.equal(updated.state, 'PENDING');
+  assert.equal(Number(updated.desired_version), 2);
+});
+
 test('online backup is verified and database files are owner-only', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const destination = await createRotatedSqliteBackup(fixture.db, fixture.databasePath, { kind: 'daily', keep: 7 });
@@ -449,4 +737,193 @@ test('failure paths retain money safely and notification retries reach the finan
   assert.equal(percentageBonusHalfUp(101, 500), 5n);
   assert.equal(parseBahtToCents('10'), 1000n);
   assert.throws(() => parseBahtToCents('-1'));
+});
+
+test('payment worker distinguishes retry, terminal rejection, and definitely-unsent failures', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  configureReceiverPhone(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { phone: '0912345678', actorId: 'admin' });
+  const runtime = (outcome) => ({ db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret }, abortController: new AbortController(),
+    paymentProvider: async () => outcome });
+  const submit = (suffix) => submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: `worker-${suffix}`,
+    voucherUrl: `https://gift.truemoney.com/campaign/?v=${suffix}23456789abcdef0123456789abcdef01` }).topup;
+
+  const waiting = submit('a');
+  await processPaymentJob(runtime({ outcome: 'AMBIGUOUS', reason: 'TEMPORARY', providerEvidence: { retry: true } }), claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' }));
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE subject_id=?').get(waiting.id).state, 'REVIEW');
+
+  const rejected = submit('b');
+  await processPaymentJob(runtime({ outcome: 'DEFINITE_FAILURE', reason: 'VOUCHER_EXPIRED', providerEvidence: {} }), claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' }));
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(rejected.id).status, 'FAILED');
+
+  const notSent = submit('c');
+  const error = Object.assign(new Error('before dispatch'), { code: 'PROVIDER_NOT_SENT' });
+  await processPaymentJob({ ...runtime(null), paymentProvider: async () => { throw error; } }, claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' }));
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(notSent.id).status, 'PROCESSING');
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE subject_id=?').get(notSent.id).state, 'RETRY_WAIT');
+});
+
+test('Admin can queue private Monitor Scan + Test and retry a durable DLQ nonce', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const now = Date.now();
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,expires_at,source,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run('scan-quest', 'Scan Quest', 'WATCH_VIDEO', 'https://discord.com/quests/scan', now + 60_000, 'CUSTOMER', now, now, now);
+  assert.equal(queueMonitorScanAndTest(fixture.db, { actorId: 'admin' }).queued, 1);
+  assert.equal(queueMonitorScanAndTest(fixture.db, { actorId: 'admin', questId: 'scan-quest' }).queued, 0);
+  assert.throws(() => queueMonitorScanAndTest(fixture.db, { actorId: 'admin', questId: 'missing' }), (error) => error.code === 'QUEST_NOT_FOUND');
+  const notification = enqueueNotification(fixture.db, { notificationType: 'SYSTEM_LOG', aggregateType: 'SYSTEM', aggregateId: 'dlq-test', destination: 'LOG_SYSTEM' });
+  fixture.db.prepare("UPDATE notifications SET state='DEAD_LETTER',attempt_count=7 WHERE id=?").run(notification.id);
+  assert.equal(retryDeadLetterNotification(fixture.db, { notificationId: notification.id }).state, 'PENDING');
+  fixture.db.prepare("UPDATE notifications SET state='DEAD_LETTER',attempt_count=7 WHERE id=?").run(notification.id);
+  assert.equal(retryNotificationDlq(fixture.db, { notificationId: notification.id, actorId: 'admin' }).state, 'PENDING');
+  assert.throws(() => retryNotificationDlq(fixture.db, { notificationId: 'missing', actorId: 'admin' }), (error) => error.code === 'DLQ_NOT_FOUND');
+});
+
+test('payload normalization bounds embeds, components, URLs, options, and explicit mentions', () => {
+  const normalized = normalizeDiscordPayload({
+    content: '<@12345678901234567> <@&99999999999999999> @everyone',
+    allowedMentions: { roles: ['99999999999999999', 'bad'], users: ['12345678901234567'] }, nonce: 'x'.repeat(40),
+    embeds: [{ title: 'x'.repeat(300), description: 'y'.repeat(4_200), footer: { text: 'z'.repeat(1_100) },
+      author: { name: 'a'.repeat(300) }, fields: Array.from({ length: 30 }, () => ({ name: 'n'.repeat(300), value: 'v'.repeat(1_100) })) }],
+    components: [{ components: [{ custom_id: 'i'.repeat(120), label: 'l'.repeat(100), url: 'http://not-allowed' },
+      { custom_id: 'good', label: 'good', url: 'https://discord.com/ok' }], options: Array.from({ length: 30 }, () => ({ label: 'o'.repeat(120), description: 'd'.repeat(120) })) }],
+  });
+  assert.equal(normalized.nonce.length, 25);
+  assert.equal(normalized.embeds[0].fields.length, 25);
+  assert.equal(normalized.components[0].components.length, 1);
+  assert.equal(normalized.allowedMentions.roles.length, 1);
+  assert.match(normalized.content, /@\u200beveryone/);
+});
+
+test('notification projections cover failed payments, order links, private Monitor cases, admin, and system variants', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const now = Date.now();
+  const client = { users: { fetch: async () => { throw new Error('avatar unavailable'); } } };
+  const failedTopup = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: '12345678901234567',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=d23456789abcdef0123456789abcdef01' }).topup;
+  markTopupProcessing(fixture.db, failedTopup.id); failTopup(fixture.db, { topupId: failedTopup.id, reasonCode: 'VOUCHER_EXPIRED' });
+  const failedDm = fixture.db.prepare("SELECT * FROM notifications WHERE notification_type='TOPUP_STATUS_DM' AND aggregate_id=?").get(failedTopup.id);
+  const failedLog = fixture.db.prepare("SELECT * FROM notifications WHERE notification_type='PAYMENT_LOG' AND aggregate_id=?").get(failedTopup.id);
+  assert.match((await renderSqliteNotification({ db: fixture.db, client }, failedDm)).embeds[0].data.title, /ไม่สำเร็จ/);
+  assert.equal((await renderSqliteNotification({ db: fixture.db, client }, failedLog)).files.length, 1);
+
+  appendWalletTransaction(fixture.db, { discordUserId: 'projection-buyer', transactionType: 'TOPUP', availableDeltaCents: 900,
+    referenceType: 'TEST', referenceId: 'projection-fund', idempotencyKey: 'projection-fund', traceId: randomUUID() });
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,orbs,source,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run('projection-quest', 'Quest @projection', 'PLAY_ON_DESKTOP', 'https://discord.com/quests/projection', 15, 'CUSTOMER', now, now, now);
+  const order = createOrder(fixture.db, { discordUserId: 'projection-buyer', questAccountId: 'projection-account', traceId: randomUUID(),
+    items: [{ questId: 'projection-quest', priceCents: 500 }] });
+  const item = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(order.id);
+  settleOrderItem(fixture.db, { itemId: item.id, outcome: 'SUCCESS', verified: true, claimUrl: 'https://discord.com/quests/projection' });
+  const history = fixture.db.prepare("SELECT * FROM notifications WHERE notification_type='QUEST_HISTORY' AND aggregate_id=?").get(order.id);
+  fixture.db.prepare("UPDATE notifications SET message_id='history-message' WHERE id=?").run(history.id);
+  const orderDm = fixture.db.prepare("SELECT * FROM notifications WHERE notification_type='ORDER_STATUS_DM' AND aggregate_id=?").get(order.id);
+  assert.equal((await renderSqliteNotification({ db: fixture.db, client, config: { surfaces: { QUEST_HISTORY: { channelId: 'history-channel' } } },
+    env: { DISCORD_GUILD_ID: 'guild' } }, orderDm)).components[0].components.length, 2);
+
+  fixture.db.prepare("UPDATE quests SET monitor_status='FOUND_READY',artwork_url='not-a-url' WHERE quest_id='projection-quest'").run();
+  const caseNotification = enqueueNotification(fixture.db, { notificationType: 'CUSTOMER_QUEST_DISCOVERY', aggregateType: 'QUEST',
+    aggregateId: 'projection-quest', destination: 'LOG_QUEST_OPERATIONS', payload: { discordUserId: '12345678901234567' } });
+  assert.equal((await renderSqliteNotification({ db: fixture.db, client }, caseNotification)).components.length, 1);
+
+  const auditId = randomUUID();
+  fixture.db.prepare(`INSERT INTO admin_audit(id,actor_id,action,target_type,target_id,reason,before_json,after_json,trace_id,created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?)`).run(auditId, 'SYSTEM', 'FEATURE_GATE_CHANGE', 'FEATURE_GATE', 'STORE_OPEN', 'test',
+    JSON.stringify({ gate: 'STORE_OPEN', enabled: false }), JSON.stringify({ gate: 'STORE_OPEN', enabled: true }), randomUUID(), now);
+  const audit = enqueueNotification(fixture.db, { notificationType: 'ADMIN_LOG', aggregateType: 'ADMIN_AUDIT', aggregateId: auditId, destination: 'LOG_ADMIN' });
+  assert.equal((await renderSqliteNotification({ db: fixture.db, client }, audit)).files.length, 2);
+  const system = enqueueNotification(fixture.db, { notificationType: 'SYSTEM_LOG', aggregateType: 'SYSTEM', aggregateId: 'system-case', destination: 'LOG_SYSTEM',
+    payload: { code: 'SQLITE_INTEGRITY_FAILED', scope: 'DATABASE', resolved: true, occurrenceCount: 2, lastSeenAt: now } });
+  assert.equal((await renderSqliteNotification({ db: fixture.db, client }, system)).files.length, 2);
+
+  const announcement = enqueueNotification(fixture.db, { notificationType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: 'projection-quest', destination: 'QUEST_NEW' });
+  const announcementPayload = await renderSqliteNotification({ db: fixture.db, client }, announcement);
+  assert.match(announcementPayload.embeds[0].data.description, /15 Discord Orbs/);
+});
+
+test('notification delivery edits checkpointed messages, replaces only confirmed 404s, and retries permission failures', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const baseRuntime = (channel) => ({ db: fixture.db, config: { surfaces: { LOG_SYSTEM: { channelId: 'system-channel' } } },
+    client: { channels: { fetch: async () => channel } } });
+  const editMessage = { id: 'checkpointed', edit: async () => editMessage };
+  const editChannel = { isTextBased: () => true, messages: { fetch: async (value) => (typeof value === 'string' ? editMessage : new Map()) },
+    send: async () => { throw new Error('must not send'); } };
+  const edited = enqueueNotification(fixture.db, { notificationType: 'SYSTEM_LOG', aggregateType: 'SYSTEM', aggregateId: 'edit-checkpoint', destination: 'LOG_SYSTEM' });
+  fixture.db.prepare("UPDATE notifications SET message_id='checkpointed' WHERE id=?").run(edited.id);
+  await deliverNotification(baseRuntime(editChannel), claimDueNotification(fixture.db));
+  assert.equal(fixture.db.prepare('SELECT state FROM notifications WHERE id=?').get(edited.id).state, 'DELIVERED');
+
+  let sent = 0;
+  const recreateChannel = { isTextBased: () => true, messages: { fetch: async (value) => {
+    if (typeof value === 'string') throw Object.assign(new Error('unknown message'), { status: 404, code: 10008 });
+    return new Map();
+  } }, send: async () => { sent += 1; return { id: 'replacement', edit: async () => null }; } };
+  const missing = enqueueNotification(fixture.db, { notificationType: 'SYSTEM_LOG', aggregateType: 'SYSTEM', aggregateId: 'missing-checkpoint', destination: 'LOG_SYSTEM' });
+  fixture.db.prepare("UPDATE notifications SET message_id='missing-message' WHERE id=?").run(missing.id);
+  await deliverNotification(baseRuntime(recreateChannel), claimDueNotification(fixture.db));
+  assert.equal(sent, 1);
+
+  const forbiddenChannel = { isTextBased: () => true, messages: { fetch: async () => { throw Object.assign(new Error('forbidden'), { status: 403 }); } },
+    send: async () => { throw new Error('must not send after 403'); } };
+  const forbidden = enqueueNotification(fixture.db, { notificationType: 'SYSTEM_LOG', aggregateType: 'SYSTEM', aggregateId: 'forbidden-checkpoint', destination: 'LOG_SYSTEM' });
+  fixture.db.prepare("UPDATE notifications SET message_id='forbidden-message' WHERE id=?").run(forbidden.id);
+  await deliverNotification(baseRuntime(forbiddenChannel), claimDueNotification(fixture.db));
+  assert.equal(fixture.db.prepare('SELECT state FROM notifications WHERE id=?').get(forbidden.id).state, 'RETRY_WAIT');
+});
+
+test('payment worker moves missing settlement credentials to review without external redemption', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const topup = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'no-receiver',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=e23456789abcdef0123456789abcdef01' }).topup;
+  await processPaymentJob({ db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret }, abortController: new AbortController() },
+    claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' }));
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(topup.id).status, 'REVIEW');
+  assert.equal(fixture.db.prepare("SELECT state FROM manual_reviews WHERE subject_id=? AND subject_type='TOPUP'").get(topup.id).state, 'OPEN');
+});
+
+test('Quest executor contracts validate unsupported, invalid, and verified video paths', async () => {
+  assert.throws(() => assertQuestExecutorContract({}), /non-empty id/);
+  assert.throws(() => defineQuestExecutor({ id: 'broken', supportsAutomaticProgress: true }), /missing matches/);
+  assert.equal(selectQuestExecutor({ eventName: 'UNKNOWN' }).id, 'unknown');
+  assert.equal(selectQuestExecutor({ eventName: 'WATCH_VIDEO' }).id, 'video');
+  assert.equal(selectQuestExecutor({ eventName: 'WATCH_VIDEO', autoSupported: false }).id, 'unsupported');
+  assert.equal(listExecutorCapabilities().some((entry) => entry.id === 'video'), true);
+  assert.equal(nextVideoTimestamp(0, 10, Number.NaN), 1);
+  assert.equal(nextVideoTimestamp(0, 10, Date.now() - 30_000, Date.now()), 10);
+  await assert.rejects(executeQuestExecutor(videoExecutor, { quest: { id: 'q', secondsNeeded: 0 } }), /invalid target/);
+  const executor = defineQuestExecutor({ id: 'verified', supportsAutomaticProgress: true, matches: () => true,
+    validate: () => true, estimateDuration: () => 0, execute: async () => ({ done: true }), verify: async () => true, describeUnsupportedReason: () => null });
+  assert.deepEqual(await executeQuestExecutor(executor, { quest: {} }), { executionResult: { done: true }, verified: true });
+});
+
+test('desktop executor verifies progressing and terminal-heartbeat Quest states', async () => {
+  assert.equal(desktopExecutor.matches('PLAY_ON_DESKTOP'), true);
+  assert.equal(desktopExecutor.matches({ eventName: 'OTHER' }), false);
+  assert.equal(desktopExecutor.estimateDuration({ secondsNeeded: 0, progressSecs: 2 }), 0);
+  assert.deepEqual(desktopExecutor.validate({}), { ok: false, issues: ['missing id'] });
+  await assert.rejects(executeQuestExecutor(desktopExecutor, { quest: { id: 'bad', secondsNeeded: 0 } }), /invalid target/);
+  let first = true;
+  const progressing = { id: 'desktop-1', eventName: 'PLAY_ON_DESKTOP', progressSecs: 0, secondsNeeded: 1, completed: false, applicationId: 'app' };
+  const context = { quest: progressing, signal: new AbortController().signal, now: Date.now, sleep: async () => {},
+    mutate: async (_kind, _evidence, send) => send(), api: { sendHeartbeat: async () => {} },
+    fetchFreshQuest: async () => ({ ...progressing, progressSecs: 1, completed: first ? (first = false, true) : true }), onServerProgress: async () => {} };
+  assert.equal((await executeQuestExecutor(desktopExecutor, context)).verified, true);
+  const terminal = { ...context, quest: { id: 'desktop-2', eventName: 'PLAY_ON_DESKTOP_V2', progressSecs: 1, secondsNeeded: 1, completed: false },
+    fetchFreshQuest: async () => ({ id: 'desktop-2', completed: true, progressSecs: 1 }) };
+  assert.equal((await executeQuestExecutor(desktopExecutor, terminal)).verified, true);
+  const stalled = { ...context, quest: { id: 'desktop-stalled', eventName: 'PLAY_ON_DESKTOP', progressSecs: 0, secondsNeeded: 1, completed: false, applicationId: 'app' },
+    fetchFreshQuest: async () => ({ id: 'desktop-stalled', progressSecs: 0, secondsNeeded: 1, completed: false, applicationId: 'app' }) };
+  await assert.rejects(executeQuestExecutor(desktopExecutor, stalled), /did not confirm desktop progress/);
+});
+
+test('video executor reports server progress and confirms completion', async () => {
+  assert.equal(videoExecutor.matches('WATCH_VIDEO_ON_MOBILE'), true);
+  assert.equal(videoExecutor.matches({ eventName: 'OTHER' }), false);
+  assert.equal(videoExecutor.estimateDuration({ secondsNeeded: 10, progressSecs: 20 }), 0);
+  assert.deepEqual(videoExecutor.validate({}), { ok: false, issues: ['missing id'] });
+  const quest = { id: 'video-1', eventName: 'WATCH_VIDEO', progressSecs: 0, secondsNeeded: 1, completed: false };
+  let progress = 0;
+  const result = await executeQuestExecutor(videoExecutor, { quest, signal: new AbortController().signal, now: Date.now, sleep: async () => {},
+    mutate: async (_kind, _evidence, send) => send(), api: { sendVideoProgress: async () => {} },
+    fetchFreshQuest: async () => ({ ...quest, progressSecs: ++progress, completed: true }), onServerProgress: async () => {} });
+  assert.equal(result.verified, true);
 });
