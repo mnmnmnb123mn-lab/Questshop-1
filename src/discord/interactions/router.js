@@ -17,7 +17,7 @@ import { loadRuntimeConfig } from '../../config/runtime-config.js';
 import { adjustWallet, adminOverview, configureReceiverPhone, confirmFinancialReview, listOpenManualReviews, queueMonitorScanAndTest, resolveOperationalReview, retryNotificationDlq, setQuestPrice, upsertMonitorAccount, upsertPromotion } from '../../domain/sqlite/admin.js';
 import { changeFeatureGate } from '../../domain/sqlite/admin.js';
 import { supportedTaskTypes } from '../../domain/sqlite/pricing.js';
-import { bindInteractionSessionMessage, consumeInteractionSession, createInteractionSession } from '../../domain/sqlite/interaction-sessions.js';
+import { bindInteractionSessionMessage, consumeInteractionSession, consumeModalInteractionSession, createInteractionSession } from '../../domain/sqlite/interaction-sessions.js';
 import { ADMIN, CUSTOMER, routeContract } from './contracts.js';
 
 function ephemeral(content) { return { content, ephemeral: true, allowedMentions: { parse: [] } }; }
@@ -38,6 +38,12 @@ function consumeAdminSession(interaction, runtime, sessionId, operation) {
   assertBackoffice(interaction, runtime);
   return consumeInteractionSession(runtime.db, { sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
     channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation });
+}
+
+function consumeAdminModalSession(interaction, runtime, sessionId, operation) {
+  assertBackoffice(interaction, runtime);
+  return consumeModalInteractionSession(runtime.db, { sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, operation });
 }
 
 function adminOverviewEmbed(runtime) {
@@ -164,6 +170,11 @@ function assertBackoffice(interaction, runtime) {
   throw new QuestshopError('NOT_AUTHORIZED', 'เมนูนี้ใช้ได้เฉพาะผู้ดูแล');
 }
 
+function assertOwner(interaction, runtime) {
+  if (interaction.user.id === runtime.env.OWNER_ID) return;
+  throw new QuestshopError('NOT_AUTHORIZED', 'การตัดสินใจทางการเงินขั้นสุดท้ายใช้ได้เฉพาะ Owner');
+}
+
 function assertCustomerRoute(interaction, runtime, gate) {
   const gates = currentFeatureGates(runtime.db);
   if (!gates.STORE_OPEN || !gates.CUSTOMER_INTERACTIONS_ENABLED || !gates[gate]) {
@@ -201,26 +212,26 @@ function assertRouteContract(interaction, runtime, route) {
   return contract;
 }
 
-function voucherModal() {
+function voucherModal(sessionId) {
   const input = new TextInputBuilder().setCustomId('url').setLabel('ลิงก์ซอง TrueMoney')
     .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(512)
     .setPlaceholder('https://gift.truemoney.com/campaign/?v=...');
-  return new ModalBuilder().setCustomId(customId('voucher_submit')).setTitle('เติมเงิน TrueMoney')
+  return new ModalBuilder().setCustomId(customId('voucher_submit', sessionId)).setTitle('เติมเงิน TrueMoney')
     .addComponents(new ActionRowBuilder().addComponents(input));
 }
 
-function tokenModal() {
+function tokenModal(sessionId) {
   const input = new TextInputBuilder().setCustomId('token').setLabel('Discord Token')
     .setStyle(TextInputStyle.Paragraph).setRequired(true).setMinLength(20).setMaxLength(300)
     .setPlaceholder('Token ใช้เฉพาะการตรวจ Quest และจะถูกลบตามกำหนด');
-  return new ModalBuilder().setCustomId(customId('token_submit')).setTitle('เริ่มทำ Quest')
+  return new ModalBuilder().setCustomId(customId('token_submit', sessionId)).setTitle('เริ่มทำ Quest')
     .addComponents(new ActionRowBuilder().addComponents(input));
 }
 
 async function handleSurfaceCommand(interaction, runtime) {
   const surfaceKey = SURFACE_COMMANDS[interaction.commandName];
   if (!surfaceKey) return false;
-  assertBackoffice(interaction, runtime);
+  if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('NOT_AUTHORIZED', 'คำสั่งติดตั้งแผงใช้ได้เฉพาะ Owner');
   await interaction.deferReply({ ephemeral: true });
   const channel = interaction.options.getChannel('channel') ?? interaction.channel;
   const result = await setupSurface({ channel, surfaceKey, runtime, actorId: interaction.user.id });
@@ -266,15 +277,19 @@ function checkoutSession(runtime, interaction, checkoutId) {
 }
 
 function selectedQuests(runtime, payload, selectedIds) {
-  const ids = [...new Set((selectedIds ?? []).map(String))].filter((id) => payload.questIds.includes(id)).slice(0, 25);
+  const ids = [...new Set((selectedIds ?? []).map(String))].filter((id) => payload.questIds.includes(id));
   if (!ids.length) throw new QuestshopError('NO_SELLABLE_QUEST', 'กรุณาเลือก Quest อย่างน้อยหนึ่งรายการ');
+  if (ids.length > 25) throw new QuestshopError('ORDER_ITEM_LIMIT', 'เลือก Quest ได้สูงสุด 25 รายการต่อคำสั่งซื้อ');
   const rows = runtime.db.prepare(`SELECT * FROM quests WHERE quest_id IN (${ids.map(() => '?').join(',')})`).all(...ids);
   if (rows.length !== ids.length) throw new QuestshopError('QUEST_NOT_FOUND', 'Quest ที่เลือกมีการเปลี่ยนแปลง กรุณาเริ่มใหม่');
   const timestamp = nowMs();
   const config = loadRuntimeConfig(runtime.db);
   runtime.config = config;
   return rows.map((quest) => {
-    if (quest.expires_at != null && Number(quest.expires_at) <= timestamp) throw new QuestshopError('QUEST_EXPIRED', 'Quest บางรายการหมดอายุแล้ว');
+    if ((quest.starts_at != null && Number(quest.starts_at) > timestamp)
+      || (quest.expires_at != null && Number(quest.expires_at) <= timestamp)) {
+      throw new QuestshopError('QUEST_UNAVAILABLE', 'Quest บางรายการยังไม่เริ่มหรือหมดอายุแล้ว');
+    }
     const priceCents = priceForQuest(config.values, quest.task_type);
     if (priceCents == null) throw new QuestshopError('PRICE_NOT_CONFIGURED', 'ร้านยังไม่ได้ตั้งราคาสำหรับ Quest บางรายการ');
     return { questId: quest.quest_id, name: quest.name, priceCents };
@@ -291,7 +306,8 @@ function pricedCheckoutQuestRows(runtime, payload) {
   runtime.config = config;
   return ids.map((questId) => {
     const quest = byId.get(questId);
-    if (!quest || (quest.expires_at != null && Number(quest.expires_at) <= timestamp)) return null;
+    if (!quest || (quest.starts_at != null && Number(quest.starts_at) > timestamp)
+      || (quest.expires_at != null && Number(quest.expires_at) <= timestamp)) return null;
     const priceCents = priceForQuest(config.values, quest.task_type);
     return priceCents == null ? null : { ...quest, priceCents };
   }).filter(Boolean);
@@ -315,7 +331,7 @@ function checkoutPagePayload(runtime, checkoutId, payload) {
     components: [new ActionRowBuilder().addComponents(select), new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(customId('checkout_page_previous', checkoutId)).setLabel('ก่อนหน้า').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
       new ButtonBuilder().setCustomId(customId('checkout_page_next', checkoutId)).setLabel('ถัดไป').setStyle(ButtonStyle.Secondary).setDisabled(page >= pageCount - 1),
-      new ButtonBuilder().setCustomId(customId('checkout_confirm', checkoutId)).setLabel('ยืนยันและตัดเครดิต').setStyle(ButtonStyle.Success).setDisabled(selectedCount === 0),
+      new ButtonBuilder().setCustomId(customId('checkout_quote', checkoutId)).setLabel('ดูราคาและยืนยัน').setStyle(ButtonStyle.Success).setDisabled(selectedCount === 0),
     )], allowedMentions: { parse: [] },
   };
 }
@@ -351,6 +367,7 @@ async function selectCheckoutQuests(interaction, runtime, checkoutId) {
   const selected = new Set(payload.selectedQuestIds ?? []);
   for (const quest of pageRows) selected.delete(quest.quest_id);
   for (const questId of interaction.values ?? []) selected.add(String(questId));
+  if (selected.size > 25) throw new QuestshopError('ORDER_ITEM_LIMIT', 'เลือก Quest ได้สูงสุด 25 รายการต่อคำสั่งซื้อ');
   const next = { ...payload, selectedQuestIds: [...selected] };
   updateCheckoutPayload(runtime, session, next);
   return interaction.update(checkoutPagePayload(runtime, checkoutId, next));
@@ -369,27 +386,79 @@ async function freshCheckoutQuests(runtime, payload, selected) {
     }, coordinator: runtime.questRateLimits });
   const [profile, fresh] = await Promise.all([api.fetchCurrentUser(runtime.abortController.signal), api.fetchQuests(runtime.abortController.signal)]);
   if (String(profile?.id ?? '') !== String(payload.accountId)) throw new QuestshopError('QUEST_ACCOUNT_CHANGED', 'บัญชี Quest เปลี่ยนไป กรุณาเริ่มใหม่');
-  const ids = new Set(fresh.map((quest) => String(quest.id)));
-  if (selected.some((quest) => !ids.has(quest.questId))) throw new QuestshopError('QUEST_CHANGED', 'Quest ที่เลือกไม่อยู่ในบัญชีนี้แล้ว กรุณาเลือกใหม่');
+  const byId = new Map(fresh.map((quest) => [String(quest.id), quest]));
+  for (const selectedQuest of selected) {
+    const current = byId.get(selectedQuest.questId);
+    if (!current || current.completed === true || (current.startsAt && Date.parse(current.startsAt) > nowMs())
+      || (current.expiresAt && Date.parse(current.expiresAt) <= nowMs())
+      || (selectedQuest.contractHash && current.contractHash !== selectedQuest.contractHash)) {
+      throw new QuestshopError('QUEST_CHANGED', 'Quest ที่เลือกเปลี่ยนแปลงหรือทำเสร็จแล้ว กรุณาสร้างราคาใหม่');
+    }
+  }
   return selected;
 }
 
-async function confirmCheckout(interaction, runtime, checkoutId) {
-  assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+function createCheckoutQuote(interaction, runtime, checkoutId) {
   const { payload } = checkoutSession(runtime, interaction, checkoutId);
-  const quests = selectedQuests(runtime, payload, payload.selectedQuestIds);
+  const items = selectedQuests(runtime, payload, payload.selectedQuestIds).map((item) => {
+    const quest = runtime.db.prepare('SELECT state_version,contract_hash,starts_at,expires_at,task_type FROM quests WHERE quest_id=?').get(item.questId);
+    return { ...item, taskType: quest.task_type, questVersion: quest.state_version, contractHash: quest.contract_hash,
+      startsAt: quest.starts_at, expiresAt: quest.expires_at };
+  });
+  const config = loadRuntimeConfig(runtime.db); runtime.config = config;
+  const configHash = JSON.stringify(config.values.priceRules ?? config.values.prices ?? {});
+  const quoteId = sessionContext(interaction, runtime, 'CHECKOUT_CONFIRM', {
+    checkoutId, credentialId: payload.credentialId, questAccountId: payload.accountId, items,
+    totalCents: items.reduce((total, item) => total + item.priceCents, 0), configHash,
+    checkoutStateVersion: runtime.db.prepare('SELECT state_version FROM jobs WHERE id=?').get(checkoutId)?.state_version ?? null,
+  });
+  return { quoteId, items };
+}
+
+async function quoteCheckout(interaction, runtime, checkoutId) {
+  assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+  const { quoteId, items } = createCheckoutQuote(interaction, runtime, checkoutId);
+  const total = items.reduce((sum, item) => sum + item.priceCents, 0);
+  return replyAndBindSessions(interaction, runtime, { embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('ยืนยันราคา Quest')
+    .setDescription(`${items.length} รายการ • **${(total / 100).toFixed(2)} บาท**\nราคานี้จะหมดอายุใน 15 นาที และระบบจะตรวจ Quest อีกครั้งก่อนกันเครดิต`)],
+  components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('checkout_confirm', quoteId))
+    .setLabel('ยืนยันและตัดเครดิต').setStyle(ButtonStyle.Success))] }, [quoteId]);
+}
+
+async function confirmCheckout(interaction, runtime, quoteId) {
+  assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+  const quote = consumeInteractionSession(runtime.db, { sessionId: quoteId, actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'CHECKOUT_CONFIRM' });
+  const snapshot = quote.payload;
+  const config = loadRuntimeConfig(runtime.db); runtime.config = config;
+  if (JSON.stringify(config.values.priceRules ?? config.values.prices ?? {}) !== snapshot.configHash) {
+    throw new QuestshopError('QUOTE_STALE', 'ราคามีการเปลี่ยนแปลง กรุณาสร้างราคาใหม่');
+  }
+  const quests = snapshot.items;
   await interaction.deferUpdate();
-  await freshCheckoutQuests(runtime, payload, quests);
-  const order = createOrder(runtime.db, { discordUserId: interaction.user.id, questAccountId: payload.accountId,
-    credentialId: payload.credentialId, items: quests, traceId: randomUUID(), prelaunch: runtime.env.PRELAUNCH });
+  await freshCheckoutQuests(runtime, { credentialId: snapshot.credentialId, accountId: snapshot.questAccountId }, quests);
+  const order = createOrder(runtime.db, { discordUserId: interaction.user.id, questAccountId: snapshot.questAccountId,
+    credentialId: snapshot.credentialId, items: quests, traceId: randomUUID(), prelaunch: runtime.env.PRELAUNCH });
   return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x23a55a).setTitle('✅ รับ Order แล้ว')
     .setDescription(`Order: \`${order.id}\`\nระบบกันเครดิตและเริ่มทำ Quest ให้แล้ว คุณจะได้รับความคืบหน้าทาง DM`)],
   components: [], allowedMentions: { parse: [] } });
 }
 
 async function routeButton(interaction, runtime, route, sessionId) {
-  if (route === 'topup') { assertCurrentSurface(interaction, runtime, 'QUEST_AUTO'); assertCustomerRoute(interaction, runtime, 'TOPUP_ACCEPTING'); return interaction.showModal(voucherModal()); }
-  if (route === 'start') { assertCurrentSurface(interaction, runtime, 'QUEST_AUTO'); assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING'); return interaction.showModal(tokenModal()); }
+  if (route === 'topup') {
+    assertCurrentSurface(interaction, runtime, 'QUEST_AUTO'); assertCustomerRoute(interaction, runtime, 'TOPUP_ACCEPTING');
+    return interaction.showModal(voucherModal(sessionContext(interaction, runtime, 'VOUCHER_SUBMIT', {}, interaction.message?.id ?? null)));
+  }
+  if (route === 'start') {
+    assertCurrentSurface(interaction, runtime, 'QUEST_AUTO'); assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+    const config = loadRuntimeConfig(runtime.db);
+    const minimum = Math.min(...supportedTaskTypes().map((type) => priceForQuest(config.values, type)).filter(Number.isSafeInteger));
+    const wallet = runtime.db.prepare('SELECT available_cents FROM wallets WHERE discord_user_id=?').get(interaction.user.id);
+    if (Number.isSafeInteger(minimum) && Number(wallet?.available_cents ?? 0) < minimum) {
+      throw new QuestshopError('INSUFFICIENT_BALANCE', 'ยอด Wallet ยังไม่พอสำหรับเริ่มทำ Quest กรุณาเติมเงินก่อน');
+    }
+    return interaction.showModal(tokenModal(sessionContext(interaction, runtime, 'TOKEN_SUBMIT', {}, interaction.message?.id ?? null)));
+  }
   if (route === 'admin') {
     assertCurrentSurface(interaction, runtime, 'ADMIN_PANEL');
     assertBackoffice(interaction, runtime);
@@ -430,6 +499,7 @@ async function routeButton(interaction, runtime, route, sessionId) {
     return interaction.update({ content: `เข้าคิว Scan + Test แล้ว ${result.queued} Quest`, embeds: [], components: [], allowedMentions: { parse: [] } });
   }
   if (route === 'admin_wallet_adjust') {
+    assertOwner(interaction, runtime);
     consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_WALLET_ADJUST');
     const submitId = sessionContext(interaction, runtime, 'ADMIN_WALLET_SUBMIT');
     return interaction.showModal(openAdminModal('admin_wallet_submit', submitId, 'ปรับ Wallet', [
@@ -447,6 +517,7 @@ async function routeButton(interaction, runtime, route, sessionId) {
     ]));
   }
   if (route === 'admin_review_decide') {
+    assertOwner(interaction, runtime);
     const session = consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_REVIEW_DECIDE');
     const submitId = sessionContext(interaction, runtime, 'ADMIN_REVIEW_SUBMIT', { reviewId: session.payload.reviewId, subjectType: session.payload.subjectType });
     return interaction.showModal(openAdminModal('admin_review_submit', submitId, 'ตัดสิน Manual Review', [
@@ -473,6 +544,7 @@ async function routeButton(interaction, runtime, route, sessionId) {
   if (route === 'checkout_open') return openCheckout(interaction, runtime, sessionId);
   if (route === 'checkout_page_previous') return moveCheckoutPage(interaction, runtime, sessionId, -1);
   if (route === 'checkout_page_next') return moveCheckoutPage(interaction, runtime, sessionId, 1);
+  if (route === 'checkout_quote') return quoteCheckout(interaction, runtime, sessionId);
   if (route === 'checkout_confirm') return confirmCheckout(interaction, runtime, sessionId);
   throw new QuestshopError('ROUTE_INTERACTION_INVALID', 'ปุ่มนี้หมดอายุแล้ว กรุณาเปิดแผงใหม่');
 }
@@ -480,6 +552,8 @@ async function routeButton(interaction, runtime, route, sessionId) {
 async function routeModal(interaction, runtime, route) {
   if (route === 'voucher_submit') {
     assertCustomerRoute(interaction, runtime, 'TOPUP_ACCEPTING');
+    consumeModalInteractionSession(runtime.db, { sessionId: parseCustomId(interaction.customId).sessionId, actorId: interaction.user.id,
+      guildId: interaction.guildId, channelId: interaction.channelId, operation: 'VOUCHER_SUBMIT' });
     await interaction.deferReply({ ephemeral: true });
     const result = submitTopup(runtime.db, runtime.env, { discordUserId: interaction.user.id,
       voucherUrl: interaction.fields.getTextInputValue('url'), traceId: randomUUID(), prelaunch: runtime.env.PRELAUNCH });
@@ -487,6 +561,8 @@ async function routeModal(interaction, runtime, route) {
   }
   if (route === 'token_submit') {
     assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+    consumeModalInteractionSession(runtime.db, { sessionId: parseCustomId(interaction.customId).sessionId, actorId: interaction.user.id,
+      guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOKEN_SUBMIT' });
     await interaction.deferReply({ ephemeral: true });
     const checkoutId = recordCustomerToken(runtime, interaction, interaction.fields.getTextInputValue('token'));
     await interaction.editReply({ ...ephemeral('รับข้อมูลบัญชีแล้ว ระบบกำลังค้นหา Quest ของบัญชีนี้ เมื่อเสร็จแล้วกดปุ่มด้านล่างเพื่อเลือกรายการ'),
@@ -500,7 +576,7 @@ async function routeModal(interaction, runtime, route) {
     return;
   }
   if (route === 'admin_price_submit') {
-    const session = consumeAdminSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_PRICE_SUBMIT');
+    const session = consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_PRICE_SUBMIT');
     const next = setQuestPrice(runtime.db, { taskType: session.payload.taskType,
       amountCents: interaction.fields.getTextInputValue('amountCents'), actorId: interaction.user.id,
       reason: interaction.fields.getTextInputValue('reason') });
@@ -508,32 +584,33 @@ async function routeModal(interaction, runtime, route) {
     return interaction.reply(ephemeral(`บันทึกราคา ${session.payload.taskType} แล้ว (${next.priceRules[session.payload.taskType].amountCents / 100} บาท)`));
   }
   if (route === 'admin_receiver_submit') {
-    consumeAdminSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_RECEIVER_SUBMIT');
+    consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_RECEIVER_SUBMIT');
     const receiver = configureReceiverPhone(runtime.db, runtime.env, { phone: interaction.fields.getTextInputValue('phone'), actorId: interaction.user.id,
       reason: interaction.fields.getTextInputValue('reason') });
     return interaction.reply(ephemeral(`ตั้งค่าเบอร์รับเงิน ••••${receiver.last4} แล้ว`));
   }
   if (route === 'admin_monitor_submit') {
-    consumeAdminSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_MONITOR_SUBMIT');
+    consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_MONITOR_SUBMIT');
     const monitor = upsertMonitorAccount(runtime.db, runtime.env, { accountId: interaction.fields.getTextInputValue('accountId'),
       label: interaction.fields.getTextInputValue('label'), token: interaction.fields.getTextInputValue('token'), actorId: interaction.user.id });
     return interaction.reply(ephemeral(`บันทึก Monitor ${monitor.label} แล้ว`));
   }
   if (route === 'admin_wallet_submit') {
-    consumeAdminSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_WALLET_SUBMIT');
+    consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_WALLET_SUBMIT');
     const result = adjustWallet(runtime.db, { discordUserId: interaction.fields.getTextInputValue('discordUserId'),
       availableDeltaCents: interaction.fields.getTextInputValue('amountCents'), actorId: interaction.user.id, reason: interaction.fields.getTextInputValue('reason') });
     return interaction.reply(ephemeral(`ปรับ Wallet แล้ว ยอดใช้ได้ปัจจุบัน ${(Number(result.wallet.available_cents) / 100).toFixed(2)} บาท`));
   }
   if (route === 'admin_promotion_submit') {
-    const session = consumeAdminSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_PROMOTION_SUBMIT');
+    const session = consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_PROMOTION_SUBMIT');
     const promotion = upsertPromotion(runtime.db, { id: session.payload.id ?? undefined, name: interaction.fields.getTextInputValue('name'),
       state: interaction.fields.getTextInputValue('state').trim().toUpperCase(), minimumCents: interaction.fields.getTextInputValue('minimumCents'),
       basisPoints: interaction.fields.getTextInputValue('basisPoints'), maximumBonusCents: interaction.fields.getTextInputValue('maximumBonusCents'), actorId: interaction.user.id });
     return interaction.reply(ephemeral(`บันทึกโปรโมชั่น ${promotion.name} แล้ว`));
   }
   if (route === 'admin_review_submit') {
-    const session = consumeAdminSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_REVIEW_SUBMIT');
+    assertOwner(interaction, runtime);
+    const session = consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_REVIEW_SUBMIT');
     const decision = interaction.fields.getTextInputValue('decision').trim().toUpperCase();
     const reason = interaction.fields.getTextInputValue('reason');
     const amountText = interaction.fields.getTextInputValue('amountCents').trim();
@@ -555,7 +632,7 @@ async function routeModal(interaction, runtime, route) {
 
 async function routeSelect(interaction, runtime, route, sessionId) {
   if (route === 'checkout_select') return selectCheckoutQuests(interaction, runtime, sessionId);
-  if (route === 'admin') return handleAdminMenu(interaction, runtime);
+  if (route === 'admin') { assertCurrentSurface(interaction, runtime, 'ADMIN_PANEL'); return handleAdminMenu(interaction, runtime); }
   if (route === 'admin_review_select') {
     const session = consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_REVIEW_SELECT');
     const reviewId = interaction.values?.[0];

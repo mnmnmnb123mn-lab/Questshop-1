@@ -20,6 +20,7 @@ export const ROUTE_CONTRACTS = Object.freeze({
   checkout_page_previous: customer('BUTTON', ['ORDER_ACCEPTING'], 'UPDATE'),
   checkout_page_next: customer('BUTTON', ['ORDER_ACCEPTING'], 'UPDATE'),
   checkout_select: customer('STRING_SELECT', ['ORDER_ACCEPTING'], 'UPDATE'),
+  checkout_quote: customer('BUTTON', ['ORDER_ACCEPTING']),
   checkout_confirm: customer('BUTTON', ['ORDER_ACCEPTING'], 'UPDATE'),
 
   admin: admin('STRING_SELECT'),
