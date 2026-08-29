@@ -13,6 +13,8 @@ import { currentFeatureGates } from '../domain/sqlite/gates.js';
 import { createRotatedSqliteBackup } from '../db/sqlite-backup.js';
 import { reconcileSurfaceAnchors } from '../discord/surfaces/setup.js';
 import { recordSystemIncident } from '../domain/sqlite/incidents.js';
+import { recomputeHealthStatus } from '../bootstrap/health-status.js';
+import { EXTERNAL_OUTCOME } from '../domain/sqlite/external-outcome.js';
 
 function cleanupExpiredRows(db) {
   const timestamp = nowMs();
@@ -31,7 +33,8 @@ function cleanupExpiredRows(db) {
       )`).run(timestamp);
     db.prepare(`DELETE FROM jobs WHERE state IN ('COMPLETED','FAILED') AND completed_at IS NOT NULL AND completed_at<?`).run(timestamp - 7 * 86_400_000);
     db.prepare(`DELETE FROM quest_checks WHERE updated_at<?`).run(timestamp - 7 * 86_400_000);
-    db.prepare(`DELETE FROM manual_reviews WHERE category='OPERATIONAL' AND state='RESOLVED' AND resolved_at<?`).run(timestamp - 30 * 86_400_000);
+    db.prepare('DELETE FROM interaction_sessions WHERE expires_at<?').run(timestamp);
+    db.prepare(`DELETE FROM manual_reviews WHERE category='OPERATIONAL' AND state IN ('RESOLVED_SUCCESS','RESOLVED_FAILURE') AND resolved_at<?`).run(timestamp - 30 * 86_400_000);
   });
 }
 
@@ -76,7 +79,7 @@ function recordAttemptResponse(db, attemptId, { dispatchState = 'RESPONSE_RECEIV
       JSON.stringify(evidence), nowMs(), attemptId));
 }
 
-async function processPaymentJob(runtime, job) {
+export async function processPaymentJob(runtime, job) {
   let topup = runtime.db.prepare('SELECT * FROM topups WHERE id=?').get(job.subject_id);
   if (topup?.status === 'REDEEMED') {
     creditRedeemedTopup(runtime.db, { topupId: topup.id });
@@ -101,23 +104,30 @@ async function processPaymentJob(runtime, job) {
   try {
     const provider = runtime.paymentProvider ?? redeemVoucher;
     const result = await provider({ code: voucher.code, receiverPhone: receiver.phone, signal: runtime.abortController.signal });
-    if (result.outcome === 'REDEEMED' && result.currency === 'THB' && Number(result.amountCents) > 0) {
+    if (result.outcome === EXTERNAL_OUTCOME.SUCCESS && result.currency === 'THB' && Number(result.amountCents) > 0) {
       recordRedeemedTopup(runtime.db, { topupId: topup.id, principalCents: result.amountCents,
         providerTransactionId: result.providerTransactionId ?? null, receiverLast4: receiver.last4,
         providerEvidence: result.providerEvidence ?? { httpStatus: result.httpStatus } });
       creditRedeemedTopup(runtime.db, { topupId: topup.id });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
     }
-    if (result.outcome === 'RETRY_WAIT') {
-      recordAttemptResponse(runtime.db, attemptId, { providerCode: result.providerCode ?? 'PROVIDER_RETRY_WAIT',
-        httpStatus: result.httpStatus, evidence: result.providerEvidence ?? {} });
-      return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, retryAt: nowMs() + 15_000,
-        errorCode: result.providerCode ?? 'PROVIDER_RETRY_WAIT', checkpoint: 'VERIFIED' });
+    if (result.outcome === EXTERNAL_OUTCOME.DEFINITE_FAILURE) {
+      const reason = result.reason ?? result.providerCode ?? 'PROVIDER_REJECTED';
+      recordAttemptResponse(runtime.db, attemptId, { providerCode: reason,
+        httpStatus: result.httpStatus ?? result.evidence?.httpStatus, evidence: result.providerEvidence ?? result.evidence ?? {} });
+      failTopup(runtime.db, { topupId: topup.id, reasonCode: reason });
+      return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED', errorCode: reason });
     }
-    recordAttemptResponse(runtime.db, attemptId, { providerCode: result.providerCode ?? 'PROVIDER_REJECTED',
-      httpStatus: result.httpStatus, evidence: result.providerEvidence ?? {} });
-    failTopup(runtime.db, { topupId: topup.id, reasonCode: result.providerCode ?? 'PROVIDER_REJECTED' });
-    return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED', errorCode: result.providerCode ?? 'PROVIDER_REJECTED' });
+    // Any unknown adapter result follows the same path as an uncertain
+    // transport result.  A payment request was already dispatched, so the
+    // safe outcome is Reserved-for-review, never an automatic rejection.
+    const reason = result.reason ?? result.providerCode ?? 'PROVIDER_RESULT_AMBIGUOUS';
+    recordAttemptResponse(runtime.db, attemptId, { providerCode: reason,
+      httpStatus: result.httpStatus ?? result.evidence?.httpStatus, evidence: result.providerEvidence ?? result.evidence ?? {} });
+    moveTopupToReview(runtime.db, { topupId: topup.id, reasonCode: reason,
+      safeReason: 'ระบบยังยืนยันผลจาก TrueMoney ไม่ได้ จึงส่งให้ผู้ดูแลตรวจสอบ' });
+    return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
+      errorCode: reason, checkpoint: 'POSSIBLY_SENT' });
   } catch (error) {
     if (error.code === 'PROVIDER_NOT_SENT' || error.code === 'PAYMENT_INTENT_CHECKPOINT_FAILED') {
       recordAttemptResponse(runtime.db, attemptId, { dispatchState: 'CONFIRMED_NOT_SENT', providerCode: error.code });
@@ -167,7 +177,40 @@ async function destinationFor(runtime, notification) {
   return channel;
 }
 
-async function deliverNotification(runtime, notification) {
+/**
+ * A Discord send can succeed just before the process crashes, leaving the
+ * notification without its message id.  Search every message created since
+ * the durable notification intent before considering a new send.  Stopping
+ * at the intent timestamp makes the search finite while still preventing a
+ * duplicate after restart; a nonce is generated before the intent is saved.
+ */
+async function findNotificationByNonce(channel, notification) {
+  const nonce = String(notification.nonce);
+  const earliest = Number(notification.created_at) || 0;
+  let before;
+  for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) {
+    const page = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+    const messages = page?.values ? [...page.values()] : [];
+    const match = messages.find((candidate) => String(candidate.nonce ?? '') === nonce);
+    if (match) return match;
+    if (!messages.length) return null;
+    const oldest = messages.at(-1);
+    if (Number(oldest?.createdTimestamp ?? 0) < earliest) return null;
+    if (!oldest?.id || oldest.id === before) break;
+    before = oldest.id;
+  }
+  // Sending after a bounded/incomplete reconciliation would risk a duplicate.
+  // Keep the intent retryable and alertable instead.
+  throw Object.assign(new Error('Unable to exhaust Discord nonce reconciliation'), { code: 'NONCE_RECONCILIATION_EXHAUSTED' });
+}
+
+function notificationDeliveryIsCurrent(db, notification) {
+  const current = db.prepare(`SELECT state,lease_token,desired_version,sending_version FROM notifications WHERE id=?`).get(notification.id);
+  return Boolean(current && current.state === 'SENDING' && current.lease_token === notification.lease_token
+    && Number(current.desired_version) === Number(notification.sending_version));
+}
+
+export async function deliverNotification(runtime, notification) {
   if (notification.notification_type === 'QUEST_NEW' && !currentFeatureGates(runtime.db).QUEST_ANNOUNCEMENT_ENABLED) {
     deferNotification(runtime.db, { notificationId: notification.id, leaseToken: notification.lease_token, retryAt: nowMs() + 60_000,
       reason: 'QUEST_ANNOUNCEMENT_DISABLED' });
@@ -180,7 +223,22 @@ async function deliverNotification(runtime, notification) {
     ]);
     const body = normalizeDiscordPayload({ ...payload, nonce: notification.nonce });
     let message = null;
-    if (notification.message_id) message = await channel.messages.fetch(notification.message_id).catch(() => null);
+    if (notification.message_id) {
+      try { message = await channel.messages.fetch(notification.message_id); }
+      catch (error) {
+        // Only Discord's explicit "unknown message" response authorizes a
+        // replacement.  Permission and transport failures must retry the
+        // existing delivery instead of creating a duplicate durable message.
+        if (!(Number(error?.status) === 404 || Number(error?.code) === 10008)) throw error;
+      }
+    }
+    if (!message) message = await findNotificationByNonce(channel, notification);
+    // A newer desired version may have been saved while this worker awaited
+    // Discord reads.  Release this old lease without publishing stale content.
+    if (!notificationDeliveryIsCurrent(runtime.db, notification)) {
+      finishNotificationDelivery(runtime.db, { notificationId: notification.id, leaseToken: notification.lease_token, financial });
+      return;
+    }
     if (message) await message.edit(body);
     else message = await channel.send(body);
     const delivered = finishNotificationDelivery(runtime.db, { notificationId: notification.id, leaseToken: notification.lease_token,
@@ -278,9 +336,16 @@ export function createSqliteWorkers({ runtime }) {
           reconcileAt = nowMs() + 60_000;
         }
         runtime.health.checks.database = 'OK';
+        // Readiness is derived from all startup/runtime checks, not merely
+        // whether this worker loop happened to complete once.
+        runtime.health.ready = !Object.values(runtime.health.checks).some((value) =>
+          ['DEGRADED', 'FAILED', 'INVALID', 'MISSING_RECEIVER', 'NOT_READY', 'LOST'].includes(value));
+        runtime.health.status = recomputeHealthStatus({ health: runtime.health });
         if (!work) await delay(500, undefined, { signal: runtime.abortController.signal, ref: false }).catch(() => null);
       } catch (error) {
         runtime.health.checks.database = 'DEGRADED';
+        runtime.health.status = recomputeHealthStatus({ health: runtime.health });
+        runtime.health.ready = false;
         runtime.health.lastError = error;
         runtime.logger.error({ error }, 'SQLite worker iteration failed');
         recordSystemIncident(runtime.db, { code: error.code ?? 'WORKER_ITERATION_FAILED', scope: 'RUNTIME', severity: 'ERROR' });
@@ -296,7 +361,7 @@ export function createSqliteWorkers({ runtime }) {
       await Promise.allSettled([...activeJobs, ...activePayments]);
     },
     async processTopupNow(topupId) {
-      runtime.db.prepare("UPDATE jobs SET next_run_at=? WHERE job_type='PAYMENT_SETTLE' AND subject_id=? AND state IN ('PENDING','RETRY_WAIT')")
+      runtime.db.prepare("UPDATE jobs SET next_run_at=?,state_version=state_version+1 WHERE job_type='PAYMENT_SETTLE' AND subject_id=? AND state IN ('PENDING','RETRY_WAIT')")
         .run(nowMs(), topupId);
       return runOne();
     },

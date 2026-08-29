@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { normalizeVoucherUrl } from '../../adapters/truemoney/voucher.js';
 import { nowMs, withImmediateTransaction } from '../../db/sqlite.js';
-import { encryptCredential, voucherHmac } from './crypto.js';
+import { CURRENT_VOUCHER_HMAC_VERSION, encryptCredential, voucherHmac, voucherIdentityHmac } from './crypto.js';
 import { enqueueNotificationInTransaction } from './notifications.js';
 import { appendWalletTransactionInTransaction } from './wallet.js';
 import { QuestshopError } from '../../shared/errors.js';
@@ -9,12 +9,14 @@ import { percentageBonusHalfUp } from '../../shared/money.js';
 
 const TEMPORARY_CREDENTIAL_LIFETIME_MS = 7 * 86_400_000;
 
-export function submitTopup(db, env, { discordUserId, voucherUrl, traceId = randomUUID() }) {
+export function submitTopup(db, env, { discordUserId, voucherUrl, traceId = randomUUID(), prelaunch = false }) {
   const voucher = normalizeVoucherUrl(voucherUrl);
-  const fingerprint = voucherHmac(env.QUESTSHOP_SECRET_KEY, voucher.code);
+  const voucherHmacVersion = env.VOUCHER_HMAC_ACTIVE_VERSION ?? CURRENT_VOUCHER_HMAC_VERSION;
+  const fingerprint = voucherHmac(env.QUESTSHOP_SECRET_KEY, voucher.code, voucherHmacVersion);
+  const identity = voucherIdentityHmac(env.QUESTSHOP_SECRET_KEY, voucher.code);
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
-    const existing = db.prepare('SELECT * FROM topups WHERE voucher_hmac=?').get(fingerprint);
+    const existing = db.prepare('SELECT * FROM topups WHERE voucher_identity_hmac=?').get(identity);
     if (existing) {
       if (existing.discord_user_id !== discordUserId) {
         throw new QuestshopError('NOT_AUTHORIZED', 'ซองนี้ถูกใช้กับรายการเติมเงินของบัญชีอื่นแล้ว', {
@@ -25,8 +27,8 @@ export function submitTopup(db, env, { discordUserId, voucherUrl, traceId = rand
     }
     const topupId = randomUUID();
     const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, voucher.url);
-    db.prepare(`INSERT INTO topups(id,discord_user_id,voucher_hmac,status,trace_id,created_at,updated_at)
-      VALUES(?,?,?,'PENDING',?,?,?)`).run(topupId, discordUserId, fingerprint, traceId, timestamp, timestamp);
+    db.prepare(`INSERT INTO topups(id,discord_user_id,voucher_hmac_version,voucher_identity_hmac,voucher_hmac,status,prelaunch,trace_id,created_at,updated_at)
+      VALUES(?,?,?,?,?,'PENDING',?,?,?,?)`).run(topupId, discordUserId, voucherHmacVersion, identity, fingerprint, prelaunch ? 1 : 0, traceId, timestamp, timestamp);
     db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,cleanup_after,created_at,updated_at)
       VALUES(?,?,?,'VOUCHER','TEMPORARY',?,?,?,?,?,?)`).run(randomUUID(), 'TOPUP', topupId,
       encrypted.ciphertext, encrypted.nonce, encrypted.authTag, timestamp + TEMPORARY_CREDENTIAL_LIFETIME_MS, timestamp, timestamp);
@@ -239,7 +241,11 @@ export function resolveTopupFinancialReview(db, {
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
     const review = db.prepare("SELECT * FROM manual_reviews WHERE id=? AND subject_type='TOPUP' AND category='FINANCIAL'").get(reviewId);
-    if (!review || review.state !== 'OPEN') throw new QuestshopError('REVIEW_NOT_OPEN', 'รายการนี้ไม่ได้รอตรวจสอบแล้ว');
+    if (!review) throw new QuestshopError('REVIEW_NOT_FOUND', 'ไม่พบรายการที่รอตรวจสอบ');
+    if (['RESOLVED_SUCCESS', 'RESOLVED_FAILURE'].includes(review.state)) {
+      return { state: review.state, idempotent: true, decision: review.decision };
+    }
+    if (review.state !== 'OPEN') throw new QuestshopError('REVIEW_NOT_OPEN', 'รายการนี้ไม่ได้รอตรวจสอบแล้ว');
     if (!review.first_confirmation_at) {
       const changed = db.prepare(`UPDATE manual_reviews SET first_confirmation_by=?,first_confirmation_at=?,state_version=state_version+1,updated_at=?
         WHERE id=? AND state='OPEN' AND state_version=?`).run(actorId, timestamp, timestamp, review.id, review.state_version);
@@ -297,14 +303,15 @@ export function resolveTopupFinancialReview(db, {
     } else {
       throw new QuestshopError('REVIEW_DECISION_INVALID', 'รูปแบบการตัดสินใจไม่ถูกต้อง');
     }
-    const resolved = db.prepare(`UPDATE manual_reviews SET state='RESOLVED',decision=?,resolved_by=?,resolved_at=?,state_version=state_version+1,updated_at=?
-      WHERE id=? AND state='OPEN' AND state_version=?`).run(decision, actorId, timestamp, timestamp, review.id, review.state_version);
+    const resolvedState = decision === 'CREDIT' ? 'RESOLVED_SUCCESS' : 'RESOLVED_FAILURE';
+    const resolved = db.prepare(`UPDATE manual_reviews SET state=?,decision=?,resolved_by=?,resolved_at=?,state_version=state_version+1,updated_at=?
+      WHERE id=? AND state='OPEN' AND state_version=?`).run(resolvedState, decision, actorId, timestamp, timestamp, review.id, review.state_version);
     if (!resolved.changes) throw new QuestshopError('REVIEW_CONFLICT', 'รายการถูกแก้ไขพร้อมกัน กรุณาลองใหม่');
     const updated = db.prepare('SELECT * FROM topups WHERE id=?').get(topup.id);
     enqueueTopupProjections(db, updated, timestamp);
     appendFinancialAudit(db, { actorId, action: 'MANUAL_REVIEW_DECISION', topupId: topup.id, reason,
       before: { status: topup.status }, after: { decision, status: nextStatus }, traceId: topup.trace_id, timestamp });
-    return { state: 'RESOLVED', decision, topup: updated, status: nextStatus };
+    return { state: resolvedState, decision, topup: updated, status: nextStatus };
   });
 }
 

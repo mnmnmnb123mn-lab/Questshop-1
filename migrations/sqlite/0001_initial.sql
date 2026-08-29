@@ -52,7 +52,13 @@ CREATE TABLE IF NOT EXISTS quests (
   task_type TEXT NOT NULL,
   url TEXT NOT NULL,
   artwork_url TEXT,
+  thumbnail_url TEXT,
+  starts_at INTEGER,
   expires_at INTEGER,
+  target_value INTEGER,
+  orbs INTEGER,
+  orb_min INTEGER,
+  orb_max INTEGER,
   contract_hash TEXT,
   source TEXT NOT NULL CHECK (source IN ('CUSTOMER','MONITOR')),
   announcement_status TEXT NOT NULL DEFAULT 'NOT_ANNOUNCED' CHECK (announcement_status IN ('NOT_ANNOUNCED','QUEUED','ANNOUNCED')),
@@ -98,8 +104,11 @@ CREATE INDEX IF NOT EXISTS credentials_cleanup ON credentials(retention_class, c
 CREATE TABLE IF NOT EXISTS topups (
   id TEXT PRIMARY KEY,
   discord_user_id TEXT NOT NULL,
+  voucher_hmac_version TEXT NOT NULL DEFAULT 'v1' CHECK (voucher_hmac_version GLOB 'v[0-9]*'),
+  voucher_identity_hmac BLOB NOT NULL UNIQUE,
   voucher_hmac BLOB NOT NULL UNIQUE,
   status TEXT NOT NULL CHECK (status IN ('PENDING','PROCESSING','REDEEMED','CREDITED','FAILED','REVIEW','REVERSED')),
+  prelaunch INTEGER NOT NULL DEFAULT 0 CHECK (prelaunch IN (0,1)),
   principal_cents INTEGER NOT NULL DEFAULT 0 CHECK (principal_cents >= 0),
   bonus_cents INTEGER NOT NULL DEFAULT 0 CHECK (bonus_cents >= 0),
   credited_cents INTEGER NOT NULL DEFAULT 0 CHECK (credited_cents >= 0),
@@ -138,6 +147,7 @@ CREATE TABLE IF NOT EXISTS orders (
   discord_user_id TEXT NOT NULL,
   quest_account_id TEXT NOT NULL,
   credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL,
+  prelaunch INTEGER NOT NULL DEFAULT 0 CHECK (prelaunch IN (0,1)),
   state TEXT NOT NULL CHECK (state IN ('PENDING','RUNNING','COMPLETED','PARTIAL','CANCELLED','REVIEW')),
   total_cents INTEGER NOT NULL CHECK (total_cents >= 0),
   trace_id TEXT NOT NULL,
@@ -174,6 +184,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   operation_key TEXT NOT NULL UNIQUE,
   state TEXT NOT NULL CHECK (state IN ('PENDING','RUNNING','RETRY_WAIT','COMPLETED','FAILED','REVIEW')),
   checkpoint TEXT NOT NULL DEFAULT 'NOT_STARTED' CHECK (checkpoint IN ('NOT_STARTED','INTENT_RECORDED','POSSIBLY_SENT','VERIFIED')),
+  state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version > 0),
   attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
   next_run_at INTEGER NOT NULL,
   last_error_code TEXT,
@@ -225,12 +236,30 @@ CREATE TABLE IF NOT EXISTS notifications (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS notifications_runnable ON notifications(state, next_run_at, created_at);
 
+-- Opaque server-side records for persistent components.  The custom ID only
+-- carries this UUID; actor/context/operation/payload remain in SQLite.
+CREATE TABLE IF NOT EXISTS interaction_sessions (
+  id TEXT PRIMARY KEY,
+  actor_id TEXT NOT NULL,
+  guild_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  message_id TEXT,
+  operation TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload_json)),
+  expires_at INTEGER NOT NULL,
+  consumed_at INTEGER,
+  state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version > 0),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS interaction_sessions_expiry ON interaction_sessions(expires_at);
+
 CREATE TABLE IF NOT EXISTS manual_reviews (
   id TEXT PRIMARY KEY,
   subject_type TEXT NOT NULL,
   subject_id TEXT NOT NULL,
   category TEXT NOT NULL CHECK (category IN ('FINANCIAL','OPERATIONAL')),
-  state TEXT NOT NULL CHECK (state IN ('OPEN','RESOLVED')),
+  state TEXT NOT NULL CHECK (state IN ('OPEN','RESOLVED_SUCCESS','RESOLVED_FAILURE')),
   reason_code TEXT NOT NULL,
   safe_reason TEXT,
   first_confirmation_by TEXT,
@@ -241,10 +270,31 @@ CREATE TABLE IF NOT EXISTS manual_reviews (
   state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version > 0),
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  CHECK ((state='OPEN' AND resolved_at IS NULL) OR state='RESOLVED')
+  CHECK ((state='OPEN' AND resolved_at IS NULL AND decision IS NULL) OR
+    (state IN ('RESOLVED_SUCCESS','RESOLVED_FAILURE') AND resolved_at IS NOT NULL AND decision IS NOT NULL))
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS manual_reviews_one_open
   ON manual_reviews(subject_type, subject_id) WHERE state='OPEN';
+
+-- Settlement evidence is deliberately separate from mutable aggregates.  It
+-- records why a reserved Item was captured, released, or retained for review
+-- without allowing a later update/delete to rewrite the financial history.
+CREATE TABLE IF NOT EXISTS settlement_evidence (
+  id TEXT PRIMARY KEY,
+  subject_type TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('CAPTURED','RELEASED','REVIEWED')),
+  reason_code TEXT NOT NULL,
+  evidence_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(evidence_json)),
+  trace_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(subject_type, subject_id, outcome)
+) STRICT;
+CREATE INDEX IF NOT EXISTS settlement_evidence_subject ON settlement_evidence(subject_type, subject_id, created_at);
+CREATE TRIGGER IF NOT EXISTS settlement_evidence_append_only_update
+BEFORE UPDATE ON settlement_evidence BEGIN SELECT RAISE(ABORT, 'settlement_evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS settlement_evidence_append_only_delete
+BEFORE DELETE ON settlement_evidence BEGIN SELECT RAISE(ABORT, 'settlement_evidence is append-only'); END;
 
 CREATE TABLE IF NOT EXISTS admin_audit (
   id TEXT PRIMARY KEY,

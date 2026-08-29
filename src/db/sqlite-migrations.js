@@ -12,7 +12,7 @@ export function assertRequiredSchema(db) {
   const tables = new Set(db.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map((row) => row.name));
   const required = ['settings', 'wallets', 'wallet_transactions', 'topups', 'payment_attempts', 'promotions',
     'quests', 'monitor_accounts', 'credentials', 'orders', 'order_items', 'jobs', 'quest_checks',
-    'notifications', 'manual_reviews', 'admin_audit'];
+    'notifications', 'interaction_sessions', 'manual_reviews', 'settlement_evidence', 'admin_audit'];
   const missing = required.filter((name) => !tables.has(name));
   if (missing.length) {
     const error = new Error(`SQLite migration is missing required tables: ${missing.join(', ')}`);
@@ -20,11 +20,13 @@ export function assertRequiredSchema(db) {
     throw error;
   }
   const requiredColumns = {
-    topups: ['id', 'voucher_hmac', 'status', 'state_version', 'wallet_transaction_id'],
-    orders: ['id', 'credential_id', 'state', 'state_version'],
+    topups: ['id', 'voucher_hmac_version', 'voucher_identity_hmac', 'voucher_hmac', 'status', 'prelaunch', 'state_version', 'wallet_transaction_id'],
+    orders: ['id', 'credential_id', 'prelaunch', 'state', 'state_version'],
+    quests: ['quest_id', 'task_type', 'thumbnail_url', 'starts_at', 'expires_at', 'target_value', 'orbs', 'orb_min', 'orb_max'],
     order_items: ['id', 'order_id', 'state', 'state_version'],
     notifications: ['id', 'desired_version', 'sending_version', 'delivered_version', 'attempt_version', 'nonce'],
-    jobs: ['id', 'checkpoint', 'lease_token', 'lease_expires_at'],
+    interaction_sessions: ['id', 'actor_id', 'guild_id', 'channel_id', 'message_id', 'operation', 'expires_at', 'consumed_at'],
+    jobs: ['id', 'checkpoint', 'state_version', 'lease_token', 'lease_expires_at'],
     credentials: ['id', 'retention_class', 'cleanup_after'],
     manual_reviews: ['id', 'state_version', 'first_confirmation_by', 'decision'],
   };
@@ -47,6 +49,7 @@ export function assertRequiredSchema(db) {
     }
   }
   for (const trigger of ['wallet_transactions_append_only_update', 'wallet_transactions_append_only_delete',
+    'settlement_evidence_append_only_update', 'settlement_evidence_append_only_delete',
     'admin_audit_append_only_update', 'admin_audit_append_only_delete']) {
     if (!triggers.has(trigger)) {
       const error = new Error(`SQLite schema is missing append-only trigger: ${trigger}`);
