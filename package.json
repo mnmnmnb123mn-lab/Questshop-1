@@ -26,7 +26,7 @@
     "lint": "eslint src scripts test",
     "test": "node scripts/test-files.js",
     "test:coverage": "node scripts/test-files.js --coverage && node scripts/check-coverage.js",
-    "test:unit": "node --test test/sqlite/*.test.js",
+    "test:unit": "node --test test/contract/*.test.js",
     "test:integration": "node --test test/sqlite/*.test.js",
     "verify": "npm run check && npm run check:imports && npm run lint && npm test"
   },
