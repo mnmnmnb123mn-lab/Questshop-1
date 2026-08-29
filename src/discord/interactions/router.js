@@ -71,7 +71,9 @@ async function showAdminGates(interaction, runtime) {
 
 async function showAdminPrices(interaction, runtime) {
   const config = loadRuntimeConfig(runtime.db); runtime.config = config;
-  const sessions = supportedTaskTypes().map((taskType) => ({ taskType, id: sessionContext(interaction, runtime, 'ADMIN_PRICE_EDIT', { taskType }) }));
+  const sessions = supportedTaskTypes().map((taskType) => ({ taskType, id: sessionContext(interaction, runtime, 'ADMIN_PRICE_EDIT', {
+    taskType, expectedConfigVersion: config.version,
+  }) }));
   const rows = [];
   for (let index = 0; index < sessions.length; index += 5) rows.push(new ActionRowBuilder().addComponents(
     sessions.slice(index, index + 5).map(({ taskType, id }) => new ButtonBuilder().setCustomId(customId('admin_price_edit', id))
@@ -165,13 +167,13 @@ export function hasAdministratorPermission(interaction) {
   return interaction.memberPermissions?.has?.(PermissionFlagsBits.Administrator) === true;
 }
 
-function assertBackoffice(interaction, runtime) {
-  if (interaction.user.id === runtime.env.OWNER_ID || hasAdministratorPermission(interaction)) return;
+function assertBackoffice(interaction, _runtime) {
+  if (hasAdministratorPermission(interaction)) return;
   throw new QuestshopError('NOT_AUTHORIZED', 'เมนูนี้ใช้ได้เฉพาะผู้ดูแล');
 }
 
 function assertOwner(interaction, runtime) {
-  if (interaction.user.id === runtime.env.OWNER_ID) return;
+  if (interaction.user.id === runtime.env.OWNER_ID && hasAdministratorPermission(interaction)) return;
   throw new QuestshopError('NOT_AUTHORIZED', 'การตัดสินใจทางการเงินขั้นสุดท้ายใช้ได้เฉพาะ Owner');
 }
 
@@ -191,6 +193,17 @@ function assertCurrentSurface(interaction, runtime, surfaceKey) {
     || interaction.message?.id !== surface.messageId) {
     throw new QuestshopError('INTERACTION_CONTEXT_INVALID', 'ปุ่มนี้ไม่ตรงกับแผงที่ตั้งค่าไว้ กรุณาใช้แผงล่าสุด');
   }
+}
+
+function assertCurrentDiscoveryCase(interaction, runtime, notificationId) {
+  const notification = runtime.db.prepare(`SELECT n.*,q.state_version AS quest_state_version FROM notifications n
+    JOIN quests q ON q.quest_id=n.aggregate_id WHERE n.id=? AND n.notification_type='CUSTOMER_QUEST_DISCOVERY'
+      AND n.aggregate_type='QUEST' AND n.destination='LOG_QUEST_OPERATIONS'`).get(notificationId);
+  const surface = runtime.config.surfaces?.LOG_QUEST_OPERATIONS;
+  if (!notification || notification.message_id !== interaction.message?.id || surface?.channelId !== interaction.channelId) {
+    throw new QuestshopError('INTERACTION_CONTEXT_INVALID', 'ปุ่มนี้ไม่ตรงกับข้อความ Quest ล่าสุด');
+  }
+  return notification;
 }
 
 function interactionKind(interaction) {
@@ -294,6 +307,10 @@ function selectedQuests(runtime, payload, selectedIds) {
     if (priceCents == null) throw new QuestshopError('PRICE_NOT_CONFIGURED', 'ร้านยังไม่ได้ตั้งราคาสำหรับ Quest บางรายการ');
     return { questId: quest.quest_id, name: quest.name, priceCents };
   });
+}
+
+function hasEverySupportedPrice(config) {
+  return supportedTaskTypes().every((type) => Number.isSafeInteger(priceForQuest(config.values, type)));
 }
 
 function pricedCheckoutQuestRows(runtime, payload) {
@@ -409,7 +426,7 @@ function createCheckoutQuote(interaction, runtime, checkoutId) {
   const configHash = JSON.stringify(config.values.priceRules ?? config.values.prices ?? {});
   const quoteId = sessionContext(interaction, runtime, 'CHECKOUT_CONFIRM', {
     checkoutId, credentialId: payload.credentialId, questAccountId: payload.accountId, items,
-    totalCents: items.reduce((total, item) => total + item.priceCents, 0), configHash,
+    totalCents: items.reduce((total, item) => total + item.priceCents, 0), configHash, runtimeConfigVersion: config.version,
     checkoutStateVersion: runtime.db.prepare('SELECT state_version FROM jobs WHERE id=?').get(checkoutId)?.state_version ?? null,
   });
   return { quoteId, items };
@@ -431,10 +448,18 @@ async function confirmCheckout(interaction, runtime, quoteId) {
     channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'CHECKOUT_CONFIRM' });
   const snapshot = quote.payload;
   const config = loadRuntimeConfig(runtime.db); runtime.config = config;
-  if (JSON.stringify(config.values.priceRules ?? config.values.prices ?? {}) !== snapshot.configHash) {
+  if (config.version !== snapshot.runtimeConfigVersion
+    || JSON.stringify(config.values.priceRules ?? config.values.prices ?? {}) !== snapshot.configHash) {
     throw new QuestshopError('QUOTE_STALE', 'ราคามีการเปลี่ยนแปลง กรุณาสร้างราคาใหม่');
   }
   const quests = snapshot.items;
+  for (const item of quests) {
+    const current = runtime.db.prepare(`SELECT task_type,contract_hash,starts_at,expires_at FROM quests WHERE quest_id=?`).get(item.questId);
+    if (!current || current.task_type !== item.taskType || current.contract_hash !== item.contractHash
+      || current.starts_at !== item.startsAt || current.expires_at !== item.expiresAt) {
+      throw new QuestshopError('QUOTE_STALE', 'ข้อมูล Quest มีการเปลี่ยนแปลง กรุณาสร้างราคาใหม่');
+    }
+  }
   await interaction.deferUpdate();
   await freshCheckoutQuests(runtime, { credentialId: snapshot.credentialId, accountId: snapshot.questAccountId }, quests);
   const order = createOrder(runtime.db, { discordUserId: interaction.user.id, questAccountId: snapshot.questAccountId,
@@ -452,6 +477,9 @@ async function routeButton(interaction, runtime, route, sessionId) {
   if (route === 'start') {
     assertCurrentSurface(interaction, runtime, 'QUEST_AUTO'); assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
     const config = loadRuntimeConfig(runtime.db);
+    if (!hasEverySupportedPrice(config)) {
+      throw new QuestshopError('PRICE_NOT_CONFIGURED', 'ร้านยังตั้งราคา Quest ไม่ครบ กรุณาติดต่อผู้ดูแล');
+    }
     const minimum = Math.min(...supportedTaskTypes().map((type) => priceForQuest(config.values, type)).filter(Number.isSafeInteger));
     const wallet = runtime.db.prepare('SELECT available_cents FROM wallets WHERE discord_user_id=?').get(interaction.user.id);
     if (Number.isSafeInteger(minimum) && Number(wallet?.available_cents ?? 0) < minimum) {
@@ -474,7 +502,9 @@ async function routeButton(interaction, runtime, route, sessionId) {
   }
   if (route === 'admin_price_edit') {
     const session = consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_PRICE_EDIT');
-    const submitId = sessionContext(interaction, runtime, 'ADMIN_PRICE_SUBMIT', { taskType: session.payload.taskType });
+    const submitId = sessionContext(interaction, runtime, 'ADMIN_PRICE_SUBMIT', {
+      taskType: session.payload.taskType, expectedConfigVersion: session.payload.expectedConfigVersion,
+    });
     return interaction.showModal(openAdminModal('admin_price_submit', submitId, `ตั้งราคา ${session.payload.taskType}`,
       [textInput('amountCents', 'ราคาเป็นสตางค์', { placeholder: 'เช่น 500 สำหรับ 5 บาท', maxLength: 12 }), textInput('reason', 'เหตุผล', { required: false })]));
   }
@@ -533,13 +563,16 @@ async function routeButton(interaction, runtime, route, sessionId) {
   }
   if (route === 'customer_quest_case_retry') {
     assertBackoffice(interaction, runtime);
+    assertCurrentDiscoveryCase(interaction, runtime, sessionId);
     const result = retryCustomerDiscovery(runtime.db, { notificationId: sessionId, actorId: interaction.user.id });
     return interaction.reply(ephemeral(result.queued ? 'เริ่มตรวจและทดสอบ Quest ใหม่แล้ว' : 'Quest นี้มีงานตรวจอยู่แล้ว'));
   }
   if (route === 'customer_quest_announce') {
     assertBackoffice(interaction, runtime);
-    announceCustomerDiscovery(runtime.db, { notificationId: sessionId, actorId: interaction.user.id });
-    return interaction.reply(ephemeral('ส่ง Quest เข้าคิวประกาศแล้ว'));
+    const notification = assertCurrentDiscoveryCase(interaction, runtime, sessionId);
+    const result = announceCustomerDiscovery(runtime.db, { notificationId: sessionId, actorId: interaction.user.id,
+      expectedQuestVersion: notification.quest_state_version });
+    return interaction.reply(ephemeral(result.queued ? 'ส่ง Quest เข้าคิวประกาศแล้ว' : 'Quest นี้ถูกส่งเข้าคิวประกาศไว้แล้ว'));
   }
   if (route === 'checkout_open') return openCheckout(interaction, runtime, sessionId);
   if (route === 'checkout_page_previous') return moveCheckoutPage(interaction, runtime, sessionId, -1);
@@ -579,7 +612,7 @@ async function routeModal(interaction, runtime, route) {
     const session = consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_PRICE_SUBMIT');
     const next = setQuestPrice(runtime.db, { taskType: session.payload.taskType,
       amountCents: interaction.fields.getTextInputValue('amountCents'), actorId: interaction.user.id,
-      reason: interaction.fields.getTextInputValue('reason') });
+      reason: interaction.fields.getTextInputValue('reason'), expectedConfigVersion: session.payload.expectedConfigVersion });
     runtime.config = loadRuntimeConfig(runtime.db);
     return interaction.reply(ephemeral(`บันทึกราคา ${session.payload.taskType} แล้ว (${next.priceRules[session.payload.taskType].amountCents / 100} บาท)`));
   }
