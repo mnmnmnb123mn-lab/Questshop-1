@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS credentials (
   subject_type TEXT NOT NULL,
   subject_id TEXT NOT NULL,
   credential_type TEXT NOT NULL,
+  key_version TEXT NOT NULL DEFAULT 'v1' CHECK (key_version GLOB 'v[0-9]*'),
   retention_class TEXT NOT NULL CHECK (retention_class IN ('TEMPORARY','PERSISTENT')),
   ciphertext BLOB NOT NULL,
   nonce BLOB NOT NULL,
@@ -295,6 +296,28 @@ CREATE TRIGGER IF NOT EXISTS settlement_evidence_append_only_update
 BEFORE UPDATE ON settlement_evidence BEGIN SELECT RAISE(ABORT, 'settlement_evidence is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS settlement_evidence_append_only_delete
 BEFORE DELETE ON settlement_evidence BEGIN SELECT RAISE(ABORT, 'settlement_evidence is append-only'); END;
+
+-- A worker must leave an immutable trail around every external operation.
+-- This is deliberately separate from the mutable job checkpoint so restart
+-- recovery can distinguish a request that was never sent from one that may
+-- have reached a provider.
+CREATE TABLE IF NOT EXISTS external_operation_evidence (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  subject_type TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  stage TEXT NOT NULL CHECK (stage IN ('INTENT','POSSIBLY_SENT','VERIFIED_RESULT','AMBIGUOUS','RECOVERY_DECISION')),
+  evidence_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(evidence_json)),
+  trace_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(job_id, stage)
+) STRICT;
+CREATE INDEX IF NOT EXISTS external_operation_evidence_subject
+  ON external_operation_evidence(subject_type, subject_id, created_at);
+CREATE TRIGGER IF NOT EXISTS external_operation_evidence_append_only_update
+BEFORE UPDATE ON external_operation_evidence BEGIN SELECT RAISE(ABORT, 'external_operation_evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS external_operation_evidence_append_only_delete
+BEFORE DELETE ON external_operation_evidence BEGIN SELECT RAISE(ABORT, 'external_operation_evidence is append-only'); END;
 
 CREATE TABLE IF NOT EXISTS admin_audit (
   id TEXT PRIMARY KEY,

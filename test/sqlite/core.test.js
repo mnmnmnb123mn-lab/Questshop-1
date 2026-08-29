@@ -50,11 +50,12 @@ async function database() {
 test('SQLite migration creates strict financial schema and append-only audit', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const tables = fixture.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'").get();
-  assert.equal(Number(tables.count), 18);
+  assert.equal(Number(tables.count), 19);
   assert.equal(fullIntegrityCheck(fixture.db).ok, true);
   appendWalletTransaction(fixture.db, { discordUserId: 'customer-a', transactionType: 'TOPUP', availableDeltaCents: 500,
     referenceType: 'TEST', referenceId: 'one', idempotencyKey: 'append-only-one', traceId: randomUUID() });
   assert.throws(() => fixture.db.prepare('DELETE FROM wallet_transactions').run(), /append-only/);
+  assert.ok(fixture.db.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='external_operation_evidence_append_only_update'").get());
 });
 
 test('external outcome and surface fallbacks reject unsafe data without changing customer contracts', () => {
@@ -303,7 +304,7 @@ test('Monitor search and test use only matching active account credentials', asy
   assert.equal(fixture.db.prepare("SELECT state FROM quest_checks WHERE check_type='SEARCH'").get().state, 'COMPLETED');
 });
 
-test('Monitor test records a passed Quest after a ready search result', async (t) => {
+test('Monitor test does not pass a Quest completed before its own mutation', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const now = Date.now();
   fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,first_seen_at,last_seen_at,updated_at)
@@ -324,8 +325,8 @@ test('Monitor test records a passed Quest after a ready search result', async (t
     operationKey: 'ready-search', payload: { questId: 'ready-quest' } });
   await processQuestWorkflowJob(runtime, claimDueJob(fixture.db));
   await processQuestWorkflowJob(runtime, claimDueJob(fixture.db));
-  assert.equal(fixture.db.prepare('SELECT monitor_status FROM quests WHERE quest_id=?').get('ready-quest').monitor_status, 'TEST_PASSED');
-  assert.equal(fixture.db.prepare("SELECT state FROM quest_checks WHERE check_type='TEST'").get().state, 'PASSED');
+  assert.equal(fixture.db.prepare('SELECT monitor_status FROM quests WHERE quest_id=?').get('ready-quest').monitor_status, 'TEST_FAILED');
+  assert.equal(fixture.db.prepare("SELECT state FROM quest_checks WHERE check_type='TEST'").get().state, 'FAILED');
 });
 
 test('a Quest absent from every active Monitor becomes not found without a test mutation', async (t) => {
@@ -632,6 +633,34 @@ test('job checkpoints recover safe reads and quarantine possibly sent mutations'
   fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(safe.id);
   recoverInterruptedJobs(fixture.db);
   assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(safe.id).state, 'PENDING');
+});
+
+test('subject-aware recovery creates reviews and requeues only durable redeemed credit', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const env = { QUESTSHOP_SECRET_KEY: secret };
+  const uncertain = submitTopup(fixture.db, env, { discordUserId: 'recovery-customer',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=6123456789abcdef0123456789abcdef01' }).topup;
+  const uncertainJob = claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' });
+  markTopupProcessing(fixture.db, uncertain.id);
+  markJobPossiblySent(fixture.db, { jobId: uncertainJob.id, leaseToken: uncertainJob.lease_token });
+  fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(uncertainJob.id);
+  recoverInterruptedJobs(fixture.db);
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(uncertain.id).status, 'REVIEW');
+  assert.equal(fixture.db.prepare("SELECT category FROM manual_reviews WHERE subject_type='TOPUP' AND subject_id=? AND state='OPEN'").get(uncertain.id).category, 'FINANCIAL');
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(uncertainJob.id).state, 'REVIEW');
+
+  const redeemed = submitTopup(fixture.db, env, { discordUserId: 'recovery-customer',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=7123456789abcdef0123456789abcdef01' }).topup;
+  markTopupProcessing(fixture.db, redeemed.id);
+  recordRedeemedTopup(fixture.db, { topupId: redeemed.id, principalCents: 500 });
+  const redeemedJob = claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' });
+  markJobPossiblySent(fixture.db, { jobId: redeemedJob.id, leaseToken: redeemedJob.lease_token });
+  fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(redeemedJob.id);
+  recoverInterruptedJobs(fixture.db);
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(redeemedJob.id).state, 'PENDING');
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(redeemed.id).status, 'REDEEMED');
+  const evidence = fixture.db.prepare("SELECT evidence_json FROM external_operation_evidence WHERE job_id=? AND stage='RECOVERY_DECISION'").get(redeemedJob.id);
+  assert.match(evidence.evidence_json, /CREDIT_REDEEMED_WITHOUT_PROVIDER_RETRY/);
 });
 
 test('gates are closed by default and Notification recovery/defer preserves a durable projection', async (t) => {

@@ -12,7 +12,7 @@ export function assertRequiredSchema(db) {
   const tables = new Set(db.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map((row) => row.name));
   const required = ['settings', 'wallets', 'wallet_transactions', 'topups', 'payment_attempts', 'promotions',
     'quests', 'monitor_accounts', 'credentials', 'orders', 'order_items', 'jobs', 'quest_checks',
-    'notifications', 'interaction_sessions', 'manual_reviews', 'settlement_evidence', 'admin_audit'];
+    'notifications', 'interaction_sessions', 'manual_reviews', 'settlement_evidence', 'external_operation_evidence', 'admin_audit'];
   const missing = required.filter((name) => !tables.has(name));
   if (missing.length) {
     const error = new Error(`SQLite migration is missing required tables: ${missing.join(', ')}`);
@@ -27,7 +27,7 @@ export function assertRequiredSchema(db) {
     notifications: ['id', 'desired_version', 'sending_version', 'delivered_version', 'attempt_version', 'nonce'],
     interaction_sessions: ['id', 'actor_id', 'guild_id', 'channel_id', 'message_id', 'operation', 'expires_at', 'consumed_at'],
     jobs: ['id', 'checkpoint', 'state_version', 'lease_token', 'lease_expires_at'],
-    credentials: ['id', 'retention_class', 'cleanup_after'],
+    credentials: ['id', 'retention_class', 'cleanup_after', 'key_version'],
     manual_reviews: ['id', 'state_version', 'first_confirmation_by', 'decision'],
   };
   for (const [table, columns] of Object.entries(requiredColumns)) {
@@ -50,6 +50,7 @@ export function assertRequiredSchema(db) {
   }
   for (const trigger of ['wallet_transactions_append_only_update', 'wallet_transactions_append_only_delete',
     'settlement_evidence_append_only_update', 'settlement_evidence_append_only_delete',
+    'external_operation_evidence_append_only_update', 'external_operation_evidence_append_only_delete',
     'admin_audit_append_only_update', 'admin_audit_append_only_delete']) {
     if (!triggers.has(trigger)) {
       const error = new Error(`SQLite schema is missing append-only trigger: ${trigger}`);

@@ -3,6 +3,7 @@ import { nowMs, withImmediateTransaction } from '../../db/sqlite.js';
 import { appendWalletTransactionInTransaction } from './wallet.js';
 import { enqueueNotificationInTransaction } from './notifications.js';
 import { QuestshopError } from '../../shared/errors.js';
+import { assertActiveJobLeaseInTransaction } from './jobs.js';
 
 function refreshOrderState(db, orderId, timestamp) {
   const order = db.prepare('SELECT * FROM orders WHERE id=?').get(orderId);
@@ -30,6 +31,7 @@ function recordSettlementEvidenceInTransaction(db, { item, outcome, reason, evid
 
 export function createOrder(db, { discordUserId, questAccountId, credentialId = null, items, traceId = randomUUID(), prelaunch = false }) {
   if (!Array.isArray(items) || !items.length) throw new QuestshopError('NO_SELLABLE_QUEST', 'ไม่มี Quest ที่เลือก');
+  if (items.length > 25) throw new QuestshopError('ORDER_ITEM_LIMIT', 'เลือก Quest ได้สูงสุด 25 รายการต่อคำสั่งซื้อ');
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
     if (credentialId) {
@@ -78,7 +80,9 @@ export function createOrder(db, { discordUserId, questAccountId, credentialId = 
   });
 }
 
-function settleOrderItemInTransaction(db, { itemId, outcome, claimUrl = null, reason = null, verified = false, evidence = {}, timestamp = nowMs() }) {
+function settleOrderItemInTransaction(db, { itemId, outcome, claimUrl = null, reason = null, verified = false, evidence = {}, workerJob = null, timestamp = nowMs() }) {
+  if (workerJob) assertActiveJobLeaseInTransaction(db, { jobId: workerJob.jobId, leaseToken: workerJob.leaseToken,
+    subjectType: 'ORDER_ITEM', subjectId: itemId, expectedStateVersion: workerJob.expectedJobVersion ?? null });
   const item = db.prepare(`SELECT i.*,o.discord_user_id,o.trace_id FROM order_items i JOIN orders o ON o.id=i.order_id
     WHERE i.id=?`).get(itemId);
     if (!item) throw new QuestshopError('ORDER_ITEM_NOT_FOUND', 'ไม่พบรายการ Quest');
@@ -155,15 +159,31 @@ export function resolveOrderItemReview(db, { reviewId, actorId, decision, reason
   });
 }
 
-export function markOrderItemRunning(db, { itemId }) {
+export function markOrderItemRunning(db, { itemId, workerJob = null }) {
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
+    if (workerJob) assertActiveJobLeaseInTransaction(db, { jobId: workerJob.jobId, leaseToken: workerJob.leaseToken,
+      subjectType: 'ORDER_ITEM', subjectId: itemId, expectedStateVersion: workerJob.expectedJobVersion ?? null });
     const item = db.prepare('SELECT * FROM order_items WHERE id=?').get(itemId);
     if (!item || item.state !== 'QUEUED') return item ?? null;
     db.prepare(`UPDATE order_items SET state='RUNNING',state_version=state_version+1,updated_at=? WHERE id=? AND state_version=?`)
       .run(timestamp, itemId, item.state_version);
     refreshOrderState(db, item.order_id, timestamp);
     return db.prepare('SELECT * FROM order_items WHERE id=?').get(itemId);
+  });
+}
+
+export function updateOrderItemProgress(db, { itemId, progressPercent, workerJob }) {
+  const timestamp = nowMs();
+  return withImmediateTransaction(db, () => {
+    assertActiveJobLeaseInTransaction(db, { jobId: workerJob.jobId, leaseToken: workerJob.leaseToken,
+      subjectType: 'ORDER_ITEM', subjectId: itemId, expectedStateVersion: workerJob.expectedJobVersion ?? null });
+    const item = db.prepare('SELECT * FROM order_items WHERE id=?').get(itemId);
+    if (!item || !['QUEUED', 'RUNNING'].includes(item.state)) return item ?? null;
+    const progress = Math.max(0, Math.min(100, Math.round(Number(progressPercent) || 0)));
+    const changed = db.prepare(`UPDATE order_items SET progress_percent=?,state_version=state_version+1,updated_at=?
+      WHERE id=? AND state_version=?`).run(progress, timestamp, itemId, item.state_version);
+    return changed.changes ? db.prepare('SELECT * FROM order_items WHERE id=?').get(itemId) : null;
   });
 }
 

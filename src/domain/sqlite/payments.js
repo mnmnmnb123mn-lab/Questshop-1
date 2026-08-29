@@ -6,6 +6,7 @@ import { enqueueNotificationInTransaction } from './notifications.js';
 import { appendWalletTransactionInTransaction } from './wallet.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { percentageBonusHalfUp } from '../../shared/money.js';
+import { appendExternalOperationEvidenceInTransaction, assertActiveJobLeaseInTransaction } from './jobs.js';
 
 const TEMPORARY_CREDENTIAL_LIFETIME_MS = 7 * 86_400_000;
 
@@ -91,9 +92,16 @@ function appendFinancialAudit(db, { actorId, action, topupId, reason = null, bef
     destination: 'LOG_ADMIN', payload: { auditId: id }, timestamp });
 }
 
-export function markTopupProcessing(db, topupId) {
+function assertPaymentWorkerLease(db, workerJob, topupId) {
+  if (!workerJob) return;
+  assertActiveJobLeaseInTransaction(db, { jobId: workerJob.jobId, leaseToken: workerJob.leaseToken,
+    subjectType: 'TOPUP', subjectId: topupId, expectedStateVersion: workerJob.expectedJobVersion ?? null });
+}
+
+export function markTopupProcessing(db, topupId, { workerJob = null } = {}) {
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
+    assertPaymentWorkerLease(db, workerJob, topupId);
     const topup = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
     if (!topup || !['PENDING', 'PROCESSING'].includes(topup.status)) return topup ?? null;
     db.prepare(`UPDATE topups SET status='PROCESSING',attempt_count=attempt_count+1,state_version=state_version+1,updated_at=?
@@ -108,9 +116,11 @@ export function markTopupProcessing(db, topupId) {
  * deliberate crash boundary: recovery can safely complete REDEEMED later. */
 export function recordRedeemedTopup(db, {
   topupId, principalCents, bonusCents = null, providerTransactionId = null, providerEvidence = {}, receiverLast4 = null,
+  workerJob = null,
 }) {
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
+    assertPaymentWorkerLease(db, workerJob, topupId);
     const topup = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
     if (!topup) throw new QuestshopError('TOPUP_NOT_FOUND', 'ไม่พบรายการเติมเงิน');
     if (['REDEEMED', 'CREDITED'].includes(topup.status)) return { topup, idempotent: true };
@@ -135,15 +145,19 @@ export function recordRedeemedTopup(db, {
       evidence_json=?,completed_at=? WHERE topup_id=? AND completed_at IS NULL`).run(
       Number(providerEvidence.httpStatus) || null, JSON.stringify(providerEvidence), timestamp, topup.id,
     );
+    if (workerJob) appendExternalOperationEvidenceInTransaction(db, { jobId: workerJob.jobId, subjectType: 'TOPUP', subjectId: topupId,
+      stage: 'VERIFIED_RESULT', evidence: { principalCents: principal, providerTransactionId, providerEvidence },
+      traceId: topup.trace_id, timestamp });
     const updated = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
     enqueueTopupProjections(db, updated, timestamp);
     return { topup: updated, idempotent: false };
   });
 }
 
-export function creditRedeemedTopup(db, { topupId }) {
+export function creditRedeemedTopup(db, { topupId, workerJob = null }) {
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
+    assertPaymentWorkerLease(db, workerJob, topupId);
     const topup = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
     if (!topup) throw new QuestshopError('TOPUP_NOT_FOUND', 'ไม่พบรายการเติมเงิน');
     if (topup.status === 'CREDITED') return { topup, idempotent: true };
@@ -169,23 +183,27 @@ export function creditVerifiedTopup(db, input) {
   return creditRedeemedTopup(db, { topupId: input.topupId });
 }
 
-export function moveTopupToReview(db, { topupId, reasonCode, safeReason }) {
+export function moveTopupToReview(db, { topupId, reasonCode, safeReason, workerJob = null }) {
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
+    assertPaymentWorkerLease(db, workerJob, topupId);
     const topup = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
     if (!topup || ['CREDITED', 'REVERSED', 'REVIEW'].includes(topup.status)) return topup ?? null;
     db.prepare(`UPDATE topups SET status='REVIEW',failure_reason=?,state_version=state_version+1,updated_at=? WHERE id=? AND state_version=?`)
       .run(reasonCode, timestamp, topupId, topup.state_version);
     const updated = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
     openFinancialReview(db, updated, reasonCode, safeReason, timestamp);
+    if (workerJob) appendExternalOperationEvidenceInTransaction(db, { jobId: workerJob.jobId, subjectType: 'TOPUP', subjectId: topupId,
+      stage: 'AMBIGUOUS', evidence: { reasonCode }, traceId: topup.trace_id, timestamp });
     enqueueTopupProjections(db, updated, timestamp);
     return updated;
   });
 }
 
-export function failTopup(db, { topupId, reasonCode }) {
+export function failTopup(db, { topupId, reasonCode, workerJob = null }) {
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
+    assertPaymentWorkerLease(db, workerJob, topupId);
     const topup = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
     if (!topup || ['CREDITED', 'REVERSED', 'REVIEW'].includes(topup.status)) return topup ?? null;
     db.prepare(`UPDATE topups SET status='FAILED',failure_reason=?,state_version=state_version+1,updated_at=? WHERE id=? AND state_version=?`)
