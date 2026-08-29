@@ -637,7 +637,8 @@ test('job checkpoints requeue safe reads and identify possibly sent mutations fo
   fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(uncertain.id);
   const interrupted = recoverInterruptedJobs(fixture.db);
   assert.equal(interrupted.some((job) => job.id === uncertain.id), true);
-  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(uncertain.id).state, 'RUNNING');
+  recoverInterruptedSubjects({ db: fixture.db });
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(uncertain.id).state, 'REVIEW');
 
   enqueueJob(fixture.db, { jobType: 'READ', subjectType: 'TEST', subjectId: 'restart', operationKey: 'safe-restart' });
   const safe = claimDueJob(fixture.db);

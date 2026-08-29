@@ -111,7 +111,12 @@ export function recoverInterruptedSubjects(runtime) {
       }
       continue;
     }
-    if (job.job_type !== 'QUEST_RUN') continue;
+    if (job.job_type !== 'QUEST_RUN') {
+      // An extension job without a declared subject recovery policy must not
+      // be retried after a possible external send.
+      finishRecoveredJob(runtime.db, { jobId: job.id, state: 'REVIEW', checkpoint: 'POSSIBLY_SENT', errorCode: 'RESTART_AFTER_POSSIBLY_SENT' });
+      continue;
+    }
     const item = runtime.db.prepare('SELECT * FROM order_items WHERE id=?').get(job.subject_id);
     if (!item) { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', errorCode: 'ORDER_ITEM_NOT_FOUND' }); continue; }
     if (item.state === 'READY_TO_CLAIM') { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'COMPLETED' }); continue; }
