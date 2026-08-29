@@ -30,19 +30,14 @@ function run(args) {
 const coverage = process.argv.includes('--coverage');
 const roots = process.argv.slice(2).filter((argument) => argument !== '--coverage').map((root) => resolve(root));
 const selectedRoots = roots.length ? roots : [resolve('test')];
-if (process.env.CI && !process.env.TEST_DATABASE_URL) {
-  throw new Error('TEST_DATABASE_URL is required in CI; refusing to skip PostgreSQL contract tests');
-}
-const files = (await Promise.all(selectedRoots.map(filesUnder))).flat().sort();
+// `npm test` is the full source suite.  Selecting only the new SQLite tests
+// hid broken imports in the rest of the repository during the migration.
+const defaultRoots = [resolve('test')];
+const files = (await Promise.all((roots.length ? selectedRoots : defaultRoots).map(filesUnder))).flat().sort();
 if (!files.length) throw new Error('No test files found');
 if (coverage) {
   await mkdir(resolve('coverage'), { recursive: true });
-  // Reporter destinations are paired in declaration order by Node. Keep each
-  // reporter next to its destination; grouping reporters first produced an
-  // empty LCOV artifact on supported Node versions while the textual report
-  // still looked successful. PostgreSQL fixtures hold a session advisory lock
-  // through each test-file lifecycle, so a combined coverage invocation cannot
-  // reset a disposable schema underneath another suite.
+  // Reporter destinations are paired in declaration order by Node.
   await run(['--test', '--test-concurrency=1', '--experimental-test-coverage',
     '--test-reporter=spec', '--test-reporter-destination=stdout',
     '--test-reporter=lcov', '--test-reporter-destination=coverage/lcov.info', ...files]);

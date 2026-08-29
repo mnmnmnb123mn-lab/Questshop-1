@@ -3,17 +3,25 @@
 Use `evidence-template.md` to record every result against one deployed build. Never record raw tokens, database URLs,
 keyrings or a full voucher URL in UAT evidence.
 
+## SQLite runtime proof
+
+- [ ] Run the candidate with Node 22.22 and an empty persistent `/data/questshop.db`; verify Migration succeeds,
+      database and directory are owner-only, and `quick_check` plus `foreign_key_check` pass after startup.
+- [ ] Restart and redeploy the same 40-character Git SHA; verify Wallet, Jobs, Notifications and surface anchors persist.
+- [ ] Create a daily and Pre-migration backup, restore it while Runtime is stopped, verify `integrity_check` and
+      `foreign_key_check`, and confirm stale `-wal`/`-shm` files are not reused.
+- [ ] Attempt a second Runtime against the same database and verify the single-instance lock rejects it.
+
 ## Preconditions
 
 - [ ] `PRELAUNCH=true`; customer routes are restricted to Owner/Admin for this round.
-- [ ] inwcloud runs Node 22.x and the intended branch/commit is deployed; no `GIT_SHA` Environment Variable is required.
+- [ ] inwcloud runs Node 22.22 and the intended 40-character `GIT_SHA` is deployed.
 - [ ] inwcloud Root Directory is explicitly the repository root; the GitHub Actions workflow passed for this build.
-- [ ] `questshop_migrator` and `questshop_runtime` are different effective roles.
-- [ ] Production DB URLs use `sslmode=verify-full`; Runtime has no DDL and protected append-only tables deny update/delete.
+- [ ] `/data/questshop.db` is persistent, SQLite runs WAL plus `synchronous=FULL`, and only one Runtime owns its lock.
 - [ ] Bot has Discord `Administrator`.
 - [ ] Owner has manually configured backoffice channel privacy; no automated human-visibility guard is assumed.
-- [ ] Receiver, Monitor and keyring health are valid; record versions/IDs only.
-- [ ] `npm run check`, `npm run lint`, PostgreSQL-backed coverage/tests, load test, `npm audit --audit-level=high` and Docker build passed for this build.
+- [ ] Receiver and Monitor credentials are valid; record IDs only.
+- [ ] `npm run check`, `npm run lint`, SQLite coverage/tests, load test, `npm audit --audit-level=high` and Docker build passed for this build.
 
 ## Quest Auto storefront UAT
 
@@ -65,9 +73,9 @@ same Quest payload/evidence; do not infer values from another bot or a screensho
 ## Financial proof
 
 - [ ] Real low-value TrueMoney success: `REDEEMED → CREDITED` exactly once.
-- [ ] Submit a new valid voucher and verify the customer interaction immediately confirms only the durable Top-up ID,
-      never waits for TrueMoney or polls in the Ephemeral window, then starts settlement for that exact Top-up without
-      taking another queued customer's voucher.
+- [ ] Submit a new valid voucher and verify the customer receives the immediate ephemeral acknowledgement only after the
+      Top-up commits, without waiting for TrueMoney. Verify one editable DM then progresses from checking to the terminal
+      result for that exact Top-up, without taking another queued customer's voucher.
 - [ ] Real low-value TrueMoney success without a provider transaction ID (if Provider omits it): `REDEEMED → CREDITED`
       exactly once; the stored transaction ID stays `NULL` and the Payment Log identifies the encrypted voucher +
       Top-up ID settlement reference without exposing a raw response.
@@ -86,15 +94,8 @@ same Quest payload/evidence; do not infer values from another bot or a screensho
       rejection, Manual Review and reversal. After encrypted-payload retention, a deleted message recovers only as a
       masked card; the existing Discord message remains Owner-managed evidence.
 - [ ] `LOG_PAYMENTS` keeps the payer profile as its upper-right thumbnail and shows the approved
-      `payment-log-banner.png` once as the lower embed image after every create or edit; no duplicate attachment remains.
-- [ ] One `TOPUP_STATUS_DM` message is created or edited for queued, processing, retry, credited, terminal failure,
-      Manual Review, Owner decision and reversal; it has the payer thumbnail, `payment-log-banner.png` once, safe
-      Thai copy and no voucher URL, sender PII, raw JSON or duplicate attachment. Customer DM must not show the
-      payment-attempt count, promotion name, TrueMoney transaction reference or Wallet transaction reference; those
-      diagnostic references remain available in `LOG_PAYMENTS` and PostgreSQL.
-- [ ] Disable customer DMs and verify the acceptance reply warns the customer, Outbox retries at 1, 5, 15, 60, 300 and
-      900 seconds, then records a Financial DLQ on the next failed attempt without changing the Top-up, Wallet or ledger
-      settlement. Enable DM before the final attempt and verify the same status message delivers the latest state instead.
+      `payment-log-banner.webp` once as the lower embed image after every create or edit; no duplicate attachment remains.
+- [ ] After the interaction wait window, a `MANUAL_REVIEW` or Owner `REJECTED` result reaches the customer as a DM.
 - [ ] Multi-Quest order captures successful Items and releases definite failures without losing cents.
 - [ ] Worker crash/restart around settlement produces no duplicate Ledger mutation.
 
@@ -126,27 +127,26 @@ Use masked voucher identity only. Full voucher links belong only in the validate
       no token, cookie, credential, ciphertext, nonce or auth tag appears.
 - [ ] In `LOG_SYSTEM`, simulate one temporary Discord failure and one operator-action incident. Verify one updated card
       per incident/scope, Thai explanation, green resolved state, no raw JSON, and advice only where an operator must act.
-- [ ] Verify every `LOG_QUEST_OPERATIONS` and `LOG_SYSTEM` event card shows `backoffice-log-banner.webp`, while every
-      `LOG_ADMIN` event card shows `admin-log-banner.webp`, once below the Embed on desktop and mobile, including a
-      missing-aggregate fallback card.
+- [ ] Verify every `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` and `LOG_SYSTEM` event card shows `backoffice-log-banner.webp`
+      once below the Embed on desktop and mobile, including a missing-aggregate fallback card.
 - [ ] Verify Checkout/Discovery/Runner/Admin-user cards show the applicable global Discord profile or safe Quest artwork
       at upper-right when available; failed profile lookup must still deliver the card.
 - [ ] Verify every `LOG_SYSTEM` card and a `LOG_ADMIN` card authored by `SYSTEM` animate
       `log-system-thumbnail.gif` at upper-right and contain exactly two attachments (GIF plus banner), without duplicates after edits or retries.
 
-## Aiven / operations proof
+## SQLite / operations proof
 
-- [ ] Simulate a Discord DNS/connection outage across multiple Surfaces and confirm one `DISCORD_CONNECTIVITY`
-      message is updated without growing a backlog of obsolete `LOG_SYSTEM` projection events.
-- [ ] Reopen and resolve one operational Incident repeatedly; confirm the same Discord message changes state, uses a
-      green resolved appearance, and reports concise Thai diagnostics rather than raw JSON.
-- [ ] Confirm Outbox SLO reports dispatch-attempt duration while `OUTBOX_STUCK` reports queue age/backlog separately.
-- [ ] Confirm `PANEL_LATENCY_SLO` identifies route P95 and `ERROR_RATE_HIGH` identifies route/error-class aggregates
-      without customer input, raw JSON or duplicate Incident messages.
-- [ ] Verify `LOG_QUEST_OPERATIONS` and `LOG_ADMIN` show the current aggregate/audit message with Trace, safe IDs and
-      Thai status text; no Token, cookie, credential, ciphertext, nonce or auth tag may appear.
-- [ ] Aiven Console provider backup status and Free-plan recovery limitation are recorded.
-- [ ] Runtime restart recovers leases, queue, Runner, Payment, Outbox and Review state.
+- [ ] Verify `/data/questshop.db` survives a process restart and a redeploy of the same Git SHA.
+- [ ] Run a pre-migration and daily backup; verify both with `integrity_check` and `foreign_key_check` before rotation.
+- [ ] Stop Runtime, restore a verified backup into a disposable `/data` copy, discard stale `-wal`/`-shm`, then run
+      full integrity checks before allowing workers to start.
+- [ ] Start a second process against the same SQLite path and verify the single-instance lock rejects it without
+      writing to the database.
+- [ ] Simulate Discord DM failure and a channel timeout. Verify notifications retry/edit the same message and never
+      change Wallet, Top-up, Order or Quest results.
+- [ ] Verify `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` and `LOG_SYSTEM` render safe Thai text and do not expose Token,
+      voucher, cookie, credential, ciphertext, nonce or auth tag.
+- [ ] Runtime restart recovers queued Jobs, Notifications and Review state according to their checkpoints.
 - [ ] `/livez`, `/readyz` and authenticated `/statusz` behave as documented.
 - [ ] External/Owner alert delivery is observed.
 - [ ] Rollback rehearsal records app rollback or forward-fix decision without editing applied migrations.

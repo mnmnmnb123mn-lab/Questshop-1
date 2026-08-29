@@ -1,19 +1,19 @@
 # State-machine contracts
 
-Canonical transition maps live in each domain `states.js`; SQL `CHECK` constraints define the durable value set.
-Discord handlers never update business state directly. Every aggregate transition uses compare-and-swap, increments
-`state_version` and records trace/causation/actor evidence.
+SQLite `CHECK` constraints define the durable value set. Discord handlers never update business state directly;
+Domain services use short `BEGIN IMMEDIATE` transactions and append Wallet/Admin evidence without holding a transaction
+over Discord, TrueMoney or Quest I/O.
 
 ## Top-up
 
 ```text
-RECEIVED → VALIDATING → PAYMENT_QUEUED → PROCESSING
+PENDING → PROCESSING → REDEEMED → CREDITED
 ```
 
 Success separates `REDEEMED` from `CREDITED`. A request that may have reached TrueMoney is never blindly retried.
 Uncertain results enter Owner-only Manual Review.
 
-After `PAYMENT_QUEUED` commits, the customer interaction acknowledges only the durable Top-up ID and starts a targeted
+After `PENDING` commits, the customer interaction acknowledges only the durable Top-up ID and starts a targeted
 background settlement. `TOPUP_STATUS_DM` is one Outbox projection per Top-up and is refreshed for each meaningful
 payment transition; Discord delivery failure never changes payment or Wallet state. กรณี DM ถูกปิดจะ retry ตาม
 backoff 6 รอบก่อนเข้า Financial DLQ.
@@ -30,7 +30,7 @@ then recovery returns it through `QUEUED`. Ordinary transient failures use `WAIT
 ## Outbox
 
 ```text
-PENDING → LEASED → DELIVERED | RETRY_WAIT | DEAD_LETTER
+PENDING → SENDING → DELIVERED | RETRY_WAIT | DEAD_LETTER
 ```
 
 Financial and Audit DLQ records cannot be discarded.

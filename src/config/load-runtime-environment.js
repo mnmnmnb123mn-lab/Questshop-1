@@ -18,8 +18,5 @@ try {
 
 const bundle = process.env.QUESTSHOP_SECRET_BUNDLE;
 applyRuntimeValues(decodeSecretBundle(bundle));
-// A stateless runtime may receive a shared legacy bundle. Remove both the
-// encoded source and deployment-only URL after importing the runtime allowlist.
+// Do not retain the encoded bundle after the runtime allowlist is applied.
 delete process.env.QUESTSHOP_SECRET_BUNDLE;
-delete process.env.DATABASE_DIRECT_URL;
-delete process.env.DATABASE_RESTORE_URL;

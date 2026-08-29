@@ -4,7 +4,7 @@ const SECRET_KEYS = new Set([
 ]);
 const MFA_DISCORD_TOKEN = /\bmfa\.[A-Za-z0-9_-]{20,}\b/g;
 const DISCORD_TOKEN = /\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b/g;
-const DATABASE_URL = /postgres(?:ql)?:\/\/[^\s]+/gi;
+const DATABASE_URL = /(?:postgres(?:ql)?|sqlite):\/\/[^\s]+/gi;
 const TRUEMONEY_VOUCHER_URL = /https:\/\/gift\.truemoney\.com\/campaign\/?\?v=[A-Za-z0-9]{16,128}/gi;
 const SENSITIVE_ASSIGNMENTS = [
   /(\b(?:token|cookie|password|secret|credential|session)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
