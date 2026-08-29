@@ -1,7 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
 import { decryptCredential } from '../domain/sqlite/crypto.js';
-import { claimDueJob, completeJob, markJobPossiblySent, recoverInterruptedJobs, renewJobLease } from '../domain/sqlite/jobs.js';
+import { appendExternalOperationEvidenceInTransaction, assertActiveJobLeaseInTransaction, claimDueJob, completeJob, markJobPossiblySent, recoverInterruptedJobs, renewJobLease } from '../domain/sqlite/jobs.js';
 import { creditRedeemedTopup, failTopup, markTopupProcessing, moveTopupToReview, recordRedeemedTopup } from '../domain/sqlite/payments.js';
 import { claimDueNotification, deferNotification, finishNotificationDelivery, recoverSendingNotifications } from '../domain/sqlite/notifications.js';
 import { nowMs, withImmediateTransaction } from '../db/sqlite.js';
@@ -60,11 +60,17 @@ function getReceiverPhone(db, env) {
   return { phone, last4: phone.slice(-4) };
 }
 
-function createAttempt(db, topupId, attemptNumber, traceId) {
+function createAttempt(db, topupId, attemptNumber, traceId, workerJob) {
   const id = randomUUID();
   const timestamp = nowMs();
-  withImmediateTransaction(db, () => db.prepare(`INSERT INTO payment_attempts(id,topup_id,attempt_number,dispatch_state,evidence_json,trace_id,started_at)
-    VALUES(?,?,?,'INTENT_RECORDED','{}',?,?)`).run(id, topupId, attemptNumber, traceId, timestamp));
+  withImmediateTransaction(db, () => {
+    assertActiveJobLeaseInTransaction(db, { jobId: workerJob.jobId, leaseToken: workerJob.leaseToken,
+      subjectType: 'TOPUP', subjectId: topupId });
+    db.prepare(`INSERT INTO payment_attempts(id,topup_id,attempt_number,dispatch_state,evidence_json,trace_id,started_at)
+      VALUES(?,?,?,'INTENT_RECORDED','{}',?,?)`).run(id, topupId, attemptNumber, traceId, timestamp);
+    appendExternalOperationEvidenceInTransaction(db, { jobId: workerJob.jobId, subjectType: 'TOPUP', subjectId: topupId,
+      stage: 'INTENT', evidence: { attemptNumber }, traceId, timestamp });
+  });
   return id;
 }
 
@@ -79,27 +85,51 @@ function recordAttemptResponse(db, attemptId, { dispatchState = 'RESPONSE_RECEIV
       JSON.stringify(evidence), nowMs(), attemptId));
 }
 
+function enqueueVerifiedMonitorAnnouncements(db) {
+  if (!currentFeatureGates(db).QUEST_ANNOUNCEMENT_ENABLED) return 0;
+  const timestamp = nowMs();
+  return withImmediateTransaction(db, () => {
+    const rows = db.prepare("SELECT * FROM quests WHERE monitor_status='TEST_PASSED' AND announcement_status='NOT_ANNOUNCED'").all();
+    for (const quest of rows) {
+      const changed = db.prepare(`UPDATE quests SET announcement_status='QUEUED',state_version=state_version+1,updated_at=?
+        WHERE quest_id=? AND announcement_status='NOT_ANNOUNCED' AND state_version=?`).run(timestamp, quest.quest_id, quest.state_version);
+      if (changed.changes) {
+        // Unique notification identity makes this restart-safe and prevents
+        // a gate toggle from bumping a durable desired version.
+        db.prepare(`INSERT INTO notifications(id,notification_type,aggregate_type,aggregate_id,destination,nonce,state,next_run_at,payload_json,created_at,updated_at)
+          VALUES(?,?,?,?,?,?, 'PENDING',?,?,?,?) ON CONFLICT(notification_type,aggregate_type,aggregate_id,destination) DO NOTHING`)
+          .run(randomUUID(), 'QUEST_NEW', 'QUEST', quest.quest_id, 'QUEST_NEW', randomUUID(), timestamp,
+            JSON.stringify({ questId: quest.quest_id, verifiedByMonitor: true }), timestamp, timestamp);
+      }
+    }
+    return rows.length;
+  });
+}
+
 export async function processPaymentJob(runtime, job) {
+  const workerJob = { jobId: job.id, leaseToken: job.lease_token };
   let topup = runtime.db.prepare('SELECT * FROM topups WHERE id=?').get(job.subject_id);
   if (topup?.status === 'REDEEMED') {
-    creditRedeemedTopup(runtime.db, { topupId: topup.id });
+    creditRedeemedTopup(runtime.db, { topupId: topup.id, workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
   }
-  topup = markTopupProcessing(runtime.db, job.subject_id);
+  topup = markTopupProcessing(runtime.db, job.subject_id, { workerJob });
   if (!topup || topup.status === 'CREDITED') return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
   const credential = runtime.db.prepare("SELECT * FROM credentials WHERE subject_type='TOPUP' AND subject_id=? AND credential_type='VOUCHER'").get(topup.id);
   const receiver = getReceiverPhone(runtime.db, runtime.env);
   if (!credential || !receiver) {
-    moveTopupToReview(runtime.db, { topupId: topup.id, reasonCode: 'PAYMENT_CREDENTIAL_UNAVAILABLE', safeReason: 'ข้อมูลรับเงินไม่พร้อมสำหรับตรวจซอง' });
+    moveTopupToReview(runtime.db, { topupId: topup.id, reasonCode: 'PAYMENT_CREDENTIAL_UNAVAILABLE', safeReason: 'ข้อมูลรับเงินไม่พร้อมสำหรับตรวจซอง', workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW', errorCode: 'PAYMENT_CREDENTIAL_UNAVAILABLE' });
   }
   let voucher;
   try { voucher = normalizeVoucherUrl(decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential)); } catch {
-    moveTopupToReview(runtime.db, { topupId: topup.id, reasonCode: 'VOUCHER_DECRYPT_FAILED', safeReason: 'ไม่สามารถอ่านข้อมูลซองอย่างปลอดภัย' });
+    moveTopupToReview(runtime.db, { topupId: topup.id, reasonCode: 'VOUCHER_DECRYPT_FAILED', safeReason: 'ไม่สามารถอ่านข้อมูลซองอย่างปลอดภัย', workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW', errorCode: 'VOUCHER_DECRYPT_FAILED' });
   }
-  const attemptId = createAttempt(runtime.db, topup.id, Number(topup.attempt_count) + 1, topup.trace_id);
-  markJobPossiblySent(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
+  const attemptId = createAttempt(runtime.db, topup.id, Number(topup.attempt_count) + 1, topup.trace_id, workerJob);
+  if (!markJobPossiblySent(runtime.db, { jobId: job.id, leaseToken: job.lease_token })) {
+    throw Object.assign(new Error('Payment lease lost before provider dispatch'), { code: 'JOB_LEASE_LOST' });
+  }
   recordAttemptSent(runtime.db, attemptId);
   try {
     const provider = runtime.paymentProvider ?? redeemVoucher;
@@ -107,15 +137,15 @@ export async function processPaymentJob(runtime, job) {
     if (result.outcome === EXTERNAL_OUTCOME.SUCCESS && result.currency === 'THB' && Number(result.amountCents) > 0) {
       recordRedeemedTopup(runtime.db, { topupId: topup.id, principalCents: result.amountCents,
         providerTransactionId: result.providerTransactionId ?? null, receiverLast4: receiver.last4,
-        providerEvidence: result.providerEvidence ?? { httpStatus: result.httpStatus } });
-      creditRedeemedTopup(runtime.db, { topupId: topup.id });
+        providerEvidence: result.providerEvidence ?? { httpStatus: result.httpStatus }, workerJob });
+      creditRedeemedTopup(runtime.db, { topupId: topup.id, workerJob });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
     }
     if (result.outcome === EXTERNAL_OUTCOME.DEFINITE_FAILURE) {
       const reason = result.reason ?? result.providerCode ?? 'PROVIDER_REJECTED';
       recordAttemptResponse(runtime.db, attemptId, { providerCode: reason,
         httpStatus: result.httpStatus ?? result.evidence?.httpStatus, evidence: result.providerEvidence ?? result.evidence ?? {} });
-      failTopup(runtime.db, { topupId: topup.id, reasonCode: reason });
+      failTopup(runtime.db, { topupId: topup.id, reasonCode: reason, workerJob });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED', errorCode: reason });
     }
     // Any unknown adapter result follows the same path as an uncertain
@@ -125,7 +155,7 @@ export async function processPaymentJob(runtime, job) {
     recordAttemptResponse(runtime.db, attemptId, { providerCode: reason,
       httpStatus: result.httpStatus ?? result.evidence?.httpStatus, evidence: result.providerEvidence ?? result.evidence ?? {} });
     moveTopupToReview(runtime.db, { topupId: topup.id, reasonCode: reason,
-      safeReason: 'ระบบยังยืนยันผลจาก TrueMoney ไม่ได้ จึงส่งให้ผู้ดูแลตรวจสอบ' });
+      safeReason: 'ระบบยังยืนยันผลจาก TrueMoney ไม่ได้ จึงส่งให้ผู้ดูแลตรวจสอบ', workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
       errorCode: reason, checkpoint: 'POSSIBLY_SENT' });
   } catch (error) {
@@ -140,7 +170,7 @@ export async function processPaymentJob(runtime, job) {
       evidence: error?.details && typeof error.details === 'object' ? error.details : {},
     });
     moveTopupToReview(runtime.db, { topupId: topup.id, reasonCode: error.code ?? 'PROVIDER_RESULT_AMBIGUOUS',
-      safeReason: 'ระบบยังยืนยันผลจาก TrueMoney ไม่ได้ จึงส่งให้ผู้ดูแลตรวจสอบ' });
+      safeReason: 'ระบบยังยืนยันผลจาก TrueMoney ไม่ได้ จึงส่งให้ผู้ดูแลตรวจสอบ', workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
       errorCode: error.code ?? 'PROVIDER_RESULT_AMBIGUOUS', checkpoint: 'POSSIBLY_SENT' });
   }
@@ -275,11 +305,19 @@ export function createSqliteWorkers({ runtime }) {
       // while this worker owns the token; every later state change still uses
       // the same token, so a stale worker cannot settle money or overwrite a
       // newer recovery attempt.
+      const jobAbortController = new AbortController();
+      const abortForShutdown = () => jobAbortController.abort(runtime.abortController.signal.reason ?? 'shutdown');
+      runtime.abortController.signal.addEventListener('abort', abortForShutdown, { once: true });
+      const workerRuntime = { ...runtime, abortController: jobAbortController };
       const leaseTimer = setInterval(() => {
         try {
           const renewed = renewJobLease(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
-          if (!renewed) runtime.logger?.warn?.({ jobId: job.id }, 'SQLite job lease was lost');
+          if (!renewed) {
+            jobAbortController.abort('job lease lost');
+            runtime.logger?.warn?.({ jobId: job.id }, 'SQLite job lease was lost');
+          }
         } catch (error) {
+          jobAbortController.abort('job lease renewal failed');
           runtime.logger?.warn?.({ error, jobId: job.id }, 'SQLite job lease renewal failed');
         }
       }, 10_000);
@@ -291,14 +329,15 @@ export function createSqliteWorkers({ runtime }) {
             errorCode: `${gate}_DISABLED`, checkpoint: job.checkpoint });
           return;
         }
-        if (job.job_type === 'PAYMENT_SETTLE') await processPaymentJob(runtime, job);
-        else await processNonPaymentJob(runtime, job);
+        if (job.job_type === 'PAYMENT_SETTLE') await processPaymentJob(workerRuntime, job);
+        else await processNonPaymentJob(workerRuntime, job);
       } catch (error) {
         runtime.logger?.error?.({ error, jobId: job.id, jobType: job.job_type }, 'SQLite job failed');
         await completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
           errorCode: error?.code ?? 'JOB_UNHANDLED_ERROR', checkpoint: job.checkpoint === 'POSSIBLY_SENT' ? 'POSSIBLY_SENT' : 'VERIFIED' });
       } finally {
         clearInterval(leaseTimer);
+        runtime.abortController.signal.removeEventListener('abort', abortForShutdown);
       }
     })();
     const active = job.job_type === 'PAYMENT_SETTLE' ? activePayments : activeJobs;
@@ -320,6 +359,7 @@ export function createSqliteWorkers({ runtime }) {
     let cleanupAt = 0;
     let backupAt = 0;
     let reconcileAt = 0;
+    let announcementAt = 0;
     while (!runtime.abortController.signal.aborted) {
       try {
         const work = await runOne();
@@ -334,6 +374,10 @@ export function createSqliteWorkers({ runtime }) {
         if (nowMs() >= reconcileAt) {
           await reconcileSurfaceAnchors({ runtime }).catch((error) => runtime.logger?.warn?.({ error }, 'Discord surface reconciliation deferred'));
           reconcileAt = nowMs() + 60_000;
+        }
+        if (nowMs() >= announcementAt) {
+          enqueueVerifiedMonitorAnnouncements(runtime.db);
+          announcementAt = nowMs() + 60_000;
         }
         runtime.health.checks.database = 'OK';
         // Readiness is derived from all startup/runtime checks, not merely
