@@ -5,7 +5,7 @@ SQLite financial records, receiver information and encryption/HMAC key material.
 and credential-sensitive even while it remains pre-launch.
 
 > [!IMPORTANT]
-> Source/test evidence is not a live-security certificate. Current status remains **implemented-but-unverified** until
+> Source/test evidence is not a live-security certificate. Current status remains **migration-in-progress** until
 > the live checklist passes on one exact Git SHA.
 
 ## Supported versions
