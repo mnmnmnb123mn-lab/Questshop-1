@@ -6,6 +6,7 @@ import { saveSurfaceInTransaction } from '../../config/runtime-config.js';
 import { loadRuntimeConfig } from '../../config/runtime-config.js';
 import { nowMs, withImmediateTransaction } from '../../db/sqlite.js';
 import { enqueueNotificationInTransaction } from '../../domain/sqlite/notifications.js';
+import { recordSystemIncident } from '../../domain/sqlite/incidents.js';
 
 export function surfaceNonce(surfaceKey) {
   const readable = `surface-${String(surfaceKey).toLowerCase()}`;
@@ -37,24 +38,51 @@ async function findSurfaceMarker(channel, surfaceKey) {
   const nonce = surfaceNonce(surfaceKey);
   const legacyFooter = `Questshop Surface • ${surfaceKey}`;
   const botUserId = channel.client?.user?.id;
+  const owned = (message) => !botUserId || message.author?.id === botUserId;
   let before;
   // Nonce is the durable primary identity.  The historical technical footer
   // is deliberately a migration-only fallback, so no customer-facing footer
   // is added to newly rendered storefronts.
+  const pages = [];
   for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) {
     const page = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
     const values = page?.values ? [...page.values()] : [];
-    const owned = (message) => !botUserId || message.author?.id === botUserId;
+    pages.push(values);
     const byNonce = values.find((message) => owned(message) && String(message.nonce ?? '') === nonce);
     if (byNonce) return byNonce;
+    const oldest = values.at(-1);
+    if (!oldest?.id || oldest.id === before || values.length < 100) break;
+    before = oldest.id;
+  }
+  // Only after exhausting the stable nonce search may an old technical
+  // footer be used as the one-way migration fallback.
+  for (const values of pages) {
     const byLegacyFooter = values.find((message) => owned(message)
       && message.embeds?.[0]?.footer?.text === legacyFooter);
     if (byLegacyFooter) return byLegacyFooter;
-    const oldest = values.at(-1);
-    if (!oldest?.id || oldest.id === before || values.length < 100) return null;
-    before = oldest.id;
   }
-  throw Object.assign(new Error('Unable to exhaust Discord surface reconciliation'), { code: 'SURFACE_RECONCILIATION_EXHAUSTED' });
+  return null;
+}
+
+function claimDurableSurfaceOperation(db, surfaceKey, actorId) {
+  const timestamp = nowMs(); const key = `surface_operation:${surfaceKey}`;
+  return withImmediateTransaction(db, () => {
+    const current = db.prepare('SELECT * FROM settings WHERE key=?').get(key);
+    let active = null;
+    try { active = JSON.parse(current?.value_json ?? 'null'); } catch { active = null; }
+    if (active?.expiresAt > timestamp) {
+      const error = new Error('Surface setup is already in progress'); error.code = 'SURFACE_SETUP_IN_PROGRESS'; throw error;
+    }
+    db.prepare(`INSERT INTO settings(key,value_json,updated_at,updated_by) VALUES(?,?,?,?)
+      ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
+      .run(key, JSON.stringify({ state: 'INTENT_RECORDED', actorId, startedAt: timestamp, expiresAt: timestamp + 5 * 60_000 }), timestamp, actorId);
+  });
+}
+
+function completeDurableSurfaceOperation(db, surfaceKey, actorId) {
+  const timestamp = nowMs();
+  withImmediateTransaction(db, () => db.prepare(`UPDATE settings SET value_json=?,updated_at=?,updated_by=? WHERE key=?`)
+    .run(JSON.stringify({ state: 'COMPLETED', completedAt: timestamp }), timestamp, actorId, `surface_operation:${surfaceKey}`));
 }
 
 export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, existingMessage = null) {
@@ -86,10 +114,10 @@ export async function setupSurface({ channel, surfaceKey, runtime, actorId }) {
   if (activeSurfaceOperations.has(surfaceKey)) {
     const error = new Error('Surface setup is already in progress'); error.code = 'SURFACE_SETUP_IN_PROGRESS'; throw error;
   }
+  claimDurableSurfaceOperation(runtime.db, surfaceKey, actorId);
   activeSurfaceOperations.add(surfaceKey);
   try {
   const current = runtime.config.surfaces?.[surfaceKey] ?? null;
-  await retireOldAnchor(runtime, surfaceKey, current, channel.id);
   const existing = current?.channelId === channel.id && current?.messageId
     ? await fetchSurfaceMessageFresh(channel, current.messageId) : null;
   const { message, recreated } = await updateOrCreateSurfaceAnchor(channel, surfaceKey, runtime.config, existing);
@@ -106,6 +134,10 @@ export async function setupSurface({ channel, surfaceKey, runtime, actorId }) {
   });
   runtime.config = { ...runtime.config, surfaces: { ...(runtime.config.surfaces ?? {}),
     [surfaceKey]: { channelId: channel.id, messageId: message.id, nonce: surfaceNonce(surfaceKey) } } };
+  // Persisting the replacement first means a failed move can never leave the
+  // storefront without a usable anchor.
+  await retireOldAnchor(runtime, surfaceKey, current, channel.id);
+  completeDurableSurfaceOperation(runtime.db, surfaceKey, actorId);
   return { message, recreated };
   } finally {
     activeSurfaceOperations.delete(surfaceKey);
@@ -122,7 +154,15 @@ export async function reconcileSurfaceAnchors({ runtime }) {
     const channel = await runtime.client.channels.fetch(stored.channelId).catch(() => null);
     if (!channel?.isTextBased?.()) continue;
     const existing = stored.messageId ? await fetchSurfaceMessageFresh(channel, stored.messageId) : null;
-    const result = await updateOrCreateSurfaceAnchor(channel, surfaceKey, runtime.config, existing).catch(() => null);
+    let result;
+    try { result = await updateOrCreateSurfaceAnchor(channel, surfaceKey, runtime.config, existing); }
+    catch (error) {
+      // 403 and transport errors must retry the same identity next cycle,
+      // never manufacture a second anchor.
+      recordSystemIncident(runtime.db, { code: error.code ?? error.status ?? 'SURFACE_RECONCILE_FAILED', scope: surfaceKey,
+        severity: 'WARNING', details: { channelId: stored.channelId } });
+      continue;
+    }
     if (!result || result.message.id === stored.messageId) continue;
     withImmediateTransaction(runtime.db, () => saveSurfaceInTransaction(runtime.db, surfaceKey,
       { channelId: channel.id, messageId: result.message.id, nonce: surfaceNonce(surfaceKey) }, 'SYSTEM'));
