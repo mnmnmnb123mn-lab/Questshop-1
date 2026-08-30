@@ -36,6 +36,7 @@ import { nextVideoTimestamp, videoExecutor } from '../../src/quest-engine/execut
 import { desktopExecutor } from '../../src/quest-engine/executors/desktop.js';
 import { EXTERNAL_OUTCOME, externalOutcome } from '../../src/domain/sqlite/external-outcome.js';
 import { consumeInteractionRateLimit } from '../../src/domain/sqlite/interaction-rate-limits.js';
+import { recordSystemIncident } from '../../src/domain/sqlite/incidents.js';
 
 const secret = 'sqlite-test-secret-key-which-is-at-least-32-characters';
 
@@ -63,6 +64,15 @@ test('customer mutation limits survive restart in SQLite', async (t) => {
   consumeInteractionRateLimit(fixture.db, { discordUserId: '12345678901234567', action: 'ORDER_CONFIRM', limit: 1, windowMs: 600_000, timestamp: 1_000 });
   assert.throws(() => consumeInteractionRateLimit(fixture.db, { discordUserId: '12345678901234567', action: 'ORDER_CONFIRM', limit: 1, windowMs: 600_000, timestamp: 1_001 }),
     (error) => error.code === 'INTERACTION_RATE_LIMITED');
+  assert.equal(consumeInteractionRateLimit(fixture.db, { discordUserId: '12345678901234567', action: 'ORDER_CONFIRM', limit: 1, windowMs: 600_000, timestamp: 601_000 }).remaining, 0);
+});
+
+test('operational incidents reuse one durable system notification', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  recordSystemIncident(fixture.db, { code: 'PAYMENT_CONTAINMENT', scope: 'TRUEMONEY', severity: 'ERROR' });
+  recordSystemIncident(fixture.db, { code: 'PAYMENT_CONTAINMENT', scope: 'TRUEMONEY', severity: 'ERROR' });
+  const payload = JSON.parse(fixture.db.prepare("SELECT payload_json FROM notifications WHERE notification_type='SYSTEM_LOG'").get().payload_json);
+  assert.equal(payload.occurrenceCount, 2);
 });
 
 test('external outcome and surface fallbacks reject unsafe data without changing customer contracts', () => {
@@ -552,6 +562,7 @@ test('SQLite Admin services configure price, receiver, monitor, promotion and au
   }
   assert.deepEqual(loadRuntimeConfig(fixture.db).priceRange, { minCents: 500, maxCents: 500 });
   assert.equal(configureReceiverPhone(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { phone: '0912345678', actorId: 'admin' }).last4, '5678');
+  assert.equal(configureReceiverPhone(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { phone: '0898765432', actorId: 'admin' }).last4, '5432');
   const monitor = upsertMonitorAccount(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { accountId: '12345678901234567', label: 'Monitor A', token: 'monitor-token', actorId: 'admin' });
   assert.equal(monitor.state, 'ACTIVE');
   const beforeRotation = fixture.db.prepare('SELECT ciphertext FROM credentials WHERE id=?').get(monitor.credential_id);
@@ -559,7 +570,12 @@ test('SQLite Admin services configure price, receiver, monitor, promotion and au
   assert.equal(rotated.credential_id, monitor.credential_id);
   assert.notDeepEqual(fixture.db.prepare('SELECT ciphertext FROM credentials WHERE id=?').get(rotated.credential_id).ciphertext, beforeRotation.ciphertext);
   assert.equal(Number(fixture.db.prepare("SELECT count(*) AS count FROM credentials WHERE subject_type='MONITOR' AND subject_id='12345678901234567'").get().count), 1);
-  assert.equal(upsertPromotion(fixture.db, { name: 'โบนัส', state: 'ACTIVE', minimumCents: 100, basisPoints: 500, actorId: 'admin' }).state, 'ACTIVE');
+  const promotion = upsertPromotion(fixture.db, { name: 'โบนัส', state: 'ACTIVE', minimumCents: 100, basisPoints: 500, actorId: 'admin' });
+  const changedPromotion = upsertPromotion(fixture.db, { id: promotion.id, name: 'โบนัสใหม่', state: 'ACTIVE', minimumCents: 100, basisPoints: 500,
+    actorId: 'admin', expectedStateVersion: promotion.state_version });
+  assert.equal(changedPromotion.name, 'โบนัสใหม่');
+  assert.throws(() => upsertPromotion(fixture.db, { id: promotion.id, name: 'เก่า', state: 'INACTIVE', minimumCents: 100, basisPoints: 500,
+    actorId: 'admin', expectedStateVersion: promotion.state_version }), (error) => error.code === 'PROMOTION_CONFLICT');
   const movement = adjustWallet(fixture.db, { discordUserId: '12345678901234567', availableDeltaCents: 700, actorId: 'admin', reason: 'UAT funding' });
   assert.equal(Number(movement.wallet.available_cents), 700);
   assert.deepEqual(adminOverview(fixture.db), { openReviews: 0, pendingJobs: 0, deadLetters: 0, activeMonitors: 1, receiverConfigured: true });
