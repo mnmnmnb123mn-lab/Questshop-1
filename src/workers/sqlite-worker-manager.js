@@ -443,12 +443,17 @@ export function createSqliteWorkers({ runtime }) {
     recoverInterruptedSubjects(runtime);
     recoverSendingNotifications(runtime.db);
     let cleanupAt = 0;
+    let recoveryAt = nowMs() + 60_000;
     let backupAt = 0;
     let reconcileAt = 0;
     let announcementAt = 0;
     while (!runtime.abortController.signal.aborted) {
       try {
         const work = await runOne();
+        if (nowMs() >= recoveryAt) {
+          recoverInterruptedSubjects(runtime);
+          recoveryAt = nowMs() + 60_000;
+        }
         if (nowMs() >= cleanupAt) {
           if (currentFeatureGates(runtime.db).RETENTION_JOBS_ENABLED) cleanupExpiredRows(runtime.db);
           cleanupAt = nowMs() + 60_000;

@@ -682,6 +682,9 @@ test('job checkpoints requeue safe reads and identify possibly sent mutations fo
   assert.equal(renewJobLease(fixture.db, { jobId: safe.id, leaseToken: safe.lease_token }), true);
   assert.equal(updateRunningJobPayload(fixture.db, { jobId: safe.id, leaseToken: safe.lease_token, payload: { stage: 'read' } }).checkpoint, 'NOT_STARTED');
   fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(safe.id);
+  assert.equal(renewJobLease(fixture.db, { jobId: safe.id, leaseToken: safe.lease_token }), false);
+  assert.equal(updateRunningJobPayload(fixture.db, { jobId: safe.id, leaseToken: safe.lease_token, payload: { stage: 'stale' } }), null);
+  assert.equal(completeJob(fixture.db, { jobId: safe.id, leaseToken: safe.lease_token }), null);
   recoverInterruptedJobs(fixture.db);
   assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(safe.id).state, 'PENDING');
 });
