@@ -19,6 +19,7 @@ import { changeFeatureGate } from '../../domain/sqlite/admin.js';
 import { supportedTaskTypes } from '../../domain/sqlite/pricing.js';
 import { bindInteractionSessionMessage, consumeInteractionSession, consumeModalInteractionSession, createInteractionSession } from '../../domain/sqlite/interaction-sessions.js';
 import { ADMIN, CUSTOMER, routeContract } from './contracts.js';
+import { installResponseController } from './response-controller.js';
 
 function ephemeral(content) { return { content, ephemeral: true, allowedMentions: { parse: [] } }; }
 
@@ -34,14 +35,14 @@ async function replyAndBindSessions(interaction, runtime, body, sessionIds) {
   return message;
 }
 
-function consumeAdminSession(interaction, runtime, sessionId, operation) {
-  assertBackoffice(interaction, runtime);
+async function consumeAdminSession(interaction, runtime, sessionId, operation) {
+  await assertBackoffice(interaction, runtime);
   return consumeInteractionSession(runtime.db, { sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
     channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation });
 }
 
-function consumeAdminModalSession(interaction, runtime, sessionId, operation) {
-  assertBackoffice(interaction, runtime);
+async function consumeAdminModalSession(interaction, runtime, sessionId, operation) {
+  await assertBackoffice(interaction, runtime);
   return consumeModalInteractionSession(runtime.db, { sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
     channelId: interaction.channelId, operation });
 }
@@ -139,7 +140,7 @@ async function showAdminReviews(interaction, runtime) {
 }
 
 async function handleAdminMenu(interaction, runtime) {
-  assertBackoffice(interaction, runtime);
+  await assertBackoffice(interaction, runtime);
   const choice = interaction.values?.[0];
   if (choice === 'overview') return interaction.reply({ embeds: [adminOverviewEmbed(runtime)], ephemeral: true, allowedMentions: { parse: [] } });
   if (choice === 'gates') return showAdminGates(interaction, runtime);
@@ -163,26 +164,33 @@ function openAdminModal(route, sessionId, title, fields) {
   return new ModalBuilder().setCustomId(customId(route, sessionId)).setTitle(title).addComponents(...fields);
 }
 
-export function hasAdministratorPermission(interaction) {
-  return interaction.memberPermissions?.has?.(PermissionFlagsBits.Administrator) === true;
+export async function hasAdministratorPermission(interaction, runtime) {
+  if (!interaction?.inGuild?.() || interaction.guildId !== runtime?.env?.DISCORD_GUILD_ID) return false;
+  try {
+    const guild = await runtime.client.guilds.fetch(interaction.guildId);
+    const member = await guild.members.fetch({ user: interaction.user.id, force: true });
+    return member.permissions.has(PermissionFlagsBits.Administrator);
+  } catch {
+    return false;
+  }
 }
 
-function assertBackoffice(interaction, _runtime) {
-  if (hasAdministratorPermission(interaction)) return;
+async function assertBackoffice(interaction, runtime) {
+  if (await hasAdministratorPermission(interaction, runtime)) return;
   throw new QuestshopError('NOT_AUTHORIZED', 'เมนูนี้ใช้ได้เฉพาะผู้ดูแล');
 }
 
-function assertOwner(interaction, runtime) {
-  if (interaction.user.id === runtime.env.OWNER_ID && hasAdministratorPermission(interaction)) return;
+async function assertOwner(interaction, runtime) {
+  if (interaction.user.id === runtime.env.OWNER_ID && await hasAdministratorPermission(interaction, runtime)) return;
   throw new QuestshopError('NOT_AUTHORIZED', 'การตัดสินใจทางการเงินขั้นสุดท้ายใช้ได้เฉพาะ Owner');
 }
 
-function assertCustomerRoute(interaction, runtime, gate) {
+async function assertCustomerRoute(interaction, runtime, gate) {
   const gates = currentFeatureGates(runtime.db);
   if (!gates.STORE_OPEN || !gates.CUSTOMER_INTERACTIONS_ENABLED || !gates[gate]) {
     throw new QuestshopError('FEATURE_DISABLED', 'ส่วนนี้ยังไม่เปิดให้ใช้งาน กรุณาติดต่อผู้ดูแล');
   }
-  if (runtime.env.PRELAUNCH && interaction.user.id !== runtime.env.OWNER_ID && !hasAdministratorPermission(interaction)) {
+  if (runtime.env.PRELAUNCH && interaction.user.id !== runtime.env.OWNER_ID && !await hasAdministratorPermission(interaction, runtime)) {
     throw new QuestshopError('PRELAUNCH_RESTRICTED', 'ระบบกำลังทดสอบก่อนเปิดใช้งาน');
   }
 }
@@ -213,14 +221,14 @@ function interactionKind(interaction) {
   return null;
 }
 
-function assertRouteContract(interaction, runtime, route) {
+async function assertRouteContract(interaction, runtime, route) {
   const contract = routeContract(route);
   if (!contract || contract.interaction !== interactionKind(interaction)) {
     throw new QuestshopError('ROUTE_INTERACTION_INVALID', 'รูปแบบการกดเมนูไม่ถูกต้อง');
   }
-  if (contract.access === ADMIN) assertBackoffice(interaction, runtime);
+  if (contract.access === ADMIN) await assertBackoffice(interaction, runtime);
   if (contract.access === CUSTOMER) {
-    for (const gate of contract.gates) assertCustomerRoute(interaction, runtime, gate);
+    for (const gate of contract.gates) await assertCustomerRoute(interaction, runtime, gate);
   }
   return contract;
 }
@@ -362,7 +370,7 @@ function updateCheckoutPayload(runtime, session, payload) {
 }
 
 async function openCheckout(interaction, runtime, checkoutId) {
-  assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+  await assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
   const { session, payload } = checkoutSession(runtime, interaction, checkoutId);
   await interaction.reply({ ...checkoutPagePayload(runtime, checkoutId, payload), ephemeral: true });
   const message = await interaction.fetchReply();
@@ -370,7 +378,7 @@ async function openCheckout(interaction, runtime, checkoutId) {
 }
 
 async function moveCheckoutPage(interaction, runtime, checkoutId, direction) {
-  assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+  await assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
   const { session, payload } = checkoutSession(runtime, interaction, checkoutId);
   const next = { ...payload, page: Math.max(0, (Number(payload.page) || 0) + direction) };
   updateCheckoutPayload(runtime, session, next);
@@ -378,7 +386,7 @@ async function moveCheckoutPage(interaction, runtime, checkoutId, direction) {
 }
 
 async function selectCheckoutQuests(interaction, runtime, checkoutId) {
-  assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+  await assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
   const { session, payload } = checkoutSession(runtime, interaction, checkoutId);
   const pageRows = pricedCheckoutQuestRows(runtime, payload).slice((Number(payload.page) || 0) * 25, ((Number(payload.page) || 0) + 1) * 25);
   const selected = new Set(payload.selectedQuestIds ?? []);
@@ -433,7 +441,7 @@ function createCheckoutQuote(interaction, runtime, checkoutId) {
 }
 
 async function quoteCheckout(interaction, runtime, checkoutId) {
-  assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+  await assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
   const { quoteId, items } = createCheckoutQuote(interaction, runtime, checkoutId);
   const total = items.reduce((sum, item) => sum + item.priceCents, 0);
   return replyAndBindSessions(interaction, runtime, { embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('ยืนยันราคา Quest')
@@ -443,7 +451,7 @@ async function quoteCheckout(interaction, runtime, checkoutId) {
 }
 
 async function confirmCheckout(interaction, runtime, quoteId) {
-  assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+  await assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
   const quote = consumeInteractionSession(runtime.db, { sessionId: quoteId, actorId: interaction.user.id, guildId: interaction.guildId,
     channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'CHECKOUT_CONFIRM' });
   const snapshot = quote.payload;
@@ -471,11 +479,11 @@ async function confirmCheckout(interaction, runtime, quoteId) {
 
 async function routeButton(interaction, runtime, route, sessionId) {
   if (route === 'topup') {
-    assertCurrentSurface(interaction, runtime, 'QUEST_AUTO'); assertCustomerRoute(interaction, runtime, 'TOPUP_ACCEPTING');
+    assertCurrentSurface(interaction, runtime, 'QUEST_AUTO'); await assertCustomerRoute(interaction, runtime, 'TOPUP_ACCEPTING');
     return interaction.showModal(voucherModal(sessionContext(interaction, runtime, 'VOUCHER_SUBMIT', {}, interaction.message?.id ?? null)));
   }
   if (route === 'start') {
-    assertCurrentSurface(interaction, runtime, 'QUEST_AUTO'); assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+    assertCurrentSurface(interaction, runtime, 'QUEST_AUTO'); await assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
     const config = loadRuntimeConfig(runtime.db);
     if (!hasEverySupportedPrice(config)) {
       throw new QuestshopError('PRICE_NOT_CONFIGURED', 'ร้านยังตั้งราคา Quest ไม่ครบ กรุณาติดต่อผู้ดูแล');
@@ -489,11 +497,11 @@ async function routeButton(interaction, runtime, route, sessionId) {
   }
   if (route === 'admin') {
     assertCurrentSurface(interaction, runtime, 'ADMIN_PANEL');
-    assertBackoffice(interaction, runtime);
+    await assertBackoffice(interaction, runtime);
     return interaction.reply({ embeds: [adminOverviewEmbed(runtime)], ephemeral: true, allowedMentions: { parse: [] } });
   }
   if (route === 'admin_gate_toggle') {
-    const session = consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_GATE_TOGGLE');
+    const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_GATE_TOGGLE');
     const gates = changeFeatureGate(runtime.db, { gate: session.payload.gate, enabled: session.payload.enabled, actorId: interaction.user.id,
       reason: 'เปลี่ยนจากแผงผู้ดูแล SQLite' });
     runtime.config = loadRuntimeConfig(runtime.db);
@@ -501,7 +509,7 @@ async function routeButton(interaction, runtime, route, sessionId) {
       embeds: [], components: [], allowedMentions: { parse: [] } });
   }
   if (route === 'admin_price_edit') {
-    const session = consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_PRICE_EDIT');
+    const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_PRICE_EDIT');
     const submitId = sessionContext(interaction, runtime, 'ADMIN_PRICE_SUBMIT', {
       taskType: session.payload.taskType, expectedConfigVersion: session.payload.expectedConfigVersion,
     });
@@ -509,14 +517,14 @@ async function routeButton(interaction, runtime, route, sessionId) {
       [textInput('amountCents', 'ราคาเป็นสตางค์', { placeholder: 'เช่น 500 สำหรับ 5 บาท', maxLength: 12 }), textInput('reason', 'เหตุผล', { required: false })]));
   }
   if (route === 'admin_receiver_edit') {
-    consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_RECEIVER_EDIT');
+    await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_RECEIVER_EDIT');
     const submitId = sessionContext(interaction, runtime, 'ADMIN_RECEIVER_SUBMIT');
     return interaction.showModal(openAdminModal('admin_receiver_submit', submitId, 'ตั้งค่าเบอร์รับเงิน', [
       textInput('phone', 'เบอร์ TrueMoney 10 หลัก', { placeholder: '0xxxxxxxxx', maxLength: 10 }), textInput('reason', 'เหตุผล', { required: false }),
     ]));
   }
   if (route === 'admin_monitor_add') {
-    consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_MONITOR_ADD');
+    await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_MONITOR_ADD');
     const submitId = sessionContext(interaction, runtime, 'ADMIN_MONITOR_SUBMIT');
     return interaction.showModal(openAdminModal('admin_monitor_submit', submitId, 'เพิ่มบัญชี Monitor', [
       textInput('accountId', 'Discord Account ID', { maxLength: 32 }), textInput('label', 'ชื่อเรียกบัญชี', { maxLength: 100 }),
@@ -524,13 +532,13 @@ async function routeButton(interaction, runtime, route, sessionId) {
     ]));
   }
   if (route === 'admin_monitor_scan') {
-    consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_MONITOR_SCAN');
+    await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_MONITOR_SCAN');
     const result = queueMonitorScanAndTest(runtime.db, { actorId: interaction.user.id });
     return interaction.update({ content: `เข้าคิว Scan + Test แล้ว ${result.queued} Quest`, embeds: [], components: [], allowedMentions: { parse: [] } });
   }
   if (route === 'admin_wallet_adjust') {
-    assertOwner(interaction, runtime);
-    consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_WALLET_ADJUST');
+    await assertOwner(interaction, runtime);
+    await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_WALLET_ADJUST');
     const submitId = sessionContext(interaction, runtime, 'ADMIN_WALLET_SUBMIT');
     return interaction.showModal(openAdminModal('admin_wallet_submit', submitId, 'ปรับ Wallet', [
       textInput('discordUserId', 'Discord User ID', { maxLength: 20 }), textInput('amountCents', 'จำนวนสตางค์ (+/-)', { maxLength: 14 }),
@@ -538,7 +546,7 @@ async function routeButton(interaction, runtime, route, sessionId) {
     ]));
   }
   if (route === 'admin_promotion_edit') {
-    const session = consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_PROMOTION_EDIT');
+    const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_PROMOTION_EDIT');
     const submitId = sessionContext(interaction, runtime, 'ADMIN_PROMOTION_SUBMIT', { id: session.payload.id });
     return interaction.showModal(openAdminModal('admin_promotion_submit', submitId, 'ตั้งโปรโมชั่น', [
       textInput('name', 'ชื่อโปรโมชั่น', { maxLength: 100 }), textInput('state', 'ACTIVE หรือ INACTIVE', { maxLength: 8 }),
@@ -547,8 +555,8 @@ async function routeButton(interaction, runtime, route, sessionId) {
     ]));
   }
   if (route === 'admin_review_decide') {
-    assertOwner(interaction, runtime);
-    const session = consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_REVIEW_DECIDE');
+    await assertOwner(interaction, runtime);
+    const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_REVIEW_DECIDE');
     const submitId = sessionContext(interaction, runtime, 'ADMIN_REVIEW_SUBMIT', { reviewId: session.payload.reviewId, subjectType: session.payload.subjectType });
     return interaction.showModal(openAdminModal('admin_review_submit', submitId, 'ตัดสิน Manual Review', [
       textInput('decision', session.payload.subjectType === 'TOPUP' ? 'CREDIT, REJECT หรือ REVERSE' : 'CAPTURE หรือ RELEASE', { maxLength: 10 }),
@@ -557,18 +565,18 @@ async function routeButton(interaction, runtime, route, sessionId) {
     ]));
   }
   if (route === 'admin_dlq_retry') {
-    const session = consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_DLQ_RETRY');
+    const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_DLQ_RETRY');
     retryNotificationDlq(runtime.db, { notificationId: session.payload.notificationId, actorId: interaction.user.id });
     return interaction.update({ content: 'ส่งข้อความกลับเข้าคิว retry แล้ว (ใช้ nonce เดิม)', embeds: [], components: [], allowedMentions: { parse: [] } });
   }
   if (route === 'customer_quest_case_retry') {
-    assertBackoffice(interaction, runtime);
+    await assertBackoffice(interaction, runtime);
     assertCurrentDiscoveryCase(interaction, runtime, sessionId);
     const result = retryCustomerDiscovery(runtime.db, { notificationId: sessionId, actorId: interaction.user.id });
     return interaction.reply(ephemeral(result.queued ? 'เริ่มตรวจและทดสอบ Quest ใหม่แล้ว' : 'Quest นี้มีงานตรวจอยู่แล้ว'));
   }
   if (route === 'customer_quest_announce') {
-    assertBackoffice(interaction, runtime);
+    await assertBackoffice(interaction, runtime);
     const notification = assertCurrentDiscoveryCase(interaction, runtime, sessionId);
     const result = announceCustomerDiscovery(runtime.db, { notificationId: sessionId, actorId: interaction.user.id,
       expectedQuestVersion: notification.quest_state_version });
@@ -584,7 +592,7 @@ async function routeButton(interaction, runtime, route, sessionId) {
 
 async function routeModal(interaction, runtime, route) {
   if (route === 'voucher_submit') {
-    assertCustomerRoute(interaction, runtime, 'TOPUP_ACCEPTING');
+    await assertCustomerRoute(interaction, runtime, 'TOPUP_ACCEPTING');
     consumeModalInteractionSession(runtime.db, { sessionId: parseCustomId(interaction.customId).sessionId, actorId: interaction.user.id,
       guildId: interaction.guildId, channelId: interaction.channelId, operation: 'VOUCHER_SUBMIT' });
     await interaction.deferReply({ ephemeral: true });
@@ -593,7 +601,7 @@ async function routeModal(interaction, runtime, route) {
     return acknowledgeTopupAndStartSettlement({ interaction, result, runtime });
   }
   if (route === 'token_submit') {
-    assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+    await assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
     consumeModalInteractionSession(runtime.db, { sessionId: parseCustomId(interaction.customId).sessionId, actorId: interaction.user.id,
       guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOKEN_SUBMIT' });
     await interaction.deferReply({ ephemeral: true });
@@ -609,7 +617,7 @@ async function routeModal(interaction, runtime, route) {
     return;
   }
   if (route === 'admin_price_submit') {
-    const session = consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_PRICE_SUBMIT');
+    const session = await consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_PRICE_SUBMIT');
     const next = setQuestPrice(runtime.db, { taskType: session.payload.taskType,
       amountCents: interaction.fields.getTextInputValue('amountCents'), actorId: interaction.user.id,
       reason: interaction.fields.getTextInputValue('reason'), expectedConfigVersion: session.payload.expectedConfigVersion });
@@ -617,33 +625,33 @@ async function routeModal(interaction, runtime, route) {
     return interaction.reply(ephemeral(`บันทึกราคา ${session.payload.taskType} แล้ว (${next.priceRules[session.payload.taskType].amountCents / 100} บาท)`));
   }
   if (route === 'admin_receiver_submit') {
-    consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_RECEIVER_SUBMIT');
+    await consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_RECEIVER_SUBMIT');
     const receiver = configureReceiverPhone(runtime.db, runtime.env, { phone: interaction.fields.getTextInputValue('phone'), actorId: interaction.user.id,
       reason: interaction.fields.getTextInputValue('reason') });
     return interaction.reply(ephemeral(`ตั้งค่าเบอร์รับเงิน ••••${receiver.last4} แล้ว`));
   }
   if (route === 'admin_monitor_submit') {
-    consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_MONITOR_SUBMIT');
+    await consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_MONITOR_SUBMIT');
     const monitor = upsertMonitorAccount(runtime.db, runtime.env, { accountId: interaction.fields.getTextInputValue('accountId'),
       label: interaction.fields.getTextInputValue('label'), token: interaction.fields.getTextInputValue('token'), actorId: interaction.user.id });
     return interaction.reply(ephemeral(`บันทึก Monitor ${monitor.label} แล้ว`));
   }
   if (route === 'admin_wallet_submit') {
-    consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_WALLET_SUBMIT');
+    await consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_WALLET_SUBMIT');
     const result = adjustWallet(runtime.db, { discordUserId: interaction.fields.getTextInputValue('discordUserId'),
       availableDeltaCents: interaction.fields.getTextInputValue('amountCents'), actorId: interaction.user.id, reason: interaction.fields.getTextInputValue('reason') });
     return interaction.reply(ephemeral(`ปรับ Wallet แล้ว ยอดใช้ได้ปัจจุบัน ${(Number(result.wallet.available_cents) / 100).toFixed(2)} บาท`));
   }
   if (route === 'admin_promotion_submit') {
-    const session = consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_PROMOTION_SUBMIT');
+    const session = await consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_PROMOTION_SUBMIT');
     const promotion = upsertPromotion(runtime.db, { id: session.payload.id ?? undefined, name: interaction.fields.getTextInputValue('name'),
       state: interaction.fields.getTextInputValue('state').trim().toUpperCase(), minimumCents: interaction.fields.getTextInputValue('minimumCents'),
       basisPoints: interaction.fields.getTextInputValue('basisPoints'), maximumBonusCents: interaction.fields.getTextInputValue('maximumBonusCents'), actorId: interaction.user.id });
     return interaction.reply(ephemeral(`บันทึกโปรโมชั่น ${promotion.name} แล้ว`));
   }
   if (route === 'admin_review_submit') {
-    assertOwner(interaction, runtime);
-    const session = consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_REVIEW_SUBMIT');
+    await assertOwner(interaction, runtime);
+    const session = await consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_REVIEW_SUBMIT');
     const decision = interaction.fields.getTextInputValue('decision').trim().toUpperCase();
     const reason = interaction.fields.getTextInputValue('reason');
     const amountText = interaction.fields.getTextInputValue('amountCents').trim();
@@ -667,7 +675,7 @@ async function routeSelect(interaction, runtime, route, sessionId) {
   if (route === 'checkout_select') return selectCheckoutQuests(interaction, runtime, sessionId);
   if (route === 'admin') { assertCurrentSurface(interaction, runtime, 'ADMIN_PANEL'); return handleAdminMenu(interaction, runtime); }
   if (route === 'admin_review_select') {
-    const session = consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_REVIEW_SELECT');
+    const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_REVIEW_SELECT');
     const reviewId = interaction.values?.[0];
     if (!session.payload.reviewIds.includes(reviewId)) throw new QuestshopError('INTERACTION_CONTEXT_INVALID', 'รายการตรวจสอบไม่อยู่ในเมนูนี้');
     const review = runtime.db.prepare("SELECT * FROM manual_reviews WHERE id=? AND state='OPEN'").get(reviewId);
@@ -678,7 +686,7 @@ async function routeSelect(interaction, runtime, route, sessionId) {
         .setLabel('ตัดสินรายการนี้').setStyle(ButtonStyle.Danger))] }, [decideId]);
   }
   if (route === 'admin_dlq_select') {
-    const session = consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_DLQ_SELECT');
+    const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_DLQ_SELECT');
     const notificationId = interaction.values?.[0];
     if (!session.payload.notificationIds.includes(notificationId)) throw new QuestshopError('INTERACTION_CONTEXT_INVALID', 'ข้อความนี้ไม่อยู่ในเมนู DLQ');
     const row = runtime.db.prepare("SELECT * FROM notifications WHERE id=? AND state='DEAD_LETTER'").get(notificationId);
@@ -700,6 +708,7 @@ function customerError(error) {
 export async function routeInteraction(interaction) {
   const runtime = interaction.client.questshop;
   if (!runtime || runtime.acceptingInteractions === false) return;
+  installResponseController(interaction);
   try {
     const parsedRoute = parseCustomId(interaction.customId);
     if (!interaction.inGuild() || interaction.guildId !== runtime.env.DISCORD_GUILD_ID) return;
@@ -709,7 +718,7 @@ export async function routeInteraction(interaction) {
       if (interaction.isChatInputCommand()) await interaction.reply(ephemeral('คำสั่งนี้ไม่มีในระบบ Questshop'));
       return;
     }
-    assertRouteContract(interaction, runtime, route.route);
+    await assertRouteContract(interaction, runtime, route.route);
     if (interaction.isButton()) return routeButton(interaction, runtime, route.route, route.sessionId);
     if (interaction.isStringSelectMenu()) return routeSelect(interaction, runtime, route.route, route.sessionId);
     if (interaction.isModalSubmit()) return routeModal(interaction, runtime, route.route);
