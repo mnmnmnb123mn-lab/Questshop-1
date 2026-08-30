@@ -1,4 +1,5 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
+import { relative, resolve } from 'node:path';
 
 const DEFAULT_MINIMUM = 70;
 const METRICS = Object.freeze([
@@ -32,16 +33,37 @@ function coverageCounter(line) {
 
 function totals(lcov) {
   const result = new Map(METRICS.map(([metric]) => [metric, { hit: 0, found: 0 }]));
+  const files = new Set();
+  let source = null;
   for (const line of lcov.split('\n')) {
+    if (line.startsWith('SF:')) {
+      source = line.slice(3);
+      if (source.startsWith('src/')) files.add(source);
+      continue;
+    }
+    if (!source?.startsWith('src/')) continue;
     const counter = coverageCounter(line);
     if (counter) result.get(counter.metric)[counter.field] += counter.count;
   }
-  return result;
+  return { result, files };
+}
+
+async function sourceFiles(root) {
+  const entries = await readdir(root, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const entryPath = resolve(root, entry.name);
+    if (entry.isDirectory()) files.push(...await sourceFiles(entryPath));
+    else if (entry.isFile() && entry.name.endsWith('.js')) files.push(relative(process.cwd(), entryPath));
+  }
+  return files;
 }
 
 const lcov = await readFile('coverage/lcov.info', 'utf8');
 if (!lcov.includes('end_of_record')) throw new Error('LCOV report is empty or invalid');
-const summary = totals(lcov);
+const { result: summary, files } = totals(lcov);
+const missing = (await sourceFiles(resolve('src'))).filter((file) => !files.has(file));
+if (missing.length) throw new Error(`Coverage report is missing runtime source: ${missing.join(',')}`);
 for (const [metric, value] of summary) {
   const percentage = value.found === 0 ? 100 : (value.hit * 100) / value.found;
   const minimum = minimumFor(metric);

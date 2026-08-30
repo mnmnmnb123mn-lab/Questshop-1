@@ -38,7 +38,7 @@ if (!files.length) throw new Error('No test files found');
 if (coverage) {
   await mkdir(resolve('coverage'), { recursive: true });
   // Reporter destinations are paired in declaration order by Node.
-  await run(['--test', '--test-concurrency=1', '--experimental-test-coverage',
+  await run(['--test', '--test-concurrency=1', '--experimental-test-coverage', '--test-coverage-include=src/**/*.js',
     '--test-reporter=spec', '--test-reporter-destination=stdout',
     '--test-reporter=lcov', '--test-reporter-destination=coverage/lcov.info', ...files]);
 } else {
