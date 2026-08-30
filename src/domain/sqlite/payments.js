@@ -27,11 +27,11 @@ export function submitTopup(db, env, { discordUserId, voucherUrl, traceId = rand
       return { topup: existing, idempotent: true };
     }
     const topupId = randomUUID();
-    const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, voucher.url);
+    const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, voucher.url, { keyVersion: env.CREDENTIAL_ENCRYPTION_ACTIVE_VERSION });
     db.prepare(`INSERT INTO topups(id,discord_user_id,voucher_hmac_version,voucher_identity_hmac,voucher_hmac,status,prelaunch,trace_id,created_at,updated_at)
       VALUES(?,?,?,?,?,'PENDING',?,?,?,?)`).run(topupId, discordUserId, voucherHmacVersion, identity, fingerprint, prelaunch ? 1 : 0, traceId, timestamp, timestamp);
-    db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,cleanup_after,created_at,updated_at)
-      VALUES(?,?,?,'VOUCHER','TEMPORARY',?,?,?,?,?,?)`).run(randomUUID(), 'TOPUP', topupId,
+    db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,key_version,retention_class,ciphertext,nonce,auth_tag,cleanup_after,created_at,updated_at)
+      VALUES(?,?,?,'VOUCHER',?,'TEMPORARY',?,?,?,?,?,?)`).run(randomUUID(), 'TOPUP', topupId, encrypted.keyVersion,
       encrypted.ciphertext, encrypted.nonce, encrypted.authTag, timestamp + TEMPORARY_CREDENTIAL_LIFETIME_MS, timestamp, timestamp);
     db.prepare(`INSERT INTO jobs(id,job_type,subject_type,subject_id,operation_key,state,checkpoint,next_run_at,created_at,updated_at)
       VALUES(?,?, 'TOPUP', ?, ?, 'PENDING','NOT_STARTED',?,?,?)`).run(randomUUID(), 'PAYMENT_SETTLE', topupId,

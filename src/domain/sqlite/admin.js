@@ -111,9 +111,9 @@ export function configureReceiverPhone(db, env, { phone, actorId, reason = '', e
       throw new QuestshopError('RECEIVER_CONFLICT', 'เบอร์รับเงินถูกเปลี่ยนแล้ว กรุณาเปิดเมนูใหม่');
     }
     const credentialId = randomUUID();
-    const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, phone);
-    db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
-      VALUES(?,?,?,'RECEIVER_PHONE','PERSISTENT',?,?,?,?,?)`).run(credentialId, 'CONFIG', credentialId,
+    const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, phone, { keyVersion: env.CREDENTIAL_ENCRYPTION_ACTIVE_VERSION });
+    db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,key_version,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
+      VALUES(?,?,?,'RECEIVER_PHONE',?,'PERSISTENT',?,?,?,?,?)`).run(credentialId, 'CONFIG', credentialId, encrypted.keyVersion,
       encrypted.ciphertext, encrypted.nonce, encrypted.authTag, timestamp, timestamp);
     db.prepare(`INSERT INTO settings(key,value_json,updated_at,updated_by) VALUES('receiver_credential_id',?,?,?)
       ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
@@ -138,11 +138,11 @@ export function upsertMonitorAccount(db, env, { accountId, label, token, actorId
       throw new QuestshopError('MONITOR_CONFLICT', 'ข้อมูล Monitor ถูกเปลี่ยนแล้ว กรุณาเปิดใหม่');
     }
     const credentialId = before?.credential_id ?? randomUUID();
-    const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, token);
-    db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
-      VALUES(?,?,?,'MONITOR_TOKEN','PERSISTENT',?,?,?,?,?)
-      ON CONFLICT(subject_type,subject_id,credential_type) DO UPDATE SET ciphertext=excluded.ciphertext,nonce=excluded.nonce,
-        auth_tag=excluded.auth_tag,updated_at=excluded.updated_at`).run(credentialId, 'MONITOR', accountId,
+    const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, token, { keyVersion: env.CREDENTIAL_ENCRYPTION_ACTIVE_VERSION });
+    db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,key_version,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
+      VALUES(?,?,?,'MONITOR_TOKEN',?,'PERSISTENT',?,?,?,?,?)
+      ON CONFLICT(subject_type,subject_id,credential_type) DO UPDATE SET key_version=excluded.key_version,ciphertext=excluded.ciphertext,nonce=excluded.nonce,
+        auth_tag=excluded.auth_tag,updated_at=excluded.updated_at`).run(credentialId, 'MONITOR', accountId, encrypted.keyVersion,
       encrypted.ciphertext, encrypted.nonce, encrypted.authTag, timestamp, timestamp);
     if (!before) {
       db.prepare(`INSERT INTO monitor_accounts(account_id,label,state,credential_id,cooldown_until,last_checked_at,updated_at)

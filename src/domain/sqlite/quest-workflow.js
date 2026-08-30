@@ -92,7 +92,7 @@ function queueMonitorSearches(db, discovered, checkoutId, { discordUserId = null
 export async function processCustomerDiscovery(runtime, job) {
   const payload = json(job.payload_json);
   const credential = credentialFor(runtime.db, payload.credentialId ?? job.subject_id);
-  const token = decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential);
+  const token = decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential, { allowedVersions: runtime.env.CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS });
   const api = await createApi(runtime, token);
   const [profile, quests] = await Promise.all([
     api.fetchCurrentUser(runtime.abortController.signal), api.fetchQuests(runtime.abortController.signal),
@@ -129,7 +129,8 @@ export async function processMonitorSearch(runtime, job) {
   for (const monitor of monitors) {
     try {
       const credential = credentialFor(runtime.db, monitor.credential_id);
-      const api = await createApi(runtime, decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential));
+      const api = await createApi(runtime, decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential,
+        { allowedVersions: runtime.env.CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS }));
       const profile = await api.fetchCurrentUser(runtime.abortController.signal);
       if (String(profile?.id) !== String(monitor.account_id)) throw new QuestshopError('MONITOR_ACCOUNT_MISMATCH', 'ข้อมูลบัญชีทดสอบไม่ตรงกับ Token');
       const candidate = (await api.fetchQuests(runtime.abortController.signal, { includeExpired: true }))
@@ -167,7 +168,8 @@ export async function processMonitorSearch(runtime, job) {
 
 async function runQuest(runtime, { credentialId, questId, job, onProgress }) {
   const credential = credentialFor(runtime.db, credentialId);
-  const api = await createApi(runtime, decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential));
+  const api = await createApi(runtime, decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential,
+    { allowedVersions: runtime.env.CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS }));
   const findFresh = async () => {
     const fresh = (await api.fetchQuests(runtime.abortController.signal, { includeExpired: true }))
       .find((entry) => String(entry.id) === String(questId));

@@ -20,6 +20,7 @@
     "prelaunch:closeout": "node scripts/prelaunch-closeout.js",
     "setup:preflight": "node scripts/setup-preflight.js",
     "verify:keys": "node scripts/verify-key-retirement.js",
+    "credentials:reencrypt": "node scripts/reencrypt-credentials.js",
     "check:imports": "node scripts/check-imports.js",
     "load:test": "node scripts/load-test.js",
     "check": "find src scripts test -type f -name '*.js' -print0 | xargs -0 -n1 node --check",

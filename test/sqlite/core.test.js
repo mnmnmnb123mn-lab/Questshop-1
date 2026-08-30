@@ -13,10 +13,10 @@ import { createOrder, resolveOrderItemReview, settleOrderItem } from '../../src/
 import { claimDueNotification, enqueueNotification, finishNotificationDelivery } from '../../src/domain/sqlite/notifications.js';
 import { createRotatedSqliteBackup, replaceDatabaseFromBackup } from '../../src/db/sqlite-backup.js';
 import { parseBahtToCents, percentageBonusHalfUp } from '../../src/shared/money.js';
-import { encryptCredential, voucherHmac, voucherIdentityHmac } from '../../src/domain/sqlite/crypto.js';
+import { decryptCredential, encryptCredential, voucherHmac, voucherIdentityHmac } from '../../src/domain/sqlite/crypto.js';
 import { claimDueJob, completeJob, enqueueJob, markJobPossiblySent, recordQuestVerifiedResult, recoverInterruptedJobs, renewJobLease, updateRunningJobPayload } from '../../src/domain/sqlite/jobs.js';
 import { processQuestWorkflowJob } from '../../src/domain/sqlite/quest-workflow.js';
-import { deliverNotification, processPaymentJob, recoverInterruptedSubjects } from '../../src/workers/sqlite-worker-manager.js';
+import { deliverNotification, processPaymentJob, recoverInterruptedSubjects, refreshOperationalHealth } from '../../src/workers/sqlite-worker-manager.js';
 import { setupSurface, surfaceNonce, updateOrCreateSurfaceAnchor } from '../../src/discord/surfaces/setup.js';
 import { bindInteractionSessionMessage, consumeInteractionSession, consumeModalInteractionSession, createInteractionSession } from '../../src/domain/sqlite/interaction-sessions.js';
 import { adjustWallet, adminOverview, configureReceiverPhone, queueMonitorScanAndTest, retryNotificationDlq, setQuestPrice, upsertMonitorAccount, upsertPromotion } from '../../src/domain/sqlite/admin.js';
@@ -141,6 +141,13 @@ test('versioned voucher proofs retain one stable identity across rotations', asy
   assert.notDeepEqual(voucherHmac(secret, code, 'v1'), voucherHmac(secret, code, 'v2'));
   assert.deepEqual(Buffer.from(fixture.db.prepare('SELECT voucher_identity_hmac FROM topups WHERE id=?').get(first.topup.id).voucher_identity_hmac),
     voucherIdentityHmac(secret, code));
+});
+
+test('credential encryption supports explicit key versions and fails closed when retired', () => {
+  const encrypted = encryptCredential(secret, 'private-token', { keyVersion: 'v2' });
+  const row = { key_version: encrypted.keyVersion, ciphertext: encrypted.ciphertext, nonce: encrypted.nonce, auth_tag: encrypted.authTag };
+  assert.equal(decryptCredential(secret, row, { allowedVersions: ['v1', 'v2'] }), 'private-token');
+  assert.throws(() => decryptCredential(secret, row, { allowedVersions: ['v1'] }), (error) => error.code === 'CREDENTIAL_KEY_VERSION_DISABLED');
 });
 
 test('REDEEMED is a durable boundary and restart recovery can credit it exactly once', async (t) => {
@@ -639,6 +646,17 @@ test('health becomes degraded when a runtime component fails and recovers only w
   assert.equal(recomputeHealthStatus({ health }), 'DEGRADED');
   health.ready = false;
   assert.equal(recomputeHealthStatus({ health }), 'NOT_READY');
+});
+
+test('operational readiness fails closed when payment gates lack a receiver', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  fixture.db.prepare(`INSERT INTO settings(key,value_json,updated_at,updated_by) VALUES('feature_gates',?,?,?)`).run(
+    JSON.stringify({ TOPUP_ACCEPTING: true, AUTO_CREDIT_ENABLED: true }), Date.now(), 'test');
+  const health = { startedAt: new Date().toISOString(), checks: {}, workers: {} };
+  refreshOperationalHealth({ db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret }, health });
+  assert.equal(health.checks.receiver, 'MISSING_RECEIVER');
+  assert.equal(health.checks.paymentContainment, 'OK');
+  assert.equal(typeof health.workers.sqlite.lastHeartbeatAt, 'number');
 });
 
 test('notification renderers cover customer, payment, order, operations and admin projections', async (t) => {

@@ -3,9 +3,20 @@ import { deriveSecretKey } from '../../db/sqlite.js';
 
 const ALGORITHM = 'aes-256-gcm';
 export const CURRENT_VOUCHER_HMAC_VERSION = 'v1';
+export const CURRENT_CREDENTIAL_ENCRYPTION_VERSION = 'v1';
 
 function assertVoucherHmacVersion(version) {
   if (!/^v[0-9]+$/.test(version)) throw new TypeError('Invalid voucher HMAC version');
+}
+
+function assertCredentialVersion(version) {
+  if (!/^v[0-9]+$/.test(version)) throw new TypeError('Invalid credential encryption version');
+}
+
+function credentialKeyPurpose(version) {
+  // v1 is the already-persisted SQLite contract.  Later versions get an
+  // explicit derivation label without making existing credentials unreadable.
+  return version === CURRENT_CREDENTIAL_ENCRYPTION_VERSION ? 'credential-encryption' : `credential-encryption:${version}`;
 }
 
 /**
@@ -32,15 +43,23 @@ export function voucherIdentityHmac(secret, code) {
   return createHmac('sha256', deriveSecretKey(secret, 'voucher-identity')).update(code, 'utf8').digest();
 }
 
-export function encryptCredential(secret, plaintext) {
+export function encryptCredential(secret, plaintext, { keyVersion = CURRENT_CREDENTIAL_ENCRYPTION_VERSION } = {}) {
+  assertCredentialVersion(keyVersion);
   const nonce = randomBytes(12);
-  const cipher = createCipheriv(ALGORITHM, deriveSecretKey(secret, 'credential-encryption'), nonce);
+  const cipher = createCipheriv(ALGORITHM, deriveSecretKey(secret, credentialKeyPurpose(keyVersion)), nonce);
   const ciphertext = Buffer.concat([cipher.update(String(plaintext), 'utf8'), cipher.final()]);
-  return { nonce, ciphertext, authTag: cipher.getAuthTag() };
+  return { nonce, ciphertext, authTag: cipher.getAuthTag(), keyVersion };
 }
 
-export function decryptCredential(secret, row) {
-  const decipher = createDecipheriv(ALGORITHM, deriveSecretKey(secret, 'credential-encryption'), row.nonce);
+export function decryptCredential(secret, row, { allowedVersions = [CURRENT_CREDENTIAL_ENCRYPTION_VERSION] } = {}) {
+  const keyVersion = row?.key_version ?? CURRENT_CREDENTIAL_ENCRYPTION_VERSION;
+  assertCredentialVersion(keyVersion);
+  if (!Array.isArray(allowedVersions) || !allowedVersions.includes(keyVersion)) {
+    const error = new Error('Credential key version is not allowed');
+    error.code = 'CREDENTIAL_KEY_VERSION_DISABLED';
+    throw error;
+  }
+  const decipher = createDecipheriv(ALGORITHM, deriveSecretKey(secret, credentialKeyPurpose(keyVersion)), row.nonce);
   decipher.setAuthTag(row.auth_tag);
   return Buffer.concat([decipher.update(row.ciphertext), decipher.final()]).toString('utf8');
 }

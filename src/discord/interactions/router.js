@@ -339,10 +339,10 @@ async function handleSurfaceCommand(interaction, runtime) {
 function recordCustomerToken(runtime, interaction, token) {
   const timestamp = nowMs();
   const id = randomUUID();
-  const encrypted = encryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, token);
+  const encrypted = encryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, token, { keyVersion: runtime.env.CREDENTIAL_ENCRYPTION_ACTIVE_VERSION });
   withImmediateTransaction(runtime.db, () => {
-    runtime.db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,cleanup_after,created_at,updated_at)
-      VALUES(?,?,?,'CUSTOMER_QUEST_TOKEN','TEMPORARY',?,?,?,?,?,?)`).run(id, 'CHECKOUT', id,
+    runtime.db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,key_version,retention_class,ciphertext,nonce,auth_tag,cleanup_after,created_at,updated_at)
+      VALUES(?,?,?,'CUSTOMER_QUEST_TOKEN',?,'TEMPORARY',?,?,?,?,?,?)`).run(id, 'CHECKOUT', id, encrypted.keyVersion,
       encrypted.ciphertext, encrypted.nonce, encrypted.authTag, timestamp + 7 * 86_400_000, timestamp, timestamp);
     runtime.db.prepare(`INSERT INTO jobs(id,job_type,subject_type,subject_id,operation_key,state,checkpoint,next_run_at,payload_json,created_at,updated_at)
       VALUES(?,?, 'CHECKOUT', ?, ?, 'PENDING','NOT_STARTED',?,?,?,?)`).run(randomUUID(), 'CUSTOMER_QUEST_DISCOVERY', id,
@@ -477,7 +477,7 @@ async function selectCheckoutQuests(interaction, runtime, checkoutId) {
 async function freshCheckoutQuests(runtime, payload, selected) {
   const credential = runtime.db.prepare("SELECT * FROM credentials WHERE id=? AND credential_type='CUSTOMER_QUEST_TOKEN'").get(payload.credentialId);
   if (!credential) throw new QuestshopError('CHECKOUT_EXPIRED', 'ข้อมูลบัญชีหมดอายุ กรุณาเริ่มทำ Quest ใหม่');
-  const token = decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential);
+  const token = decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential, { allowedVersions: runtime.env.CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS });
   const api = runtime.questApiFactory
     ? await runtime.questApiFactory({ token })
     : (await import('../../quest-engine/api/client.js')).createQuestApiClient({ token, profile: {

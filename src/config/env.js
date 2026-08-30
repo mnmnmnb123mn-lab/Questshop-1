@@ -16,6 +16,9 @@ const fields = {
   SQLITE_PATH: z.string().min(1).default('/data/questshop.db'),
   QUESTSHOP_SECRET_KEY: z.string().min(32),
   VOUCHER_HMAC_ACTIVE_VERSION: z.string().regex(/^v[0-9]+$/).default('v1'),
+  CREDENTIAL_ENCRYPTION_ACTIVE_VERSION: z.string().regex(/^v[0-9]+$/).default('v1'),
+  CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS: z.string().regex(/^v[0-9]+(?:,v[0-9]+)*$/).default('v1')
+    .transform((value) => Object.freeze([...new Set(value.split(','))])),
   RUNNER_CONCURRENCY: z.coerce.number().int().min(1).max(5).default(1),
   RUNNER_CONCURRENCY_HARD_MAX: z.coerce.number().int().min(1).max(5).default(1),
   GIT_SHA: z.string().regex(/^[0-9a-f]{40}$/i).optional(),

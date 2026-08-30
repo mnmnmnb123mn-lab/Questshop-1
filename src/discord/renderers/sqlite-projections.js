@@ -47,7 +47,7 @@ function ownerVoucherLink(db, runtime, topup) {
   const credential = db.prepare("SELECT * FROM credentials WHERE subject_type='TOPUP' AND subject_id=? AND credential_type='VOUCHER'").get(topup.id);
   if (!credential) return null;
   try {
-    const url = decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential);
+    const url = decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential, { allowedVersions: runtime.env.CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS });
     return url.startsWith('https://gift.truemoney.com/campaign/') ? url : null;
   } catch { return null; }
 }

@@ -6,7 +6,7 @@ import { creditRedeemedTopup, markTopupProcessing, moveTopupToReview, recordRede
   recordTopupDefiniteFailure, recordTopupNotSent } from '../domain/sqlite/payments.js';
 import { settleOrderItem } from '../domain/sqlite/orders.js';
 import { claimDueNotification, deferNotification, finishNotificationDelivery, recoverSendingNotifications } from '../domain/sqlite/notifications.js';
-import { nowMs, withImmediateTransaction } from '../db/sqlite.js';
+import { nowMs, quickIntegrityCheck, withImmediateTransaction } from '../db/sqlite.js';
 import { normalizeVoucherUrl, redeemVoucher } from '../adapters/truemoney/voucher.js';
 import { renderSqliteNotification } from '../discord/renderers/sqlite-projections.js';
 import { normalizeDiscordPayload } from '../discord/payload.js';
@@ -17,7 +17,7 @@ import { reconcileSurfaceAnchors } from '../discord/surfaces/setup.js';
 import { recordSystemIncident } from '../domain/sqlite/incidents.js';
 import { recomputeHealthStatus } from '../bootstrap/health-status.js';
 import { EXTERNAL_OUTCOME } from '../domain/sqlite/external-outcome.js';
-import { openPaymentContainment, verifyPaymentProbe } from '../domain/sqlite/payment-containment.js';
+import { currentPaymentContainment, openPaymentContainment, verifyPaymentProbe } from '../domain/sqlite/payment-containment.js';
 
 function cleanupExpiredRows(db) {
   const timestamp = nowMs();
@@ -51,7 +51,47 @@ async function createDailyBackupIfDue(runtime) {
   withImmediateTransaction(runtime.db, () => runtime.db.prepare(`INSERT INTO settings(key,value_json,updated_at,updated_by)
     VALUES('last_daily_backup',?,?, 'SYSTEM') ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
     .run(JSON.stringify({ at: now }), now));
+  withImmediateTransaction(runtime.db, () => runtime.db.prepare(`INSERT INTO settings(key,value_json,updated_at,updated_by)
+    VALUES('last_daily_backup_failure','{"at":0}',?, 'SYSTEM') ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
+    .run(now));
   return true;
+}
+
+function readSetting(db, key) {
+  const row = db.prepare('SELECT value_json FROM settings WHERE key=?').get(key);
+  try { return JSON.parse(row?.value_json ?? '{}'); } catch { return {}; }
+}
+
+function recordBackupFailure(runtime, error) {
+  const timestamp = nowMs();
+  withImmediateTransaction(runtime.db, () => runtime.db.prepare(`INSERT INTO settings(key,value_json,updated_at,updated_by)
+    VALUES('last_daily_backup_failure',?,?, 'SYSTEM') ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
+    .run(JSON.stringify({ at: timestamp, code: String(error?.code ?? 'SQLITE_BACKUP_FAILED').slice(0, 100) }), timestamp));
+  recordSystemIncident(runtime.db, { code: 'SQLITE_BACKUP_FAILED', scope: 'BACKUP', severity: 'ERROR', details: { code: error?.code ?? null } });
+}
+
+export function refreshOperationalHealth(runtime) {
+  const { db, health } = runtime;
+  const timestamp = nowMs();
+  const gates = currentFeatureGates(db);
+  const paymentGatesOpen = gates.TOPUP_ACCEPTING || gates.AUTO_CREDIT_ENABLED;
+  const integrity = quickIntegrityCheck(db);
+  health.checks.integrity = integrity.ok ? 'OK' : 'FAILED';
+  health.checks.worker = 'OK';
+  health.workers.sqlite = { lastHeartbeatAt: timestamp };
+  const containment = currentPaymentContainment(db);
+  health.checks.paymentContainment = !paymentGatesOpen || containment.state === 'CLOSED' ? 'OK' : 'DEGRADED';
+  let receiverReady = false;
+  try { receiverReady = Boolean(getReceiverPhone(db, runtime.env)); } catch { receiverReady = false; }
+  health.checks.receiver = !paymentGatesOpen || receiverReady ? 'OK' : 'MISSING_RECEIVER';
+  const stuckRedeemed = Number(db.prepare("SELECT count(*) AS count FROM topups WHERE status='REDEEMED' AND redeemed_at<?").get(timestamp - 5 * 60_000).count);
+  const overdueReviews = Number(db.prepare("SELECT count(*) AS count FROM manual_reviews WHERE category='FINANCIAL' AND state='OPEN' AND created_at<?").get(timestamp - 24 * 60 * 60_000).count);
+  health.checks.recovery = stuckRedeemed === 0 ? 'OK' : 'DEGRADED';
+  health.checks.financialReviews = overdueReviews === 0 ? 'OK' : 'DEGRADED';
+  const lastBackup = Number(readSetting(db, 'last_daily_backup').at) || 0;
+  const backupFailure = Number(readSetting(db, 'last_daily_backup_failure').at) || 0;
+  const startedAt = Date.parse(health.startedAt ?? '') || timestamp;
+  health.checks.backup = (backupFailure > lastBackup || (timestamp - startedAt > 26 * 60 * 60_000 && timestamp - lastBackup > 26 * 60 * 60_000)) ? 'DEGRADED' : 'OK';
 }
 
 function getReceiverPhone(db, env) {
@@ -59,7 +99,7 @@ function getReceiverPhone(db, env) {
   const credentialId = setting ? JSON.parse(setting.value_json)?.credentialId : null;
   const row = credentialId ? db.prepare("SELECT * FROM credentials WHERE id=? AND credential_type='RECEIVER_PHONE'").get(credentialId) : null;
   if (!row) return null;
-  const phone = decryptCredential(env.QUESTSHOP_SECRET_KEY, row);
+  const phone = decryptCredential(env.QUESTSHOP_SECRET_KEY, row, { allowedVersions: env.CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS });
   return { phone, last4: phone.slice(-4) };
 }
 
@@ -213,7 +253,8 @@ export async function processPaymentJob(runtime, job) {
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW', errorCode: 'PAYMENT_CREDENTIAL_UNAVAILABLE' });
   }
   let voucher;
-  try { voucher = normalizeVoucherUrl(decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential)); } catch {
+  try { voucher = normalizeVoucherUrl(decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential,
+    { allowedVersions: runtime.env.CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS })); } catch {
     moveTopupToReview(runtime.db, { topupId: topup.id, reasonCode: 'VOUCHER_DECRYPT_FAILED', safeReason: 'ไม่สามารถอ่านข้อมูลซองอย่างปลอดภัย', workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW', errorCode: 'VOUCHER_DECRYPT_FAILED' });
   }
@@ -457,6 +498,7 @@ export function createSqliteWorkers({ runtime }) {
     recoverSendingNotifications(runtime.db);
     let cleanupAt = 0;
     let recoveryAt = nowMs() + 60_000;
+    let healthAt = 0;
     let backupAt = 0;
     let reconcileAt = 0;
     let announcementAt = 0;
@@ -472,7 +514,10 @@ export function createSqliteWorkers({ runtime }) {
           cleanupAt = nowMs() + 60_000;
         }
         if (nowMs() >= backupAt) {
-          await createDailyBackupIfDue(runtime).catch((error) => runtime.logger?.error?.({ error }, 'SQLite daily backup failed'));
+          await createDailyBackupIfDue(runtime).catch((error) => {
+            runtime.logger?.error?.({ error }, 'SQLite daily backup failed');
+            recordBackupFailure(runtime, error);
+          });
           backupAt = nowMs() + 3_600_000;
         }
         if (nowMs() >= reconcileAt) {
@@ -484,6 +529,11 @@ export function createSqliteWorkers({ runtime }) {
           announcementAt = nowMs() + 60_000;
         }
         runtime.health.checks.database = 'OK';
+        runtime.health.workers.sqlite = { lastHeartbeatAt: nowMs() };
+        if (nowMs() >= healthAt) {
+          refreshOperationalHealth(runtime);
+          healthAt = nowMs() + 60_000;
+        }
         // Readiness is derived from all startup/runtime checks, not merely
         // whether this worker loop happened to complete once.
         runtime.health.ready = !Object.values(runtime.health.checks).some((value) =>
