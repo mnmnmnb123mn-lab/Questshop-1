@@ -20,3 +20,7 @@ Current implementation note: financial ambiguity, verified Quest settlement, ide
 sessions, nonce-based notification recovery with desired-version fencing, 404-only surface replacement, announcement
 metadata and SQLite operations scripts have source/test changes in the worktree. Candidate-commit Node 22 evidence,
 load/audit/Docker checks and same-SHA UAT remain release blockers.
+
+Recent source work also persists external payment outcomes before settlement, fences Admin promotion/Monitor edits by
+aggregate version, limits customer mutations in SQLite, and removes confirmed-unreachable PostgreSQL runtime paths.
+These are source/test controls only; they do not constitute live-provider or production evidence.

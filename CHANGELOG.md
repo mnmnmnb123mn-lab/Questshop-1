@@ -5,6 +5,9 @@
 - SQLite migration remains **migration-in-progress**. This source has not passed same-SHA live UAT and must not be described as production-ready.
 - Money settlement fails closed through `SUCCESS`, `DEFINITE_FAILURE` and `AMBIGUOUS`: unknown TrueMoney outcomes create financial review; Quest capture requires verified completion; pre-completed and definite-failure Items release their reservation with append-only settlement evidence.
 - Added server-side interaction sessions, SQLite Admin controls for gates/prices/receiver/promotions/Monitor/Wallet/reviews, stable nonce recovery with desired-version fencing, safe 404-only surface replacement, SQLite prelaunch closeout and relative-import verification.
+- Provider outcomes are now persisted with their payment attempt before settlement; recovered `REDEEMED` payments credit only through the existing idempotent path.
+- Promotion and Monitor updates use aggregate versions; bonus usage is persisted per customer and Bangkok day. Customer mutation limits also survive restart in SQLite.
+- Removed unreachable PostgreSQL renderer, pricing, promotion, keyring and rate-limit paths rather than retaining a second persistence implementation.
 
 - Added durable customer Quest discovery cases with automatic Monitor visibility checks before tests, one backoffice card per Quest, safe retry, and informational announcements decoupled from customer checkout.
 
