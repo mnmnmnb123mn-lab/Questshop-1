@@ -37,6 +37,7 @@ import { desktopExecutor } from '../../src/quest-engine/executors/desktop.js';
 import { EXTERNAL_OUTCOME, externalOutcome } from '../../src/domain/sqlite/external-outcome.js';
 import { consumeInteractionRateLimit } from '../../src/domain/sqlite/interaction-rate-limits.js';
 import { recordSystemIncident } from '../../src/domain/sqlite/incidents.js';
+import { beginPaymentProbe, closePaymentContainment, currentPaymentContainment, openPaymentContainment, verifyPaymentProbe } from '../../src/domain/sqlite/payment-containment.js';
 
 const secret = 'sqlite-test-secret-key-which-is-at-least-32-characters';
 
@@ -73,6 +74,23 @@ test('operational incidents reuse one durable system notification', async (t) =>
   recordSystemIncident(fixture.db, { code: 'PAYMENT_CONTAINMENT', scope: 'TRUEMONEY', severity: 'ERROR' });
   const payload = JSON.parse(fixture.db.prepare("SELECT payload_json FROM notifications WHERE notification_type='SYSTEM_LOG'").get().payload_json);
   assert.equal(payload.occurrenceCount, 2);
+});
+
+test('payment containment closes automation durably and needs a verified probe before reopening', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const opened = openPaymentContainment(fixture.db, { reasonCode: 'PROVIDER_SUCCESS_SCHEMA_UNCERTAIN' });
+  assert.equal(opened.containment.state, 'OPEN');
+  assert.equal(opened.gates.TOPUP_ACCEPTING, false);
+  assert.equal(opened.gates.AUTO_CREDIT_ENABLED, false);
+  assert.equal(openPaymentContainment(fixture.db, { reasonCode: 'PROVIDER_SUCCESS_SCHEMA_UNCERTAIN' }).idempotent, true);
+  beginPaymentProbe(fixture.db, { actorId: 'owner' });
+  assert.throws(() => closePaymentContainment(fixture.db, { actorId: 'owner' }), (error) => error.code === 'PAYMENT_PROBE_REQUIRED');
+  const topup = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'owner',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=b123456789abcdef0123456789abcdef01' }).topup;
+  creditVerifiedTopup(fixture.db, { topupId: topup.id, principalCents: 100 });
+  assert.equal(verifyPaymentProbe(fixture.db, { topupId: topup.id, actorId: 'owner' }).state, 'PROBE_VERIFIED');
+  assert.equal(closePaymentContainment(fixture.db, { actorId: 'owner' }).state, 'CLOSED');
+  assert.equal(currentPaymentContainment(fixture.db).state, 'CLOSED');
 });
 
 test('external outcome and surface fallbacks reject unsafe data without changing customer contracts', () => {

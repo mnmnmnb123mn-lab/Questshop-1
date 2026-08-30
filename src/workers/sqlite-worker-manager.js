@@ -17,6 +17,7 @@ import { reconcileSurfaceAnchors } from '../discord/surfaces/setup.js';
 import { recordSystemIncident } from '../domain/sqlite/incidents.js';
 import { recomputeHealthStatus } from '../bootstrap/health-status.js';
 import { EXTERNAL_OUTCOME } from '../domain/sqlite/external-outcome.js';
+import { openPaymentContainment, verifyPaymentProbe } from '../domain/sqlite/payment-containment.js';
 
 function cleanupExpiredRows(db) {
   const timestamp = nowMs();
@@ -230,7 +231,16 @@ export async function processPaymentJob(runtime, job) {
         providerEvidence: { ...(result.providerEvidence ?? {}), httpStatus: result.httpStatus ?? result.providerEvidence?.httpStatus },
         attemptId, workerJob });
       creditRedeemedTopup(runtime.db, { topupId: topup.id, workerJob });
+      // A probe is still an ordinary, exactly-once top-up.  Only after its
+      // normal credit has committed may an Owner perform the second reopen
+      // confirmation.
+      verifyPaymentProbe(runtime.db, { topupId: topup.id });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
+    }
+    if (result.outcome === EXTERNAL_OUTCOME.SUCCESS) {
+      openPaymentContainment(runtime.db, { reasonCode: 'PROVIDER_SUCCESS_SCHEMA_UNCERTAIN', details: {
+        currency: result.currency ?? null, amountCents: result.amountCents ?? null,
+      } });
     }
     if (result.outcome === EXTERNAL_OUTCOME.DEFINITE_FAILURE) {
       const reason = result.reason ?? result.providerCode ?? 'PROVIDER_REJECTED';
@@ -249,6 +259,9 @@ export async function processPaymentJob(runtime, job) {
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
       errorCode: reason, checkpoint: 'POSSIBLY_SENT' });
   } catch (error) {
+    if (['PROVIDER_SCHEMA_INVALID', 'RECEIVER_UNCERTAIN', 'PAYMENT_AMOUNT_UNCERTAIN', 'PAYMENT_CURRENCY_UNCERTAIN'].includes(error?.code)) {
+      openPaymentContainment(runtime.db, { reasonCode: error.code, details: error.details ?? {} });
+    }
     if (error.code === 'PROVIDER_NOT_SENT' || error.code === 'PAYMENT_INTENT_CHECKPOINT_FAILED') {
       recordTopupNotSent(runtime.db, { topupId: topup.id, attemptId, reasonCode: error.code, workerJob });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, retryAt: nowMs() + 15_000,
