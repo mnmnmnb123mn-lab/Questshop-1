@@ -4,7 +4,7 @@ import { currentFeatureGates } from './gates.js';
 import { enqueueNotificationInTransaction } from './notifications.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { resolveTopupFinancialReview, reverseCreditedTopup } from './payments.js';
-import { encryptCredential } from './crypto.js';
+import { decryptCredential, encryptCredential } from './crypto.js';
 import { refundReadyOrderItem, resolveOrderItemReview } from './orders.js';
 import { supportedTaskTypes } from './pricing.js';
 import { appendWalletTransactionInTransaction } from './wallet.js';
@@ -14,6 +14,7 @@ export const ADMIN_AUDIT_ALLOWED_FIELDS = Object.freeze({
   FEATURE_GATE_CHANGE: ['gate', 'enabled'],
   PROMOTION_UPDATED: ['name', 'state', 'startsAt', 'endsAt', 'basisPoints', 'minimumCents', 'maximumBonusCents', 'maxUsesPerUser', 'maxBonusPerDayCents'],
   MONITOR_UPDATED: ['label', 'state', 'cooldownUntil'],
+  MONITOR_HEALTH_CHECKED: ['healthState', 'questCount', 'errorCode'],
   MONITOR_SCAN_QUEUED: ['queued'],
   DLQ_RETRY: ['notificationType', 'destination'],
   WALLET_ADJUSTMENT: ['availableDeltaCents', 'reservedDeltaCents'],
@@ -157,6 +158,69 @@ export function upsertMonitorAccount(db, env, { accountId, label, token, actorId
       after: { label: String(label).trim().slice(0, 100), state, cooldownUntil: null }, timestamp });
     return db.prepare('SELECT account_id,label,state,credential_id,cooldown_until,last_checked_at,health_state,last_health_error_code,last_health_quest_count,state_version,updated_at FROM monitor_accounts WHERE account_id=?').get(accountId);
   });
+}
+
+function monitorHealthErrorCode(error) {
+  const code = String(error?.code ?? 'MONITOR_CHECK_FAILED');
+  return /^[A-Z0-9_]{1,64}$/.test(code) ? code : 'MONITOR_CHECK_FAILED';
+}
+
+async function monitorApi(runtime, token) {
+  if (runtime.questApiFactory) return runtime.questApiFactory({ token });
+  const { createQuestApiClient } = await import('../../quest-engine/api/client.js');
+  return createQuestApiClient({ token, profile: {
+    clientVersion: runtime.env.DISCORD_CLIENT_VERSION, chromeVersion: runtime.env.DISCORD_CHROME_VERSION,
+    electronVersion: runtime.env.DISCORD_ELECTRON_VERSION, buildNumber: runtime.env.DISCORD_BUILD_NUMBER,
+    nativeBuildNumber: runtime.env.DISCORD_NATIVE_BUILD_NUMBER, locale: runtime.env.DISCORD_LOCALE,
+  }, coordinator: runtime.questRateLimits });
+}
+
+/** Read-only Discord verification followed by a short CAS update.  The token
+ * is never persisted or returned, and a newer Monitor edit wins over this
+ * delayed external result. */
+export async function checkMonitorHealth(runtime, { accountId, actorId, expectedStateVersion = null }) {
+  const monitor = runtime.db.prepare('SELECT * FROM monitor_accounts WHERE account_id=?').get(accountId);
+  if (!monitor) throw new QuestshopError('MONITOR_NOT_FOUND', 'ไม่พบบัญชี Monitor');
+  if (expectedStateVersion != null && Number(expectedStateVersion) !== Number(monitor.state_version)) {
+    throw new QuestshopError('MONITOR_CONFLICT', 'ข้อมูล Monitor ถูกเปลี่ยนแล้ว กรุณาเปิดใหม่');
+  }
+  const credential = monitor.credential_id ? runtime.db.prepare('SELECT * FROM credentials WHERE id=?').get(monitor.credential_id) : null;
+  if (!credential) throw new QuestshopError('CREDENTIAL_NOT_FOUND', 'ไม่พบ Token ของ Monitor');
+  const timestamp = nowMs();
+  let healthState = 'READY'; let errorCode = null; let questCount = null;
+  try {
+    const token = decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential,
+      { allowedVersions: runtime.env.CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS });
+    const api = await monitorApi(runtime, token);
+    const signal = runtime.abortController?.signal;
+    const [profile, quests] = await Promise.all([api.fetchCurrentUser(signal), api.fetchQuests(signal, { includeExpired: true })]);
+    if (String(profile?.id ?? '') !== String(monitor.account_id)) {
+      throw new QuestshopError('MONITOR_ACCOUNT_MISMATCH', 'Token ของ Monitor ไม่ตรงกับบัญชีที่ตั้งไว้');
+    }
+    questCount = Array.isArray(quests) ? quests.length : 0;
+  } catch (error) {
+    errorCode = monitorHealthErrorCode(error);
+    healthState = ['TOKEN_INVALID', 'MONITOR_ACCOUNT_MISMATCH', 'CREDENTIAL_KEY_VERSION_DISABLED'].includes(errorCode) ? 'INVALID' : 'DEGRADED';
+  }
+  return withImmediateTransaction(runtime.db, () => {
+    const changed = runtime.db.prepare(`UPDATE monitor_accounts SET health_state=?,last_health_error_code=?,last_health_quest_count=?,
+      last_checked_at=?,state_version=state_version+1,updated_at=? WHERE account_id=? AND state_version=?`).run(
+      healthState, errorCode, questCount, timestamp, timestamp, monitor.account_id, monitor.state_version);
+    if (!changed.changes) throw new QuestshopError('MONITOR_CONFLICT', 'ข้อมูล Monitor ถูกเปลี่ยนแล้ว กรุณาเปิดใหม่');
+    appendAdminAuditInTransaction(runtime.db, { actorId, action: 'MONITOR_HEALTH_CHECKED', targetType: 'MONITOR_ACCOUNT', targetId: monitor.account_id,
+      reason: 'ตรวจสุขภาพ Monitor', after: { healthState, questCount, errorCode }, timestamp });
+    return runtime.db.prepare('SELECT account_id,label,state,health_state,last_checked_at,last_health_error_code,last_health_quest_count,state_version FROM monitor_accounts WHERE account_id=?').get(monitor.account_id);
+  });
+}
+
+export async function checkAllMonitorHealth(runtime, { actorId }) {
+  const monitors = runtime.db.prepare("SELECT account_id,state_version FROM monitor_accounts WHERE state='ACTIVE' ORDER BY account_id").all();
+  const results = [];
+  for (const monitor of monitors) {
+    try { results.push(await checkMonitorHealth(runtime, { accountId: monitor.account_id, actorId, expectedStateVersion: monitor.state_version })); }
+    catch (error) { results.push({ account_id: monitor.account_id, health_state: 'UNCHANGED', error_code: error.code ?? 'MONITOR_CHECK_FAILED' }); }
+  }
+  return results;
 }
 
 /** Queue a fresh Scan + Test cycle.  Search jobs themselves enqueue the test

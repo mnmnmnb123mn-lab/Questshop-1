@@ -19,7 +19,7 @@ import { processQuestWorkflowJob } from '../../src/domain/sqlite/quest-workflow.
 import { deliverNotification, processPaymentJob, recoverInterruptedSubjects, refreshOperationalHealth } from '../../src/workers/sqlite-worker-manager.js';
 import { setupSurface, surfaceNonce, updateOrCreateSurfaceAnchor } from '../../src/discord/surfaces/setup.js';
 import { bindInteractionSessionMessage, consumeInteractionSession, consumeModalInteractionSession, createInteractionSession } from '../../src/domain/sqlite/interaction-sessions.js';
-import { adjustWallet, adminOverview, configureReceiverPhone, queueMonitorScanAndTest, retryNotificationDlq, setQuestPrice, upsertMonitorAccount, upsertPromotion } from '../../src/domain/sqlite/admin.js';
+import { adjustWallet, adminOverview, checkAllMonitorHealth, checkMonitorHealth, configureReceiverPhone, queueMonitorScanAndTest, retryNotificationDlq, setQuestPrice, upsertMonitorAccount, upsertPromotion } from '../../src/domain/sqlite/admin.js';
 import { loadRuntimeConfig } from '../../src/config/runtime-config.js';
 import { recomputeHealthStatus } from '../../src/bootstrap/health-status.js';
 import { renderQuestAuto } from '../../src/discord/renderers/surfaces.js';
@@ -608,6 +608,26 @@ test('SQLite Admin services configure price, receiver, monitor, promotion and au
   assert.deepEqual(adminOverview(fixture.db), { openReviews: 0, pendingJobs: 0, deadLetters: 0, activeMonitors: 1, receiverConfigured: true,
     expiredLeases: 0, stuckRedeemed: 0, reservedCents: 0, availableCents: 700, containmentState: 'CLOSED', backupAt: null });
   assert.equal(fixture.db.prepare("SELECT count(*) AS count FROM admin_audit WHERE action IN ('PRICE_UPDATED','RECEIVER_UPDATED','MONITOR_UPDATED','PROMOTION_UPDATED','WALLET_ADJUSTMENT')").get().count >= 8, true);
+});
+
+test('Monitor health checks use the stored token and record only a safe result', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const env = { QUESTSHOP_SECRET_KEY: secret, CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS: ['v1'] };
+  const ready = upsertMonitorAccount(fixture.db, env, { accountId: '12345678901234567', label: 'Ready', token: 'ready-token', actorId: 'admin' });
+  const invalid = upsertMonitorAccount(fixture.db, env, { accountId: '76543210987654321', label: 'Invalid', token: 'invalid-token', actorId: 'admin' });
+  const runtime = { db: fixture.db, env, abortController: new AbortController(), questApiFactory: ({ token }) => ({
+    fetchCurrentUser: async () => {
+      if (token === 'invalid-token') { const error = new Error('invalid'); error.code = 'TOKEN_INVALID'; throw error; }
+      return { id: '12345678901234567' };
+    },
+    fetchQuests: async () => [{ id: 'quest-a' }],
+  }) };
+  const checked = await checkMonitorHealth(runtime, { accountId: ready.account_id, actorId: 'admin', expectedStateVersion: ready.state_version });
+  assert.equal(checked.health_state, 'READY');
+  assert.equal(Number(checked.last_health_quest_count), 1);
+  const all = await checkAllMonitorHealth(runtime, { actorId: 'admin' });
+  assert.equal(all.find((row) => row.account_id === invalid.account_id).health_state, 'INVALID');
+  assert.equal(fixture.db.prepare('SELECT last_health_error_code FROM monitor_accounts WHERE account_id=?').get(invalid.account_id).last_health_error_code, 'TOKEN_INVALID');
 });
 
 test('Quest Auto and public Quest announcement render stored Thai metadata without internal identifiers', async (t) => {

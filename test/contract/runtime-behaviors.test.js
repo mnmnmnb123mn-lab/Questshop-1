@@ -154,7 +154,7 @@ test('runtime adapters reject incompatible input and use their documented fallba
 });
 
 test('persistent Admin routes re-check the current Discord Administrator permission', async () => {
-  const runtime = { env: { DISCORD_GUILD_ID: 'guild' }, client: { guilds: { fetch: async () => ({ members: {
+  const runtime = { acceptingInteractions: true, env: { DISCORD_GUILD_ID: 'guild', OWNER_ID: 'owner' }, client: { guilds: { fetch: async () => ({ members: {
     fetch: async () => ({ permissions: { has: () => false } }),
   } }) } } };
   const interaction = { guildId: 'guild', user: { id: 'admin' }, customId: customId('admin_gate_toggle'),
@@ -167,6 +167,18 @@ test('persistent Admin routes re-check the current Discord Administrator permiss
   assert.equal(await hasAdministratorPermission(interaction, runtime), true);
   runtime.client.guilds.fetch = async () => { throw new Error('Discord unavailable'); };
   assert.equal(await hasAdministratorPermission(interaction, runtime), false);
+
+  // A copied financial component may have a valid opaque shape but no
+  // server-side session. It must reach the route only far enough to reject
+  // that authority; it cannot trigger a reversal or disclose details.
+  runtime.client.guilds.fetch = async () => ({ members: { fetch: async () => ({ permissions: { has: () => true } }) } });
+  const replies = [];
+  const forged = { client: { questshop: runtime }, guildId: 'guild', channelId: 'channel', user: { id: 'owner' },
+    customId: customId('admin_topup_reverse_confirm'), inGuild: () => true, isButton: () => true,
+    isChatInputCommand: () => false, reply: async (payload) => { replies.push(payload); } };
+  await routeInteraction(forged);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].content, /ข้อมูลที่กรอกไม่ถูกต้อง/);
 });
 
 test('Owner setup commands also require current Discord Administrator permission', async () => {

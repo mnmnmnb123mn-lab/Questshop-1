@@ -14,7 +14,7 @@ import { safeDiscordText } from '../payload.js';
 import { currentFeatureGates } from '../../domain/sqlite/gates.js';
 import { announceCustomerDiscovery, retryCustomerDiscovery } from '../../domain/sqlite/discovery.js';
 import { loadRuntimeConfig } from '../../config/runtime-config.js';
-import { adjustWallet, adminOverview, configureReceiverPhone, confirmFinancialReview, discardNotificationDlq, listAdminOrders, listOpenManualReviews, listRecentAdminAudit, orderDetail, queueMonitorScanAndTest, refundOrderItem, resolveOperationalReview, reverseTopup, retryNotificationDlq, setQuestPrice, upsertMonitorAccount, upsertPromotion } from '../../domain/sqlite/admin.js';
+import { adjustWallet, adminOverview, checkAllMonitorHealth, checkMonitorHealth, configureReceiverPhone, confirmFinancialReview, discardNotificationDlq, listAdminOrders, listOpenManualReviews, listRecentAdminAudit, orderDetail, queueMonitorScanAndTest, refundOrderItem, resolveOperationalReview, reverseTopup, retryNotificationDlq, setQuestPrice, upsertMonitorAccount, upsertPromotion } from '../../domain/sqlite/admin.js';
 import { changeFeatureGate } from '../../domain/sqlite/admin.js';
 import { supportedTaskTypes } from '../../domain/sqlite/pricing.js';
 import { bindInteractionSessionMessage, consumeInteractionSession, consumeModalInteractionSession, createInteractionSession } from '../../domain/sqlite/interaction-sessions.js';
@@ -103,6 +103,7 @@ async function showAdminMonitors(interaction, runtime) {
   const monitors = runtime.db.prepare('SELECT account_id,label,state,last_checked_at,health_state,state_version FROM monitor_accounts ORDER BY updated_at DESC LIMIT 20').all();
   const sessionId = sessionContext(interaction, runtime, 'ADMIN_MONITOR_ADD');
   const scanId = sessionContext(interaction, runtime, 'ADMIN_MONITOR_SCAN');
+  const checkAllId = sessionContext(interaction, runtime, 'ADMIN_MONITOR_CHECK_ALL');
   const selectId = monitors.length ? sessionContext(interaction, runtime, 'ADMIN_MONITOR_SELECT', { monitors: monitors.map((row) => ({ accountId: row.account_id, stateVersion: row.state_version })) }) : null;
   const text = monitors.length ? monitors.map((row) => `${row.label} (…${String(row.account_id).slice(-4)}) — ${row.state}/${row.health_state}`).join('\n') : 'ยังไม่มีบัญชี Monitor';
   const components = [];
@@ -112,10 +113,11 @@ async function showAdminMonitors(interaction, runtime) {
       .addOptions(monitors.map((row) => ({ value: row.account_id, label: `${row.label} • ${row.state}`.slice(0, 100), description: `${row.health_state} • …${String(row.account_id).slice(-4)}` }))),
   ));
   components.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('admin_monitor_add', sessionId))
-    .setLabel('เพิ่มบัญชี Monitor').setStyle(ButtonStyle.Primary), new ButtonBuilder().setCustomId(customId('admin_monitor_scan', scanId))
+    .setLabel('เพิ่มบัญชี Monitor').setStyle(ButtonStyle.Primary), new ButtonBuilder().setCustomId(customId('admin_monitor_check_all', checkAllId))
+    .setLabel('ตรวจสุขภาพทั้งหมด').setStyle(ButtonStyle.Secondary), new ButtonBuilder().setCustomId(customId('admin_monitor_scan', scanId))
     .setLabel('Scan + Test Quest ที่ค้าง').setStyle(ButtonStyle.Secondary)));
   return replyAndBindSessions(interaction, runtime, { embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('บัญชี Monitor').setDescription(text)],
-    components }, [sessionId, scanId, selectId].filter(Boolean));
+    components }, [sessionId, scanId, checkAllId, selectId].filter(Boolean));
 }
 
 async function showAdminDlq(interaction, runtime) {
@@ -625,6 +627,21 @@ async function routeButton(interaction, runtime, route, sessionId) {
     const result = queueMonitorScanAndTest(runtime.db, { actorId: interaction.user.id });
     return interaction.update({ content: `เข้าคิว Scan + Test แล้ว ${result.queued} Quest`, embeds: [], components: [], allowedMentions: { parse: [] } });
   }
+  if (route === 'admin_monitor_check_all') {
+    await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_MONITOR_CHECK_ALL');
+    await interaction.deferUpdate();
+    const rows = await checkAllMonitorHealth(runtime, { actorId: interaction.user.id });
+    const ready = rows.filter((row) => row.health_state === 'READY').length;
+    return interaction.editReply({ content: `ตรวจสุขภาพ Monitor แล้ว ${rows.length} บัญชี (พร้อมใช้งาน ${ready})`, embeds: [], components: [], allowedMentions: { parse: [] } });
+  }
+  if (route === 'admin_monitor_check_one') {
+    const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_MONITOR_CHECK_ONE');
+    await interaction.deferUpdate();
+    const monitor = await checkMonitorHealth(runtime, { accountId: session.payload.accountId, actorId: interaction.user.id,
+      expectedStateVersion: session.payload.expectedStateVersion });
+    return interaction.editReply({ content: `${monitor.label}: ${monitor.health_state}${monitor.last_health_error_code ? ` (${monitor.last_health_error_code})` : ''}`,
+      embeds: [], components: [], allowedMentions: { parse: [] } });
+  }
   if (route === 'admin_wallet_adjust') {
     await assertOwner(interaction, runtime);
     await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_WALLET_ADJUST');
@@ -689,7 +706,15 @@ async function routeButton(interaction, runtime, route, sessionId) {
   if (route === 'admin_order_refund') {
     await assertOwner(interaction, runtime);
     const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_ORDER_REFUND');
-    const result = refundOrderItem(runtime.db, { itemId: session.payload.itemId, actorId: interaction.user.id, reason: 'OWNER_CONFIRMED_REFUND',
+    const submitId = sessionContext(interaction, runtime, 'ADMIN_ORDER_REFUND_SUBMIT', session.payload);
+    return interaction.showModal(openAdminModal('admin_order_refund_submit', submitId, 'เหตุผลการคืนเครดิต', [
+      textInput('reason', 'เหตุผล', { maxLength: 300 }),
+    ]));
+  }
+  if (route === 'admin_order_refund_confirm') {
+    await assertOwner(interaction, runtime);
+    const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_ORDER_REFUND_CONFIRM');
+    const result = refundOrderItem(runtime.db, { itemId: session.payload.itemId, actorId: interaction.user.id, reason: session.payload.reason,
       expectedStateVersion: session.payload.stateVersion });
     return interaction.update({ content: result.idempotent ? 'รายการนี้คืนเครดิตไปแล้ว' : `คืนเครดิต ${(Number(result.wallet.available_cents) / 100).toFixed(2)} บาทแล้ว`, embeds: [], components: [], allowedMentions: { parse: [] } });
   }
@@ -703,7 +728,15 @@ async function routeButton(interaction, runtime, route, sessionId) {
   if (route === 'admin_topup_reverse') {
     await assertOwner(interaction, runtime);
     const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_TOPUP_REVERSE');
-    const result = reverseTopup(runtime.db, { topupId: session.payload.topupId, actorId: interaction.user.id, reason: 'OWNER_CONFIRMED_REVERSAL',
+    const submitId = sessionContext(interaction, runtime, 'ADMIN_TOPUP_REVERSE_SUBMIT', session.payload);
+    return interaction.showModal(openAdminModal('admin_topup_reverse_submit', submitId, 'เหตุผลการย้อนเครดิต', [
+      textInput('reason', 'เหตุผล', { maxLength: 300 }),
+    ]));
+  }
+  if (route === 'admin_topup_reverse_confirm') {
+    await assertOwner(interaction, runtime);
+    const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_TOPUP_REVERSE_CONFIRM');
+    const result = reverseTopup(runtime.db, { topupId: session.payload.topupId, actorId: interaction.user.id, reason: session.payload.reason,
       expectedStateVersion: session.payload.stateVersion });
     const text = result.reviewOpened ? 'ยอด Wallet ไม่พอ จึงเปิด Financial Review แล้ว' : result.idempotent ? 'รายการนี้ถูกย้อนเครดิตแล้ว' : 'ย้อนเครดิตรายการเติมเงินแล้ว';
     return interaction.update({ content: text, embeds: [], components: [], allowedMentions: { parse: [] } });
@@ -807,6 +840,41 @@ async function routeModal(interaction, runtime, route) {
       description: `${Number(row.credited_cents ?? 0) / 100} บาท • …${String(row.discord_user_id).slice(-4)}`.slice(0, 100) })));
     return replyAndBindSessions(interaction, runtime, { content: 'เลือกรายการเติมเงินเพื่อดู/ย้อนเครดิต',
       components: [new ActionRowBuilder().addComponents(select)] }, [selectId]);
+  }
+  if (route === 'admin_order_refund_submit') {
+    await assertOwner(interaction, runtime);
+    const session = await consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_ORDER_REFUND_SUBMIT');
+    const item = runtime.db.prepare(`SELECT i.id,i.state,i.state_version,i.price_cents,o.discord_user_id
+      FROM order_items i JOIN orders o ON o.id=i.order_id WHERE i.id=?`).get(session.payload.itemId);
+    if (!item || item.state !== 'READY_TO_CLAIM' || Number(item.state_version) !== Number(session.payload.stateVersion)) {
+      throw new QuestshopError('ORDER_ITEM_CONFLICT', 'รายการนี้ถูกเปลี่ยนแล้ว กรุณาเปิดใหม่');
+    }
+    const wallet = runtime.db.prepare('SELECT available_cents FROM wallets WHERE discord_user_id=?').get(item.discord_user_id);
+    if (!wallet) throw new QuestshopError('WALLET_NOT_FOUND', 'ไม่พบ Wallet ของลูกค้า');
+    const reason = interaction.fields.getTextInputValue('reason').trim();
+    if (!reason) throw new QuestshopError('REFUND_REASON_REQUIRED', 'ต้องระบุเหตุผลการคืนเครดิต');
+    const confirmId = sessionContext(interaction, runtime, 'ADMIN_ORDER_REFUND_CONFIRM', { itemId: item.id, stateVersion: item.state_version, reason });
+    return replyAndBindSessions(interaction, runtime, { content: `ยืนยันคืนเครดิต ${(Number(item.price_cents) / 100).toFixed(2)} บาท\nก่อน: ${(Number(wallet.available_cents) / 100).toFixed(2)} บาท\nหลัง: ${((Number(wallet.available_cents) + Number(item.price_cents)) / 100).toFixed(2)} บาท\nเหตุผล: ${reason}`,
+      components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('admin_order_refund_confirm', confirmId))
+        .setLabel('Owner ยืนยันคืนเครดิต').setStyle(ButtonStyle.Danger))] }, [confirmId]);
+  }
+  if (route === 'admin_topup_reverse_submit') {
+    await assertOwner(interaction, runtime);
+    const session = await consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_TOPUP_REVERSE_SUBMIT');
+    const topup = runtime.db.prepare('SELECT id,discord_user_id,status,credited_cents,state_version FROM topups WHERE id=?').get(session.payload.topupId);
+    if (!topup || topup.status !== 'CREDITED' || Number(topup.state_version) !== Number(session.payload.stateVersion)) {
+      throw new QuestshopError('TOPUP_CONFLICT', 'รายการเติมเงินถูกเปลี่ยนแล้ว กรุณาเปิดใหม่');
+    }
+    const wallet = runtime.db.prepare('SELECT available_cents FROM wallets WHERE discord_user_id=?').get(topup.discord_user_id);
+    if (!wallet) throw new QuestshopError('WALLET_NOT_FOUND', 'ไม่พบ Wallet ของลูกค้า');
+    const reason = interaction.fields.getTextInputValue('reason').trim();
+    if (!reason) throw new QuestshopError('REVERSAL_REASON_REQUIRED', 'ต้องระบุเหตุผลการย้อนเครดิต');
+    const before = Number(wallet.available_cents); const amount = Number(topup.credited_cents);
+    const after = before - amount;
+    const confirmId = sessionContext(interaction, runtime, 'ADMIN_TOPUP_REVERSE_CONFIRM', { topupId: topup.id, stateVersion: topup.state_version, reason });
+    return replyAndBindSessions(interaction, runtime, { content: `ยืนยันย้อนเครดิต ${(amount / 100).toFixed(2)} บาท\nก่อน: ${(before / 100).toFixed(2)} บาท\nหลัง: ${after >= 0 ? `${(after / 100).toFixed(2)} บาท` : 'ยอดไม่พอ จะเปิด Financial Review'}\nเหตุผล: ${reason}`,
+      components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('admin_topup_reverse_confirm', confirmId))
+        .setLabel('Owner ยืนยันย้อนเครดิต').setStyle(ButtonStyle.Danger))] }, [confirmId]);
   }
   if (route === 'admin_receiver_submit') {
     const session = await consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_RECEIVER_SUBMIT');
@@ -920,9 +988,12 @@ async function routeSelect(interaction, runtime, route, sessionId) {
     }
     const editId = sessionContext(interaction, runtime, 'ADMIN_MONITOR_EDIT', { accountId: monitor.account_id, label: monitor.label,
       state: monitor.state, expectedStateVersion: monitor.state_version });
+    const checkId = sessionContext(interaction, runtime, 'ADMIN_MONITOR_CHECK_ONE', { accountId: monitor.account_id,
+      expectedStateVersion: monitor.state_version });
     return replyAndBindSessions(interaction, runtime, { content: `${monitor.label} • ${monitor.state}/${monitor.health_state}\nตรวจล่าสุด: ${monitor.last_checked_at ? new Date(monitor.last_checked_at).toISOString() : '-'}\nข้อผิดพลาดล่าสุด: ${monitor.last_health_error_code ?? '-'}`,
-      components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('admin_monitor_edit', editId))
-        .setLabel('หมุน Token / เปลี่ยนสถานะ').setStyle(ButtonStyle.Primary))] }, [editId]);
+      components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('admin_monitor_check_one', checkId))
+        .setLabel('ตรวจสุขภาพ').setStyle(ButtonStyle.Secondary), new ButtonBuilder().setCustomId(customId('admin_monitor_edit', editId))
+        .setLabel('หมุน Token / เปลี่ยนสถานะ').setStyle(ButtonStyle.Primary))] }, [editId, checkId]);
   }
   if (route === 'admin_order_select') {
     const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_ORDER_SELECT');
@@ -970,9 +1041,9 @@ export async function routeInteraction(interaction) {
       return;
     }
     await assertRouteContract(interaction, runtime, route.route);
-    if (interaction.isButton()) return routeButton(interaction, runtime, route.route, route.sessionId);
-    if (interaction.isStringSelectMenu()) return routeSelect(interaction, runtime, route.route, route.sessionId);
-    if (interaction.isModalSubmit()) return routeModal(interaction, runtime, route.route);
+    if (interaction.isButton()) return await routeButton(interaction, runtime, route.route, route.sessionId);
+    if (interaction.isStringSelectMenu()) return await routeSelect(interaction, runtime, route.route, route.sessionId);
+    if (interaction.isModalSubmit()) return await routeModal(interaction, runtime, route.route);
     throw new QuestshopError('ROUTE_INTERACTION_INVALID', 'รูปแบบการกดเมนูไม่ถูกต้อง');
   } catch (error) {
     const message = safeDiscordText(customerError(error), { maximum: 1_800 });
