@@ -38,6 +38,8 @@ export function renderAdminPanel() {
       { label: 'ตั้งราคา Quest', value: 'prices' }, { label: 'ตั้งค่าเบอร์รับเงิน', value: 'receiver' },
       { label: 'โปรโมชั่น', value: 'promotions' }, { label: 'ปรับ Wallet', value: 'wallet' },
       { label: 'บัญชี Monitor', value: 'monitors' }, { label: 'Manual reviews', value: 'reviews' }, { label: 'งานค้างส่ง (DLQ)', value: 'dlq' },
+      { label: 'Orders และคืนเครดิต', value: 'orders' }, { label: 'ย้อนรายการเติมเงิน', value: 'topups' },
+      { label: 'Admin audit ล่าสุด', value: 'audit' }, { label: 'Payment containment', value: 'containment' },
     ))], allowedMentions: { parse: [] } };
 }
 

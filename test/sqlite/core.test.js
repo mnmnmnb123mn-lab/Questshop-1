@@ -596,7 +596,8 @@ test('SQLite Admin services configure price, receiver, monitor, promotion and au
     actorId: 'admin', expectedStateVersion: promotion.state_version }), (error) => error.code === 'PROMOTION_CONFLICT');
   const movement = adjustWallet(fixture.db, { discordUserId: '12345678901234567', availableDeltaCents: 700, actorId: 'admin', reason: 'UAT funding' });
   assert.equal(Number(movement.wallet.available_cents), 700);
-  assert.deepEqual(adminOverview(fixture.db), { openReviews: 0, pendingJobs: 0, deadLetters: 0, activeMonitors: 1, receiverConfigured: true });
+  assert.deepEqual(adminOverview(fixture.db), { openReviews: 0, pendingJobs: 0, deadLetters: 0, activeMonitors: 1, receiverConfigured: true,
+    expiredLeases: 0, stuckRedeemed: 0, reservedCents: 0, availableCents: 700, containmentState: 'CLOSED', backupAt: null });
   assert.equal(fixture.db.prepare("SELECT count(*) AS count FROM admin_audit WHERE action IN ('PRICE_UPDATED','RECEIVER_UPDATED','MONITOR_UPDATED','PROMOTION_UPDATED','WALLET_ADJUSTMENT')").get().count >= 8, true);
 });
 

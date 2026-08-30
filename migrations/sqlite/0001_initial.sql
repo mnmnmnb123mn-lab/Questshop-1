@@ -242,7 +242,7 @@ CREATE TABLE IF NOT EXISTS notifications (
   destination TEXT NOT NULL,
   message_id TEXT,
   nonce TEXT NOT NULL UNIQUE,
-  state TEXT NOT NULL CHECK (state IN ('PENDING','SENDING','RETRY_WAIT','DELIVERED','DEAD_LETTER')),
+  state TEXT NOT NULL CHECK (state IN ('PENDING','SENDING','RETRY_WAIT','DELIVERED','DEAD_LETTER','DISCARDED')),
   desired_version INTEGER NOT NULL DEFAULT 1,
   sending_version INTEGER,
   delivered_version INTEGER NOT NULL DEFAULT 0,

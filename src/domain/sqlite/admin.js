@@ -3,9 +3,9 @@ import { nowMs, withImmediateTransaction } from '../../db/sqlite.js';
 import { currentFeatureGates } from './gates.js';
 import { enqueueNotificationInTransaction } from './notifications.js';
 import { QuestshopError } from '../../shared/errors.js';
-import { resolveTopupFinancialReview } from './payments.js';
+import { resolveTopupFinancialReview, reverseCreditedTopup } from './payments.js';
 import { encryptCredential } from './crypto.js';
-import { resolveOrderItemReview } from './orders.js';
+import { refundReadyOrderItem, resolveOrderItemReview } from './orders.js';
 import { supportedTaskTypes } from './pricing.js';
 import { appendWalletTransactionInTransaction } from './wallet.js';
 import { enqueueJobInTransaction } from './jobs.js';
@@ -25,6 +25,7 @@ export const ADMIN_AUDIT_ALLOWED_FIELDS = Object.freeze({
   SURFACE_SETUP: ['channelId', 'messageId'],
   PRICE_UPDATED: ['taskType', 'amountCents'],
   RECEIVER_UPDATED: ['last4'],
+  DLQ_DISCARDED: ['notificationType', 'destination'],
 });
 
 function filtered(action, value) {
@@ -97,13 +98,18 @@ export function setQuestPrice(db, { taskType, amountCents, actorId, reason = '',
   });
 }
 
-export function configureReceiverPhone(db, env, { phone, actorId, reason = '' }) {
+export function configureReceiverPhone(db, env, { phone, actorId, reason = '', expectedVersion = null }) {
   if (!/^0\d{9}$/.test(String(phone ?? ''))) throw new QuestshopError('RECEIVER_INVALID', 'เบอร์รับเงินต้องเป็นหมายเลขไทย 10 หลัก');
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
     const previous = db.prepare("SELECT value_json FROM settings WHERE key='receiver_credential_id'").get();
-    let previousCredentialId = null;
-    try { previousCredentialId = JSON.parse(previous?.value_json ?? '{}').credentialId ?? null; } catch { /* replace malformed pointer safely */ }
+    let pointer = {};
+    try { pointer = JSON.parse(previous?.value_json ?? '{}'); } catch { /* replace malformed pointer safely */ }
+    const previousCredentialId = pointer.credentialId ?? null;
+    const currentVersion = Number(pointer.version) || 1;
+    if (expectedVersion != null && Number(expectedVersion) !== currentVersion) {
+      throw new QuestshopError('RECEIVER_CONFLICT', 'เบอร์รับเงินถูกเปลี่ยนแล้ว กรุณาเปิดเมนูใหม่');
+    }
     const credentialId = randomUUID();
     const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, phone);
     db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
@@ -111,14 +117,14 @@ export function configureReceiverPhone(db, env, { phone, actorId, reason = '' })
       encrypted.ciphertext, encrypted.nonce, encrypted.authTag, timestamp, timestamp);
     db.prepare(`INSERT INTO settings(key,value_json,updated_at,updated_by) VALUES('receiver_credential_id',?,?,?)
       ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
-      .run(JSON.stringify({ credentialId }), timestamp, actorId);
+      .run(JSON.stringify({ credentialId, version: currentVersion + 1 }), timestamp, actorId);
     if (previousCredentialId && previousCredentialId !== credentialId) {
       db.prepare(`DELETE FROM credentials WHERE id=? AND credential_type='RECEIVER_PHONE'
         AND NOT EXISTS (SELECT 1 FROM settings WHERE key='receiver_credential_id' AND value_json LIKE '%' || credentials.id || '%')`).run(previousCredentialId);
     }
     appendAdminAuditInTransaction(db, { actorId, action: 'RECEIVER_UPDATED', targetType: 'RECEIVER', targetId: credentialId, reason,
       after: { last4: String(phone).slice(-4) }, timestamp });
-    return { credentialId, last4: String(phone).slice(-4) };
+    return { credentialId, last4: String(phone).slice(-4), version: currentVersion + 1 };
   });
 }
 
@@ -191,6 +197,23 @@ export function retryNotificationDlq(db, { notificationId, actorId }) {
   });
 }
 
+export function discardNotificationDlq(db, { notificationId, actorId }) {
+  const timestamp = nowMs();
+  return withImmediateTransaction(db, () => {
+    const before = db.prepare("SELECT * FROM notifications WHERE id=? AND state='DEAD_LETTER'").get(notificationId);
+    if (!before) throw new QuestshopError('DLQ_NOT_FOUND', 'ไม่พบข้อความที่ค้างส่ง');
+    const protectedRecord = before.destination === 'LOG_PAYMENTS' || before.destination === 'LOG_ADMIN'
+      || ['TOPUP', 'WALLET', 'ADMIN_AUDIT'].includes(before.aggregate_type);
+    if (protectedRecord) throw new QuestshopError('DLQ_DISCARD_FORBIDDEN', 'ห้ามทิ้งรายการการเงินหรือหลักฐาน audit');
+    const changed = db.prepare(`UPDATE notifications SET state='DISCARDED',lease_token=NULL,lease_expires_at=NULL,updated_at=?
+      WHERE id=? AND state='DEAD_LETTER'`).run(timestamp, notificationId);
+    if (!changed.changes) throw new QuestshopError('DLQ_CONFLICT', 'รายการค้างส่งถูกเปลี่ยนแล้ว กรุณาเปิดใหม่');
+    appendAdminAuditInTransaction(db, { actorId, action: 'DLQ_DISCARDED', targetType: 'NOTIFICATION', targetId: notificationId,
+      reason: 'Owner ทิ้งข้อความค้างส่งที่ไม่ใช่การเงินหรือ audit', after: { notificationType: before.notification_type, destination: before.destination }, timestamp });
+    return db.prepare('SELECT * FROM notifications WHERE id=?').get(notificationId);
+  });
+}
+
 export function listOpenManualReviews(db, { limit = 25 } = {}) {
   return db.prepare(`SELECT * FROM manual_reviews WHERE state='OPEN' ORDER BY created_at LIMIT ?`).all(Math.max(1, Math.min(25, Number(limit) || 25)));
 }
@@ -198,12 +221,22 @@ export function listOpenManualReviews(db, { limit = 25 } = {}) {
 export function adminOverview(db) {
   const count = (sql) => Number(db.prepare(sql).get().count);
   const receiver = db.prepare("SELECT value_json FROM settings WHERE key='receiver_credential_id'").get();
+  const containment = db.prepare("SELECT value_json FROM settings WHERE key='payment_containment'").get();
+  const backup = db.prepare("SELECT value_json FROM settings WHERE key='last_daily_backup'").get();
+  let containmentState = 'CLOSED'; let backupAt = null;
+  try { containmentState = JSON.parse(containment?.value_json ?? '{}').state ?? containmentState; } catch { /* report safe default */ }
+  try { backupAt = Number(JSON.parse(backup?.value_json ?? '{}').at) || null; } catch { /* no backup yet */ }
   return {
     openReviews: count("SELECT count(*) AS count FROM manual_reviews WHERE state='OPEN'"),
     pendingJobs: count("SELECT count(*) AS count FROM jobs WHERE state IN ('PENDING','RUNNING','RETRY_WAIT')"),
     deadLetters: count("SELECT count(*) AS count FROM notifications WHERE state='DEAD_LETTER'"),
     activeMonitors: count("SELECT count(*) AS count FROM monitor_accounts WHERE state='ACTIVE'"),
     receiverConfigured: Boolean(receiver),
+    expiredLeases: count("SELECT count(*) AS count FROM jobs WHERE state='RUNNING' AND lease_expires_at<=strftime('%s','now')*1000"),
+    stuckRedeemed: count("SELECT count(*) AS count FROM topups WHERE status='REDEEMED'"),
+    reservedCents: Number(db.prepare('SELECT COALESCE(sum(reserved_cents),0) AS total FROM wallets').get().total),
+    availableCents: Number(db.prepare('SELECT COALESCE(sum(available_cents),0) AS total FROM wallets').get().total),
+    containmentState, backupAt,
   };
 }
 
@@ -211,13 +244,17 @@ export function resolveOperationalReview(db, input) {
   return resolveOrderItemReview(db, input);
 }
 
-export function adjustWallet(db, { discordUserId, availableDeltaCents, actorId, reason }) {
+export function adjustWallet(db, { discordUserId, availableDeltaCents, actorId, reason, expectedWalletVersion = null }) {
   const amount = Number(availableDeltaCents);
   if (!/^\d{17,20}$/.test(String(discordUserId ?? '')) || !Number.isSafeInteger(amount) || amount === 0 || !String(reason ?? '').trim()) {
     throw new QuestshopError('WALLET_ADJUSTMENT_INVALID', 'ข้อมูลปรับเครดิตไม่ถูกต้อง');
   }
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
+    const wallet = db.prepare('SELECT * FROM wallets WHERE discord_user_id=?').get(discordUserId);
+    if (expectedWalletVersion != null && Number(wallet?.version) !== Number(expectedWalletVersion)) {
+      throw new QuestshopError('WALLET_CONFLICT', 'ยอด Wallet ถูกเปลี่ยนแล้ว กรุณาเปิดเมนูใหม่');
+    }
     const traceId = randomUUID();
     const movement = appendWalletTransactionInTransaction(db, { discordUserId, transactionType: 'ADJUSTMENT', availableDeltaCents: amount,
       referenceType: 'ADMIN_ADJUSTMENT', referenceId: traceId, idempotencyKey: `wallet-adjustment:${traceId}`, traceId, reason: String(reason).trim(), timestamp });
@@ -225,6 +262,33 @@ export function adjustWallet(db, { discordUserId, availableDeltaCents, actorId, 
       after: { availableDeltaCents: amount, reservedDeltaCents: 0 }, traceId, timestamp });
     return movement;
   });
+}
+
+export function listAdminOrders(db, { offset = 0, limit = 25 } = {}) {
+  return db.prepare(`SELECT o.id,o.discord_user_id,o.quest_account_id,o.state,o.created_at,o.updated_at,
+    count(i.id) AS item_count, sum(CASE WHEN i.state='REVIEW' THEN 1 ELSE 0 END) AS review_count
+    FROM orders o JOIN order_items i ON i.order_id=o.id GROUP BY o.id ORDER BY o.updated_at DESC LIMIT ? OFFSET ?`)
+    .all(Math.max(1, Math.min(25, Number(limit) || 25)), Math.max(0, Number(offset) || 0));
+}
+
+export function orderDetail(db, orderId) {
+  const order = db.prepare('SELECT id,discord_user_id,quest_account_id,state,created_at,updated_at FROM orders WHERE id=?').get(orderId);
+  if (!order) throw new QuestshopError('ORDER_NOT_FOUND', 'ไม่พบ Order');
+  return { order, items: db.prepare(`SELECT id,quest_id,task_type,state,price_cents,progress_percent,claim_url,refund_cents,state_version
+    FROM order_items WHERE order_id=? ORDER BY created_at`).all(orderId) };
+}
+
+export function refundOrderItem(db, input) {
+  return refundReadyOrderItem(db, input);
+}
+
+export function reverseTopup(db, input) {
+  return reverseCreditedTopup(db, input);
+}
+
+export function listRecentAdminAudit(db, { limit = 25 } = {}) {
+  return db.prepare(`SELECT id,actor_id,action,target_type,target_id,reason,before_json,after_json,created_at
+    FROM admin_audit ORDER BY created_at DESC LIMIT ?`).all(Math.max(1, Math.min(25, Number(limit) || 25)));
 }
 
 export function upsertPromotion(db, { id = randomUUID(), name, state, minimumCents, basisPoints, maximumBonusCents = null,
