@@ -23,8 +23,13 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run check
+      - run: npm run check:imports
       - run: npm run lint
       - run: npm run test:coverage
+      - run: npm run test:unit
+      - run: npm run test:integration
       - run: npm run load:test
       - run: npm audit --audit-level=high
-      - run: docker build --build-arg GIT_SHA=${{ github.sha }} -t questshop:${{ github.sha }} .
+      - run: |
+          docker build --build-arg GIT_SHA=${{ github.sha }} -t questshop:${{ github.sha }} .
+          test "$(docker run --rm --entrypoint cat questshop:${{ github.sha }} .source-sha)" = "${{ github.sha }}"

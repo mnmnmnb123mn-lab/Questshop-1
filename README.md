@@ -243,6 +243,18 @@ docker build --build-arg GIT_SHA=<exact-40-character-sha> -t questshop:local .
 
 tests ใช้ SQLite file ชั่วคราวเท่านั้น; ห้ามชี้ `SQLITE_PATH` ของ test หรือ load test ไป `/data/questshop.db`.
 
+Credential encryption writes `CREDENTIAL_ENCRYPTION_ACTIVE_VERSION` and reads
+only `CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS`. Use
+`npm run credentials:reencrypt` for an offline locked rotation, then
+`npm run verify:keys` before retiring a version; it checks both the live
+database and local SQLite backups. Same-volume backups support operational
+recovery only and are not disaster recovery.
+
+The Docker gate is passed only by a real build whose `/app/.source-sha` equals
+the exact candidate SHA. A missing local Docker daemon is recorded as
+`NOT_RUN_LOCAL: DOCKER_DAEMON_UNAVAILABLE`; GitHub Actions supplies the build
+evidence without pushing or deploying an image.
+
 ## เอกสารอ้างอิง
 
 - [System architecture](docs/architecture/system.md)

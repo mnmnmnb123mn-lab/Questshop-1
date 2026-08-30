@@ -8,6 +8,8 @@ Required environment values:
 SQLITE_PATH=/data/questshop.db
 QUESTSHOP_SECRET_KEY=<one permanent secret, at least 32 characters>
 VOUCHER_HMAC_ACTIVE_VERSION=v1
+CREDENTIAL_ENCRYPTION_ACTIVE_VERSION=v1
+CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS=v1
 GIT_SHA=<exact 40-character source SHA>
 DISCORD_BOT_TOKEN=<secret>
 DISCORD_CLIENT_ID=<application id>
@@ -37,3 +39,9 @@ npm audit --audit-level=high
 git diff --check
 docker build --build-arg GIT_SHA="$GIT_SHA" -t questshop:local .
 ```
+
+The Docker evidence is valid only after a successful build and a check that
+`/app/.source-sha` equals the exact candidate SHA. If a workstation has no
+Docker daemon, record `NOT_RUN_LOCAL: DOCKER_DAEMON_UNAVAILABLE`; do not edit
+the Dockerfile on that fact alone. GitHub Actions performs the build without
+pushing or deploying an image.

@@ -8,6 +8,8 @@
 - Provider outcomes are now persisted with their payment attempt before settlement; recovered `REDEEMED` payments credit only through the existing idempotent path.
 - Promotion and Monitor updates use aggregate versions; bonus usage is persisted per customer and Bangkok day. Customer mutation limits also survive restart in SQLite.
 - Removed unreachable PostgreSQL renderer, pricing, promotion, keyring and rate-limit paths rather than retaining a second persistence implementation.
+- Worker leases reject expired tokens for all authoritative writes; recovery runs at startup and continuously. Payment containment is persisted in SQLite and requires an Owner-bound, low-value verified probe before a separate audited gate reopen.
+- Coverage now enumerates every `src/**/*.js` runtime module and enforces native Node Lines/Branches/Functions thresholds (70% each). CI builds the image on Node 22.22.0 and checks the embedded source SHA; this is source/CI evidence only, not live UAT.
 
 - Added durable customer Quest discovery cases with automatic Monitor visibility checks before tests, one backoffice card per Quest, safe retry, and informational announcements decoupled from customer checkout.
 
