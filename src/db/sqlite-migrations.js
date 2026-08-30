@@ -12,7 +12,7 @@ export function assertRequiredSchema(db) {
   const tables = new Set(db.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map((row) => row.name));
   const required = ['settings', 'wallets', 'wallet_transactions', 'topups', 'payment_attempts', 'promotions',
     'quests', 'monitor_accounts', 'credentials', 'orders', 'order_items', 'jobs', 'quest_checks',
-    'notifications', 'interaction_sessions', 'manual_reviews', 'settlement_evidence', 'external_operation_evidence', 'admin_audit', 'promotion_usages'];
+    'notifications', 'interaction_sessions', 'interaction_rate_limits', 'manual_reviews', 'settlement_evidence', 'external_operation_evidence', 'admin_audit', 'promotion_usages'];
   const missing = required.filter((name) => !tables.has(name));
   if (missing.length) {
     const error = new Error(`SQLite migration is missing required tables: ${missing.join(', ')}`);
@@ -31,6 +31,7 @@ export function assertRequiredSchema(db) {
     manual_reviews: ['id', 'state_version', 'first_confirmation_by', 'decision'],
     promotions: ['id', 'state_version'],
     monitor_accounts: ['account_id', 'health_state', 'state_version'],
+    interaction_rate_limits: ['discord_user_id', 'action', 'state_version'],
   };
   for (const [table, columns] of Object.entries(requiredColumns)) {
     const actual = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name));

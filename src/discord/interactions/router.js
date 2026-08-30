@@ -20,6 +20,7 @@ import { supportedTaskTypes } from '../../domain/sqlite/pricing.js';
 import { bindInteractionSessionMessage, consumeInteractionSession, consumeModalInteractionSession, createInteractionSession } from '../../domain/sqlite/interaction-sessions.js';
 import { ADMIN, CUSTOMER, routeContract } from './contracts.js';
 import { installResponseController } from './response-controller.js';
+import { consumeInteractionRateLimit } from '../../domain/sqlite/interaction-rate-limits.js';
 
 function ephemeral(content) { return { content, ephemeral: true, allowedMentions: { parse: [] } }; }
 
@@ -452,6 +453,7 @@ async function quoteCheckout(interaction, runtime, checkoutId) {
 
 async function confirmCheckout(interaction, runtime, quoteId) {
   await assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+  consumeInteractionRateLimit(runtime.db, { discordUserId: interaction.user.id, action: 'ORDER_CONFIRM', limit: 5, windowMs: 10 * 60_000 });
   const quote = consumeInteractionSession(runtime.db, { sessionId: quoteId, actorId: interaction.user.id, guildId: interaction.guildId,
     channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'CHECKOUT_CONFIRM' });
   const snapshot = quote.payload;
@@ -480,10 +482,12 @@ async function confirmCheckout(interaction, runtime, quoteId) {
 async function routeButton(interaction, runtime, route, sessionId) {
   if (route === 'topup') {
     assertCurrentSurface(interaction, runtime, 'QUEST_AUTO'); await assertCustomerRoute(interaction, runtime, 'TOPUP_ACCEPTING');
+    consumeInteractionRateLimit(runtime.db, { discordUserId: interaction.user.id, action: 'CUSTOMER_BUTTON', limit: 1, windowMs: 2_000 });
     return interaction.showModal(voucherModal(sessionContext(interaction, runtime, 'VOUCHER_SUBMIT', {}, interaction.message?.id ?? null)));
   }
   if (route === 'start') {
     assertCurrentSurface(interaction, runtime, 'QUEST_AUTO'); await assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+    consumeInteractionRateLimit(runtime.db, { discordUserId: interaction.user.id, action: 'CUSTOMER_BUTTON', limit: 1, windowMs: 2_000 });
     const config = loadRuntimeConfig(runtime.db);
     if (!hasEverySupportedPrice(config)) {
       throw new QuestshopError('PRICE_NOT_CONFIGURED', 'ร้านยังตั้งราคา Quest ไม่ครบ กรุณาติดต่อผู้ดูแล');
@@ -596,12 +600,21 @@ async function routeModal(interaction, runtime, route) {
     consumeModalInteractionSession(runtime.db, { sessionId: parseCustomId(interaction.customId).sessionId, actorId: interaction.user.id,
       guildId: interaction.guildId, channelId: interaction.channelId, operation: 'VOUCHER_SUBMIT' });
     await interaction.deferReply({ ephemeral: true });
-    const result = submitTopup(runtime.db, runtime.env, { discordUserId: interaction.user.id,
-      voucherUrl: interaction.fields.getTextInputValue('url'), traceId: randomUUID(), prelaunch: runtime.env.PRELAUNCH });
+    let result;
+    try {
+      result = submitTopup(runtime.db, runtime.env, { discordUserId: interaction.user.id,
+        voucherUrl: interaction.fields.getTextInputValue('url'), traceId: randomUUID(), prelaunch: runtime.env.PRELAUNCH });
+    } catch (error) {
+      if (String(error?.code ?? '').startsWith('INVALID_VOUCHER')) {
+        consumeInteractionRateLimit(runtime.db, { discordUserId: interaction.user.id, action: 'INVALID_VOUCHER', limit: 5, windowMs: 30 * 60_000 });
+      }
+      throw error;
+    }
     return acknowledgeTopupAndStartSettlement({ interaction, result, runtime });
   }
   if (route === 'token_submit') {
     await assertCustomerRoute(interaction, runtime, 'ORDER_ACCEPTING');
+    consumeInteractionRateLimit(runtime.db, { discordUserId: interaction.user.id, action: 'TOKEN_VALIDATION', limit: 3, windowMs: 10 * 60_000 });
     consumeModalInteractionSession(runtime.db, { sessionId: parseCustomId(interaction.customId).sessionId, actorId: interaction.user.id,
       guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOKEN_SUBMIT' });
     await interaction.deferReply({ ephemeral: true });

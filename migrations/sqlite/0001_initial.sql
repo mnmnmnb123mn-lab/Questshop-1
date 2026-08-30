@@ -277,6 +277,16 @@ CREATE TABLE IF NOT EXISTS interaction_sessions (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS interaction_sessions_expiry ON interaction_sessions(expires_at);
 
+CREATE TABLE IF NOT EXISTS interaction_rate_limits (
+  discord_user_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  window_started_at INTEGER NOT NULL,
+  count INTEGER NOT NULL CHECK (count > 0),
+  state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version > 0),
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(discord_user_id,action)
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS manual_reviews (
   id TEXT PRIMARY KEY,
   subject_type TEXT NOT NULL,

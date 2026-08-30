@@ -35,6 +35,7 @@ import { listExecutorCapabilities, selectQuestExecutor } from '../../src/quest-e
 import { nextVideoTimestamp, videoExecutor } from '../../src/quest-engine/executors/video.js';
 import { desktopExecutor } from '../../src/quest-engine/executors/desktop.js';
 import { EXTERNAL_OUTCOME, externalOutcome } from '../../src/domain/sqlite/external-outcome.js';
+import { consumeInteractionRateLimit } from '../../src/domain/sqlite/interaction-rate-limits.js';
 
 const secret = 'sqlite-test-secret-key-which-is-at-least-32-characters';
 
@@ -49,12 +50,19 @@ async function database() {
 test('SQLite migration creates strict financial schema and append-only audit', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const tables = fixture.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'").get();
-  assert.equal(Number(tables.count), 20);
+  assert.equal(Number(tables.count), 21);
   assert.equal(fullIntegrityCheck(fixture.db).ok, true);
   appendWalletTransaction(fixture.db, { discordUserId: 'customer-a', transactionType: 'TOPUP', availableDeltaCents: 500,
     referenceType: 'TEST', referenceId: 'one', idempotencyKey: 'append-only-one', traceId: randomUUID() });
   assert.throws(() => fixture.db.prepare('DELETE FROM wallet_transactions').run(), /append-only/);
   assert.ok(fixture.db.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='external_operation_evidence_append_only_update'").get());
+});
+
+test('customer mutation limits survive restart in SQLite', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  consumeInteractionRateLimit(fixture.db, { discordUserId: '12345678901234567', action: 'ORDER_CONFIRM', limit: 1, windowMs: 600_000, timestamp: 1_000 });
+  assert.throws(() => consumeInteractionRateLimit(fixture.db, { discordUserId: '12345678901234567', action: 'ORDER_CONFIRM', limit: 1, windowMs: 600_000, timestamp: 1_001 }),
+    (error) => error.code === 'INTERACTION_RATE_LIMITED');
 });
 
 test('external outcome and surface fallbacks reject unsafe data without changing customer contracts', () => {
