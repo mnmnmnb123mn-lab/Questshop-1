@@ -98,6 +98,23 @@ function assertPaymentWorkerLease(db, workerJob, topupId) {
     subjectType: 'TOPUP', subjectId: topupId });
 }
 
+function updatePaymentAttemptInTransaction(db, {
+  topupId, attemptId = null, dispatchState = 'RESPONSE_RECEIVED', outcome = null, httpStatus = null,
+  providerCode = null, providerReference = null, reasonCode = null, evidence = {}, timestamp = nowMs(),
+}) {
+  const attempt = attemptId
+    ? db.prepare('SELECT id FROM payment_attempts WHERE id=? AND topup_id=?').get(attemptId, topupId)
+    : db.prepare('SELECT id FROM payment_attempts WHERE topup_id=? AND completed_at IS NULL ORDER BY attempt_number DESC LIMIT 1').get(topupId);
+  if (!attempt) return null;
+  db.prepare(`UPDATE payment_attempts SET dispatch_state=?,outcome=?,provider_http_status=?,provider_code=?,provider_reference=?,reason_code=?,
+    evidence_json=?,completed_at=? WHERE id=? AND completed_at IS NULL`).run(
+    dispatchState, outcome, Number(httpStatus) || null, providerCode == null ? null : String(providerCode).slice(0, 100),
+    providerReference == null ? null : String(providerReference).slice(0, 200), reasonCode == null ? null : String(reasonCode).slice(0, 100),
+    JSON.stringify(evidence), timestamp, attempt.id,
+  );
+  return attempt.id;
+}
+
 export function markTopupProcessing(db, topupId, { workerJob = null } = {}) {
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
@@ -116,7 +133,7 @@ export function markTopupProcessing(db, topupId, { workerJob = null } = {}) {
  * deliberate crash boundary: recovery can safely complete REDEEMED later. */
 export function recordRedeemedTopup(db, {
   topupId, principalCents, bonusCents = null, providerTransactionId = null, providerEvidence = {}, receiverLast4 = null,
-  workerJob = null,
+  attemptId = null, workerJob = null,
 }) {
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
@@ -141,16 +158,65 @@ export function recordRedeemedTopup(db, {
       principal, promotion.bonusCents, principal + promotion.bonusCents, promotion.snapshot ? JSON.stringify(promotion.snapshot) : null,
       providerTransactionId, receiverLast4, timestamp, timestamp, topup.id, topup.state_version,
     );
-    db.prepare(`UPDATE payment_attempts SET dispatch_state='RESPONSE_RECEIVED',provider_http_status=?,provider_code='SUCCESS',
-      evidence_json=?,completed_at=? WHERE topup_id=? AND completed_at IS NULL`).run(
-      Number(providerEvidence.httpStatus) || null, JSON.stringify(providerEvidence), timestamp, topup.id,
-    );
+    updatePaymentAttemptInTransaction(db, { topupId, attemptId, outcome: 'SUCCESS', httpStatus: providerEvidence.httpStatus,
+      providerCode: 'SUCCESS', providerReference: providerTransactionId, evidence: providerEvidence, timestamp });
     if (workerJob) appendExternalOperationEvidenceInTransaction(db, { jobId: workerJob.jobId, subjectType: 'TOPUP', subjectId: topupId,
-      stage: 'VERIFIED_RESULT', evidence: { principalCents: principal, providerTransactionId, providerEvidence },
+      stage: 'VERIFIED_RESULT', evidence: { outcome: 'SUCCESS', principalCents: principal, providerTransactionId, providerEvidence },
       traceId: topup.trace_id, timestamp });
     const updated = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
     enqueueTopupProjections(db, updated, timestamp);
     return { topup: updated, idempotent: false };
+  });
+}
+
+export function recordTopupDefiniteFailure(db, {
+  topupId, attemptId = null, reasonCode, providerEvidence = {}, providerReference = null, workerJob = null,
+}) {
+  const timestamp = nowMs();
+  return withImmediateTransaction(db, () => {
+    assertPaymentWorkerLease(db, workerJob, topupId);
+    const topup = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
+    if (!topup || ['CREDITED', 'REVERSED', 'REVIEW', 'FAILED'].includes(topup.status)) return topup ?? null;
+    updatePaymentAttemptInTransaction(db, { topupId, attemptId, outcome: 'DEFINITE_FAILURE', httpStatus: providerEvidence.httpStatus,
+      providerCode: reasonCode, providerReference, reasonCode, evidence: providerEvidence, timestamp });
+    if (workerJob) appendExternalOperationEvidenceInTransaction(db, { jobId: workerJob.jobId, subjectType: 'TOPUP', subjectId: topupId,
+      stage: 'VERIFIED_RESULT', evidence: { outcome: 'DEFINITE_FAILURE', reasonCode, providerReference, providerEvidence },
+      traceId: topup.trace_id, timestamp });
+    db.prepare(`UPDATE topups SET status='FAILED',failure_reason=?,state_version=state_version+1,updated_at=?
+      WHERE id=? AND state_version=?`).run(reasonCode, timestamp, topupId, topup.state_version);
+    const updated = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
+    enqueueTopupProjections(db, updated, timestamp);
+    return updated;
+  });
+}
+
+export function recordTopupAmbiguity(db, {
+  topupId, attemptId = null, reasonCode, safeReason, providerEvidence = {}, workerJob = null,
+}) {
+  const timestamp = nowMs();
+  return withImmediateTransaction(db, () => {
+    assertPaymentWorkerLease(db, workerJob, topupId);
+    const topup = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
+    if (!topup || ['CREDITED', 'REVERSED', 'REVIEW'].includes(topup.status)) return topup ?? null;
+    updatePaymentAttemptInTransaction(db, { topupId, attemptId, outcome: 'AMBIGUOUS', httpStatus: providerEvidence.httpStatus,
+      providerCode: reasonCode, reasonCode, evidence: providerEvidence, timestamp });
+    db.prepare(`UPDATE topups SET status='REVIEW',failure_reason=?,state_version=state_version+1,updated_at=?
+      WHERE id=? AND state_version=?`).run(reasonCode, timestamp, topupId, topup.state_version);
+    const updated = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
+    openFinancialReview(db, updated, reasonCode, safeReason, timestamp);
+    if (workerJob) appendExternalOperationEvidenceInTransaction(db, { jobId: workerJob.jobId, subjectType: 'TOPUP', subjectId: topupId,
+      stage: 'AMBIGUOUS', evidence: { outcome: 'AMBIGUOUS', reasonCode, providerEvidence }, traceId: topup.trace_id, timestamp });
+    enqueueTopupProjections(db, updated, timestamp);
+    return updated;
+  });
+}
+
+export function recordTopupNotSent(db, { topupId, attemptId, reasonCode, workerJob = null }) {
+  const timestamp = nowMs();
+  return withImmediateTransaction(db, () => {
+    assertPaymentWorkerLease(db, workerJob, topupId);
+    updatePaymentAttemptInTransaction(db, { topupId, attemptId, dispatchState: 'CONFIRMED_NOT_SENT', providerCode: reasonCode,
+      reasonCode, timestamp });
   });
 }
 

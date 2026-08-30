@@ -14,7 +14,7 @@ import { claimDueNotification, enqueueNotification, finishNotificationDelivery }
 import { createRotatedSqliteBackup, replaceDatabaseFromBackup } from '../../src/db/sqlite-backup.js';
 import { parseBahtToCents, percentageBonusHalfUp } from '../../src/shared/money.js';
 import { encryptCredential, voucherHmac, voucherIdentityHmac } from '../../src/domain/sqlite/crypto.js';
-import { claimDueJob, completeJob, enqueueJob, markJobPossiblySent, recoverInterruptedJobs, renewJobLease, updateRunningJobPayload } from '../../src/domain/sqlite/jobs.js';
+import { claimDueJob, completeJob, enqueueJob, markJobPossiblySent, recordQuestVerifiedResult, recoverInterruptedJobs, renewJobLease, updateRunningJobPayload } from '../../src/domain/sqlite/jobs.js';
 import { processQuestWorkflowJob } from '../../src/domain/sqlite/quest-workflow.js';
 import { deliverNotification, processPaymentJob, recoverInterruptedSubjects } from '../../src/workers/sqlite-worker-manager.js';
 import { setupSurface, surfaceNonce, updateOrCreateSurfaceAnchor } from '../../src/discord/surfaces/setup.js';
@@ -412,6 +412,7 @@ test('an incomplete Quest result remains reserved for operational review', async
 
 test('unknown TrueMoney provider outcomes become financial review rather than failure', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
+  configureReceiverPhone(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { phone: '0912345678', actorId: 'owner' });
   const topup = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'ambiguous-payer',
     voucherUrl: 'https://gift.truemoney.com/campaign/?v=7123456789abcdef0123456789abcdef01' }).topup;
   const job = claimDueJob(fixture.db);
@@ -420,6 +421,7 @@ test('unknown TrueMoney provider outcomes become financial review rather than fa
   await processPaymentJob(runtime, job);
   assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(topup.id).status, 'REVIEW');
   assert.equal(fixture.db.prepare("SELECT state FROM manual_reviews WHERE subject_type='TOPUP' AND subject_id=?").get(topup.id).state, 'OPEN');
+  assert.equal(fixture.db.prepare('SELECT outcome FROM payment_attempts WHERE topup_id=?').get(topup.id).outcome, 'AMBIGUOUS');
 });
 
 test('payment worker credits verified success and fails only explicit terminal voucher outcomes', async (t) => {
@@ -435,6 +437,9 @@ test('payment worker credits verified success and fails only explicit terminal v
   await processPaymentJob({ db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret }, abortController: new AbortController(),
     paymentProvider: async () => ({ outcome: 'DEFINITE_FAILURE', reason: 'VOUCHER_EXPIRED', httpStatus: 400, providerEvidence: {} }) }, claimDueJob(fixture.db));
   assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(rejected.id).status, 'FAILED');
+  assert.equal(fixture.db.prepare('SELECT outcome FROM payment_attempts WHERE topup_id=?').get(rejected.id).outcome, 'DEFINITE_FAILURE');
+  assert.match(fixture.db.prepare("SELECT evidence_json FROM external_operation_evidence WHERE subject_id=? AND stage='VERIFIED_RESULT'").get(rejected.id).evidence_json,
+    /DEFINITE_FAILURE/);
 });
 
 test('operational review releases once or captures only with explicit verification', async (t) => {
@@ -719,8 +724,9 @@ test('Quest recovery settles a durable verified result without another mutation'
     items: [{ questId: 'quest-recovery', priceCents: 500 }] });
   const item = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(order.id);
   const job = claimDueJob(fixture.db, { jobType: 'QUEST_RUN' });
-  fixture.db.prepare("UPDATE jobs SET checkpoint='VERIFIED',payload_json=?,lease_expires_at=0 WHERE id=?").run(
-    JSON.stringify({ recoveryResult: { outcome: 'SUCCESS', claimUrl: 'https://discord.com/quests/recovery', evidence: { verifiedCompleted: true } } }), job.id);
+  recordQuestVerifiedResult(fixture.db, { jobId: job.id, leaseToken: job.lease_token, subjectId: item.id,
+    result: { outcome: 'SUCCESS', claimUrl: 'https://discord.com/quests/recovery', evidence: { verifiedCompleted: true } } });
+  fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(job.id);
   recoverInterruptedSubjects({ db: fixture.db });
   assert.equal(fixture.db.prepare('SELECT state FROM order_items WHERE id=?').get(item.id).state, 'READY_TO_CLAIM');
   assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(job.id).state, 'COMPLETED');
@@ -731,8 +737,9 @@ test('Quest recovery settles a durable verified result without another mutation'
     items: [{ questId: 'quest-recovery', priceCents: 500 }] });
   const releaseItem = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(releaseOrder.id);
   const releaseJob = claimDueJob(fixture.db, { jobType: 'QUEST_RUN' });
-  fixture.db.prepare("UPDATE jobs SET checkpoint='VERIFIED',payload_json=?,lease_expires_at=0 WHERE id=?").run(
-    JSON.stringify({ recoveryResult: { outcome: 'FAILED', reason: 'EXTERNAL_COMPLETED_RELEASED', evidence: { completedBeforeRun: true } } }), releaseJob.id);
+  recordQuestVerifiedResult(fixture.db, { jobId: releaseJob.id, leaseToken: releaseJob.lease_token, subjectId: releaseItem.id,
+    result: { outcome: 'FAILED', reason: 'EXTERNAL_COMPLETED_RELEASED', evidence: { completedBeforeRun: true } } });
+  fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(releaseJob.id);
   recoverInterruptedSubjects({ db: fixture.db });
   assert.equal(fixture.db.prepare('SELECT state FROM order_items WHERE id=?').get(releaseItem.id).state, 'FAILED');
 

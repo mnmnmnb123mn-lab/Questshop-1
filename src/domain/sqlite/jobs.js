@@ -43,11 +43,10 @@ export function claimDueJob(db, { now = nowMs(), leaseMs = 30_000, jobType = nul
 }
 
 export function completeJob(db, { jobId, leaseToken, state = 'COMPLETED', checkpoint = 'VERIFIED',
-  errorCode = null, retryAt = null, expectedStateVersion = null, now = nowMs() }) {
+  errorCode = null, retryAt = null, now = nowMs() }) {
   return withImmediateTransaction(db, () => {
     const row = db.prepare('SELECT * FROM jobs WHERE id=?').get(jobId);
-    if (!row || row.lease_token !== leaseToken || row.state !== 'RUNNING'
-      || (expectedStateVersion != null && row.state_version !== expectedStateVersion)) return null;
+    if (!row || row.lease_token !== leaseToken || row.state !== 'RUNNING') return null;
     const nextState = retryAt == null ? state : 'RETRY_WAIT';
     db.prepare(`UPDATE jobs SET state=?,checkpoint=?,state_version=state_version+1,last_error_code=?,next_run_at=?,lease_token=NULL,lease_expires_at=NULL,
       completed_at=?,updated_at=? WHERE id=?`).run(nextState, checkpoint, errorCode, retryAt ?? now,
@@ -63,12 +62,11 @@ export function completeJob(db, { jobId, leaseToken, state = 'COMPLETED', checkp
  * the same BEGIN IMMEDIATE transaction as the protected aggregate mutation.
  */
 export function assertActiveJobLeaseInTransaction(db, {
-  jobId, leaseToken, subjectType, subjectId, expectedStateVersion = null,
+  jobId, leaseToken, subjectType, subjectId,
 }) {
   const job = db.prepare('SELECT * FROM jobs WHERE id=?').get(jobId);
   if (!job || job.state !== 'RUNNING' || job.lease_token !== leaseToken
-    || job.subject_type !== subjectType || job.subject_id !== subjectId
-    || (expectedStateVersion != null && job.state_version !== expectedStateVersion)) {
+    || job.subject_type !== subjectType || job.subject_id !== subjectId) {
     const error = new Error('Worker lease is no longer authoritative');
     error.code = 'JOB_LEASE_LOST';
     throw error;
@@ -125,9 +123,9 @@ export function recordQuestVerifiedResult(db, { jobId, leaseToken, subjectId, re
     const job = assertActiveJobLeaseInTransaction(db, {
       jobId, leaseToken, subjectType: 'ORDER_ITEM', subjectId,
     });
-    const payload = { ...JSON.parse(job.payload_json ?? '{}'), recoveryResult: result };
-    const changed = db.prepare(`UPDATE jobs SET payload_json=?,checkpoint='VERIFIED',state_version=state_version+1,updated_at=?
-      WHERE id=? AND state='RUNNING' AND lease_token=?`).run(JSON.stringify(payload), now, jobId, leaseToken);
+    const payload = JSON.parse(job.payload_json ?? '{}');
+    const changed = db.prepare(`UPDATE jobs SET checkpoint='VERIFIED',state_version=state_version+1,updated_at=?
+      WHERE id=? AND state='RUNNING' AND lease_token=?`).run(now, jobId, leaseToken);
     if (!changed.changes) throw Object.assign(new Error('Worker lease is no longer authoritative'), { code: 'JOB_LEASE_LOST' });
     appendExternalOperationEvidenceInTransaction(db, {
       jobId, subjectType: 'ORDER_ITEM', subjectId, stage: 'VERIFIED_RESULT', evidence: result,
@@ -160,10 +158,23 @@ export function recoverInterruptedJobs(db, { now = nowMs() } = {}) {
   });
 }
 
-export function finishRecoveredJob(db, { jobId, state, checkpoint = 'VERIFIED', errorCode = null, now = nowMs() }) {
-  return withImmediateTransaction(db, () => db.prepare(`UPDATE jobs SET state=?,checkpoint=?,state_version=state_version+1,
-    lease_token=NULL,lease_expires_at=NULL,last_error_code=?,completed_at=?,updated_at=?
-    WHERE id=? AND state='RUNNING' AND lease_expires_at<?`).run(
-    state, checkpoint, errorCode, ['COMPLETED', 'FAILED', 'REVIEW'].includes(state) ? now : null, now, jobId, now,
-  ).changes === 1);
+export function finishRecoveredJob(db, { jobId, state, checkpoint = 'VERIFIED', errorCode = null,
+  recoveryDecision = null, recoveryEvidence = {}, now = nowMs() }) {
+  return withImmediateTransaction(db, () => {
+    const job = db.prepare('SELECT * FROM jobs WHERE id=?').get(jobId);
+    if (!job || job.state !== 'RUNNING' || Number(job.lease_expires_at) >= now) return false;
+    if (recoveryDecision) {
+      let payload = {};
+      try { payload = JSON.parse(job.payload_json ?? '{}'); } catch { /* use operation key below */ }
+      appendExternalOperationEvidenceInTransaction(db, {
+        jobId: job.id, subjectType: job.subject_type, subjectId: job.subject_id, stage: 'RECOVERY_DECISION',
+        evidence: { decision: recoveryDecision, ...recoveryEvidence }, traceId: payload.traceId ?? job.operation_key, timestamp: now,
+      });
+    }
+    return db.prepare(`UPDATE jobs SET state=?,checkpoint=?,state_version=state_version+1,
+      lease_token=NULL,lease_expires_at=NULL,last_error_code=?,completed_at=?,updated_at=?
+      WHERE id=? AND state='RUNNING' AND lease_expires_at<?`).run(
+      state, checkpoint, errorCode, ['COMPLETED', 'FAILED', 'REVIEW'].includes(state) ? now : null, now, jobId, now,
+    ).changes === 1;
+  });
 }

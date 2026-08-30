@@ -2,7 +2,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
 import { decryptCredential } from '../domain/sqlite/crypto.js';
 import { appendExternalOperationEvidenceInTransaction, assertActiveJobLeaseInTransaction, claimDueJob, completeJob, finishRecoveredJob, markJobPossiblySent, recoverInterruptedJobs, renewJobLease } from '../domain/sqlite/jobs.js';
-import { creditRedeemedTopup, failTopup, markTopupProcessing, moveTopupToReview, recordRedeemedTopup } from '../domain/sqlite/payments.js';
+import { creditRedeemedTopup, markTopupProcessing, moveTopupToReview, recordRedeemedTopup, recordTopupAmbiguity,
+  recordTopupDefiniteFailure, recordTopupNotSent } from '../domain/sqlite/payments.js';
 import { settleOrderItem } from '../domain/sqlite/orders.js';
 import { claimDueNotification, deferNotification, finishNotificationDelivery, recoverSendingNotifications } from '../domain/sqlite/notifications.js';
 import { nowMs, withImmediateTransaction } from '../db/sqlite.js';
@@ -77,11 +78,27 @@ function createAttempt(db, topupId, attemptNumber, traceId, workerJob) {
   return id;
 }
 
-function recoveryEvidence(db, job, decision, details = {}) {
-  appendExternalOperationEvidenceInTransaction(db, {
-    jobId: job.id, subjectType: job.subject_type, subjectId: job.subject_id, stage: 'RECOVERY_DECISION',
-    evidence: { decision, ...details }, traceId: JSON.parse(job.payload_json ?? '{}').traceId ?? job.operation_key,
-  });
+function appendRecoveryStage(db, job, stage, evidence = {}) {
+  let payload = {};
+  try { payload = JSON.parse(job.payload_json ?? '{}'); } catch { /* operation key is the safe fallback */ }
+  withImmediateTransaction(db, () => appendExternalOperationEvidenceInTransaction(db, {
+    jobId: job.id, subjectType: job.subject_type, subjectId: job.subject_id, stage,
+    evidence, traceId: payload.traceId ?? job.operation_key,
+  }));
+}
+
+function ensureRecoveryReview(db, job, { category = 'OPERATIONAL', reasonCode, safeReason }) {
+  const timestamp = nowMs();
+  withImmediateTransaction(db, () => db.prepare(`INSERT INTO manual_reviews(id,subject_type,subject_id,category,state,reason_code,safe_reason,created_at,updated_at)
+    VALUES(?,?,?,?,'OPEN',?,?,?,?) ON CONFLICT(subject_type,subject_id) WHERE state='OPEN' DO NOTHING`).run(
+    randomUUID(), job.subject_type, job.subject_id, category, reasonCode, safeReason, timestamp, timestamp,
+  ));
+}
+
+function verifiedQuestResult(db, jobId) {
+  const row = db.prepare("SELECT evidence_json FROM external_operation_evidence WHERE job_id=? AND stage='VERIFIED_RESULT'").get(jobId);
+  if (!row) return null;
+  try { return JSON.parse(row.evidence_json); } catch { return null; }
 }
 
 /** Recover only expired deliveries.  Aggregate mutations stay in their domain
@@ -92,48 +109,54 @@ export function recoverInterruptedSubjects(runtime) {
   for (const job of jobs) {
     if (job.job_type === 'PAYMENT_SETTLE') {
       const topup = runtime.db.prepare('SELECT * FROM topups WHERE id=?').get(job.subject_id);
-      if (!topup) { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', errorCode: 'TOPUP_NOT_FOUND' }); continue; }
+      if (!topup) { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', errorCode: 'TOPUP_NOT_FOUND', recoveryDecision: 'TOPUP_NOT_FOUND' }); continue; }
       if (topup.status === 'REDEEMED') {
         creditRedeemedTopup(runtime.db, { topupId: topup.id });
-        withImmediateTransaction(runtime.db, () => recoveryEvidence(runtime.db, job, 'CREDIT_REDEEMED_WITHOUT_PROVIDER_RETRY'));
-        finishRecoveredJob(runtime.db, { jobId: job.id, state: 'COMPLETED' });
+        finishRecoveredJob(runtime.db, { jobId: job.id, state: 'COMPLETED', recoveryDecision: 'CREDIT_REDEEMED_WITHOUT_PROVIDER_RETRY' });
       } else if (['CREDITED', 'REVERSED'].includes(topup.status)) {
-        finishRecoveredJob(runtime.db, { jobId: job.id, state: 'COMPLETED' });
+        finishRecoveredJob(runtime.db, { jobId: job.id, state: 'COMPLETED', recoveryDecision: 'TOPUP_ALREADY_TERMINAL' });
       } else if (topup.status === 'FAILED') {
-        finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', errorCode: topup.failure_reason });
+        finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', errorCode: topup.failure_reason, recoveryDecision: 'TOPUP_ALREADY_FAILED' });
       } else if (topup.status === 'REVIEW') {
-        finishRecoveredJob(runtime.db, { jobId: job.id, state: 'REVIEW', checkpoint: 'POSSIBLY_SENT', errorCode: topup.failure_reason });
+        ensureRecoveryReview(runtime.db, job, { category: 'FINANCIAL', reasonCode: topup.failure_reason ?? 'RECOVERY_REVIEW_REQUIRED',
+          safeReason: 'รายการเติมเงินนี้ต้องได้รับการตรวจสอบจากผู้ดูแล' });
+        finishRecoveredJob(runtime.db, { jobId: job.id, state: 'REVIEW', checkpoint: 'POSSIBLY_SENT', errorCode: topup.failure_reason,
+          recoveryDecision: 'TOPUP_REVIEW_ALREADY_OPEN' });
       } else {
-        moveTopupToReview(runtime.db, { topupId: topup.id, reasonCode: 'RESTART_AFTER_POSSIBLY_SENT',
+        recordTopupAmbiguity(runtime.db, { topupId: topup.id, reasonCode: 'RESTART_AFTER_POSSIBLY_SENT',
           safeReason: 'คำขอ TrueMoney อาจถูกส่งแล้วและต้องตรวจสอบด้วยผู้ดูแล' });
-        withImmediateTransaction(runtime.db, () => recoveryEvidence(runtime.db, job, 'FINANCIAL_REVIEW_NO_PROVIDER_RETRY'));
-        finishRecoveredJob(runtime.db, { jobId: job.id, state: 'REVIEW', checkpoint: 'POSSIBLY_SENT', errorCode: 'RESTART_AFTER_POSSIBLY_SENT' });
+        appendRecoveryStage(runtime.db, job, 'AMBIGUOUS', { reasonCode: 'RESTART_AFTER_POSSIBLY_SENT' });
+        finishRecoveredJob(runtime.db, { jobId: job.id, state: 'REVIEW', checkpoint: 'POSSIBLY_SENT', errorCode: 'RESTART_AFTER_POSSIBLY_SENT',
+          recoveryDecision: 'FINANCIAL_REVIEW_NO_PROVIDER_RETRY' });
       }
       continue;
     }
     if (job.job_type !== 'QUEST_RUN') {
       // An extension job without a declared subject recovery policy must not
       // be retried after a possible external send.
-      finishRecoveredJob(runtime.db, { jobId: job.id, state: 'REVIEW', checkpoint: 'POSSIBLY_SENT', errorCode: 'RESTART_AFTER_POSSIBLY_SENT' });
+      ensureRecoveryReview(runtime.db, job, { reasonCode: 'RESTART_AFTER_POSSIBLY_SENT',
+        safeReason: 'งานภายนอกถูกขัดจังหวะและต้องได้รับการตรวจสอบ' });
+      appendRecoveryStage(runtime.db, job, 'AMBIGUOUS', { reasonCode: 'RESTART_AFTER_POSSIBLY_SENT' });
+      finishRecoveredJob(runtime.db, { jobId: job.id, state: 'REVIEW', checkpoint: 'POSSIBLY_SENT', errorCode: 'RESTART_AFTER_POSSIBLY_SENT',
+        recoveryDecision: 'UNKNOWN_EXTERNAL_OPERATION_REVIEW' });
       continue;
     }
     const item = runtime.db.prepare('SELECT * FROM order_items WHERE id=?').get(job.subject_id);
-    if (!item) { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', errorCode: 'ORDER_ITEM_NOT_FOUND' }); continue; }
-    if (item.state === 'READY_TO_CLAIM') { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'COMPLETED' }); continue; }
-    if (['FAILED', 'REFUNDED'].includes(item.state)) { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED' }); continue; }
-    const result = JSON.parse(job.payload_json ?? '{}').recoveryResult;
+    if (!item) { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', errorCode: 'ORDER_ITEM_NOT_FOUND', recoveryDecision: 'ORDER_ITEM_NOT_FOUND' }); continue; }
+    if (item.state === 'READY_TO_CLAIM') { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'COMPLETED', recoveryDecision: 'ITEM_ALREADY_CAPTURED' }); continue; }
+    if (['FAILED', 'REFUNDED'].includes(item.state)) { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', recoveryDecision: 'ITEM_ALREADY_RELEASED' }); continue; }
+    const result = verifiedQuestResult(runtime.db, job.id);
     if (result?.outcome === 'SUCCESS') {
       settleOrderItem(runtime.db, { itemId: item.id, outcome: 'SUCCESS', claimUrl: result.claimUrl, verified: true, evidence: result.evidence ?? {} });
-      withImmediateTransaction(runtime.db, () => recoveryEvidence(runtime.db, job, 'CAPTURE_FROM_VERIFIED_RESULT'));
-      finishRecoveredJob(runtime.db, { jobId: job.id, state: 'COMPLETED' });
+      finishRecoveredJob(runtime.db, { jobId: job.id, state: 'COMPLETED', recoveryDecision: 'CAPTURE_FROM_VERIFIED_RESULT' });
     } else if (result?.outcome === 'FAILED') {
       settleOrderItem(runtime.db, { itemId: item.id, outcome: 'FAILED', reason: result.reason, evidence: result.evidence ?? {} });
-      withImmediateTransaction(runtime.db, () => recoveryEvidence(runtime.db, job, 'RELEASE_FROM_VERIFIED_RESULT'));
-      finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', errorCode: result.reason });
+      finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', errorCode: result.reason, recoveryDecision: 'RELEASE_FROM_VERIFIED_RESULT' });
     } else {
       settleOrderItem(runtime.db, { itemId: item.id, outcome: 'REVIEW', reason: 'RESTART_AFTER_POSSIBLY_SENT', evidence: { recovery: true } });
-      withImmediateTransaction(runtime.db, () => recoveryEvidence(runtime.db, job, 'OPERATIONAL_REVIEW_RESERVED'));
-      finishRecoveredJob(runtime.db, { jobId: job.id, state: 'REVIEW', checkpoint: 'POSSIBLY_SENT', errorCode: 'RESTART_AFTER_POSSIBLY_SENT' });
+      appendRecoveryStage(runtime.db, job, 'AMBIGUOUS', { reasonCode: 'RESTART_AFTER_POSSIBLY_SENT' });
+      finishRecoveredJob(runtime.db, { jobId: job.id, state: 'REVIEW', checkpoint: 'POSSIBLY_SENT', errorCode: 'RESTART_AFTER_POSSIBLY_SENT',
+        recoveryDecision: 'OPERATIONAL_REVIEW_RESERVED' });
     }
   }
 }
@@ -149,17 +172,6 @@ function recordAttemptSent(db, attemptId, workerJob) {
   withImmediateTransaction(db, () => {
     assertPaymentAttemptLease(db, attemptId, workerJob);
     db.prepare("UPDATE payment_attempts SET dispatch_state='POSSIBLY_SENT' WHERE id=?").run(attemptId);
-  });
-}
-
-function recordAttemptResponse(db, attemptId, workerJob, {
-  dispatchState = 'RESPONSE_RECEIVED', httpStatus = null, providerCode = null, evidence = {},
-} = {}) {
-  withImmediateTransaction(db, () => {
-    assertPaymentAttemptLease(db, attemptId, workerJob);
-    db.prepare(`UPDATE payment_attempts SET dispatch_state=?,provider_http_status=?,provider_code=?,evidence_json=?,completed_at=?
-      WHERE id=? AND completed_at IS NULL`).run(dispatchState, Number(httpStatus) || null,
-      providerCode == null ? null : String(providerCode).slice(0, 100), JSON.stringify(evidence), nowMs(), attemptId);
   });
 }
 
@@ -215,40 +227,36 @@ export async function processPaymentJob(runtime, job) {
     if (result.outcome === EXTERNAL_OUTCOME.SUCCESS && result.currency === 'THB' && Number(result.amountCents) > 0) {
       recordRedeemedTopup(runtime.db, { topupId: topup.id, principalCents: result.amountCents,
         providerTransactionId: result.providerTransactionId ?? null, receiverLast4: receiver.last4,
-        providerEvidence: result.providerEvidence ?? { httpStatus: result.httpStatus }, workerJob });
+        providerEvidence: { ...(result.providerEvidence ?? {}), httpStatus: result.httpStatus ?? result.providerEvidence?.httpStatus },
+        attemptId, workerJob });
       creditRedeemedTopup(runtime.db, { topupId: topup.id, workerJob });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
     }
     if (result.outcome === EXTERNAL_OUTCOME.DEFINITE_FAILURE) {
       const reason = result.reason ?? result.providerCode ?? 'PROVIDER_REJECTED';
-      recordAttemptResponse(runtime.db, attemptId, workerJob, { providerCode: reason,
-        httpStatus: result.httpStatus ?? result.evidence?.httpStatus, evidence: result.providerEvidence ?? result.evidence ?? {} });
-      failTopup(runtime.db, { topupId: topup.id, reasonCode: reason, workerJob });
+      recordTopupDefiniteFailure(runtime.db, { topupId: topup.id, attemptId, reasonCode: reason,
+        providerReference: result.providerTransactionId ?? null,
+        providerEvidence: { ...(result.providerEvidence ?? result.evidence ?? {}), httpStatus: result.httpStatus ?? result.evidence?.httpStatus }, workerJob });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED', errorCode: reason });
     }
     // Any unknown adapter result follows the same path as an uncertain
     // transport result.  A payment request was already dispatched, so the
     // safe outcome is Reserved-for-review, never an automatic rejection.
     const reason = result.reason ?? result.providerCode ?? 'PROVIDER_RESULT_AMBIGUOUS';
-    recordAttemptResponse(runtime.db, attemptId, workerJob, { providerCode: reason,
-      httpStatus: result.httpStatus ?? result.evidence?.httpStatus, evidence: result.providerEvidence ?? result.evidence ?? {} });
-    moveTopupToReview(runtime.db, { topupId: topup.id, reasonCode: reason,
-      safeReason: 'ระบบยังยืนยันผลจาก TrueMoney ไม่ได้ จึงส่งให้ผู้ดูแลตรวจสอบ', workerJob });
+    recordTopupAmbiguity(runtime.db, { topupId: topup.id, attemptId, reasonCode: reason,
+      safeReason: 'ระบบยังยืนยันผลจาก TrueMoney ไม่ได้ จึงส่งให้ผู้ดูแลตรวจสอบ',
+      providerEvidence: { ...(result.providerEvidence ?? result.evidence ?? {}), httpStatus: result.httpStatus ?? result.evidence?.httpStatus }, workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
       errorCode: reason, checkpoint: 'POSSIBLY_SENT' });
   } catch (error) {
     if (error.code === 'PROVIDER_NOT_SENT' || error.code === 'PAYMENT_INTENT_CHECKPOINT_FAILED') {
-      recordAttemptResponse(runtime.db, attemptId, workerJob, { dispatchState: 'CONFIRMED_NOT_SENT', providerCode: error.code });
+      recordTopupNotSent(runtime.db, { topupId: topup.id, attemptId, reasonCode: error.code, workerJob });
       return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, retryAt: nowMs() + 15_000,
         errorCode: error.code, checkpoint: 'NOT_STARTED' });
     }
-    recordAttemptResponse(runtime.db, attemptId, workerJob, {
-      dispatchState: 'POSSIBLY_SENT', providerCode: error.code ?? 'PROVIDER_RESULT_AMBIGUOUS',
-      httpStatus: error?.details?.httpStatus,
-      evidence: error?.details && typeof error.details === 'object' ? error.details : {},
-    });
-    moveTopupToReview(runtime.db, { topupId: topup.id, reasonCode: error.code ?? 'PROVIDER_RESULT_AMBIGUOUS',
-      safeReason: 'ระบบยังยืนยันผลจาก TrueMoney ไม่ได้ จึงส่งให้ผู้ดูแลตรวจสอบ', workerJob });
+    recordTopupAmbiguity(runtime.db, { topupId: topup.id, attemptId, reasonCode: error.code ?? 'PROVIDER_RESULT_AMBIGUOUS',
+      safeReason: 'ระบบยังยืนยันผลจาก TrueMoney ไม่ได้ จึงส่งให้ผู้ดูแลตรวจสอบ',
+      providerEvidence: error?.details && typeof error.details === 'object' ? error.details : {}, workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
       errorCode: error.code ?? 'PROVIDER_RESULT_AMBIGUOUS', checkpoint: 'POSSIBLY_SENT' });
   }
