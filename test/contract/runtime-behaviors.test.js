@@ -20,7 +20,7 @@ import { assertQuestPriceCategory, questPriceCategoryForTaskType, taskTypesForQu
 import { AuthorizationError, FencingLostError, StaleStateError } from '../../src/shared/errors.js';
 import { assertAllowedQuestApiPath, discordQuestRequestPath, QUEST_ENDPOINT } from '../../src/quest-engine/api/endpoints.js';
 import { secureJitter } from '../../src/shared/random.js';
-import { hasAdministratorPermission, interactionMatchesContract } from '../../src/discord/interactions/router.js';
+import { hasAdministratorPermission, interactionMatchesContract, routeInteraction } from '../../src/discord/interactions/router.js';
 import { customId } from '../../src/discord/components/custom-id.js';
 
 const rawQuest = Object.freeze({
@@ -161,8 +161,22 @@ test('persistent Admin routes re-check the current Discord Administrator permiss
     inGuild: () => true, isButton: () => true, isChatInputCommand: () => false };
   assert.equal(await hasAdministratorPermission(interaction, runtime), false);
   assert.equal(interactionMatchesContract(interaction, runtime), true);
+  assert.equal(interactionMatchesContract({ ...interaction, isChatInputCommand: () => true, commandName: 'unknown' }, runtime), false);
+  assert.equal(interactionMatchesContract({ ...interaction, guildId: 'other' }, runtime), false);
   runtime.client.guilds.fetch = async () => ({ members: { fetch: async () => ({ permissions: { has: () => true } }) } });
   assert.equal(await hasAdministratorPermission(interaction, runtime), true);
   runtime.client.guilds.fetch = async () => { throw new Error('Discord unavailable'); };
   assert.equal(await hasAdministratorPermission(interaction, runtime), false);
+});
+
+test('Owner setup commands also require current Discord Administrator permission', async () => {
+  const replies = [];
+  const runtime = { acceptingInteractions: true, env: { DISCORD_GUILD_ID: 'guild', OWNER_ID: 'owner' }, logger: { warn() {} },
+    client: { guilds: { fetch: async () => ({ members: { fetch: async () => ({ permissions: { has: () => false } }) } }) } } };
+  const interaction = { client: { questshop: runtime }, guildId: 'guild', user: { id: 'owner' }, commandName: 'quest-auto',
+    inGuild: () => true, isChatInputCommand: () => true, reply: async (payload) => { replies.push(payload); },
+    deferReply: async () => { throw new Error('setup must not start without current permission'); } };
+  await routeInteraction(interaction);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].content, /เฉพาะ Owner/);
 });

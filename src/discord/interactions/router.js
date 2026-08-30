@@ -328,7 +328,7 @@ function tokenModal(sessionId) {
 async function handleSurfaceCommand(interaction, runtime) {
   const surfaceKey = SURFACE_COMMANDS[interaction.commandName];
   if (!surfaceKey) return false;
-  if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('NOT_AUTHORIZED', 'คำสั่งติดตั้งแผงใช้ได้เฉพาะ Owner');
+  await assertOwner(interaction, runtime);
   await interaction.deferReply({ ephemeral: true });
   const channel = interaction.options.getChannel('channel') ?? interaction.channel;
   const result = await setupSurface({ channel, surfaceKey, runtime, actorId: interaction.user.id });
