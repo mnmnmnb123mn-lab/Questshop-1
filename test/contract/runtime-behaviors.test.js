@@ -20,6 +20,8 @@ import { assertQuestPriceCategory, questPriceCategoryForTaskType, taskTypesForQu
 import { AuthorizationError, FencingLostError, StaleStateError } from '../../src/shared/errors.js';
 import { assertAllowedQuestApiPath, discordQuestRequestPath, QUEST_ENDPOINT } from '../../src/quest-engine/api/endpoints.js';
 import { secureJitter } from '../../src/shared/random.js';
+import { hasAdministratorPermission, interactionMatchesContract } from '../../src/discord/interactions/router.js';
+import { customId } from '../../src/discord/components/custom-id.js';
 
 const rawQuest = Object.freeze({
   id: 'quest-1',
@@ -149,4 +151,18 @@ test('runtime adapters reject incompatible input and use their documented fallba
   assert.throws(() => assertAllowedQuestApiPath('https://example.test'), /unsafe Discord/);
   assert.equal(secureJitter(0), 0);
   assert.ok(secureJitter(2) >= 0);
+});
+
+test('persistent Admin routes re-check the current Discord Administrator permission', async () => {
+  const runtime = { env: { DISCORD_GUILD_ID: 'guild' }, client: { guilds: { fetch: async () => ({ members: {
+    fetch: async () => ({ permissions: { has: () => false } }),
+  } }) } } };
+  const interaction = { guildId: 'guild', user: { id: 'admin' }, customId: customId('admin_gate_toggle'),
+    inGuild: () => true, isButton: () => true, isChatInputCommand: () => false };
+  assert.equal(await hasAdministratorPermission(interaction, runtime), false);
+  assert.equal(interactionMatchesContract(interaction, runtime), true);
+  runtime.client.guilds.fetch = async () => ({ members: { fetch: async () => ({ permissions: { has: () => true } }) } });
+  assert.equal(await hasAdministratorPermission(interaction, runtime), true);
+  runtime.client.guilds.fetch = async () => { throw new Error('Discord unavailable'); };
+  assert.equal(await hasAdministratorPermission(interaction, runtime), false);
 });
