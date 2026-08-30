@@ -1,62 +1,68 @@
-import { getRuntimePool } from '../db/pools.js';
-import { DEFAULT_FEATURE_GATES } from './feature-gates.js';
-import { paymentPolicyFromConfigValues } from '../domain/payments/policy.js';
+import { DEFAULT_FEATURE_GATES, assertFeatureGate } from './feature-gates.js';
+import { nowMs, withImmediateTransaction } from '../db/sqlite.js';
+import { configuredPriceRange } from '../domain/sqlite/pricing.js';
 
-const PAYMENT_POLICY_KEYS = Object.freeze([
-  'topupAutoCreditMinCents',
-  'topupAutoCreditMaxCents',
-  'topupDailyLimitCents',
-]);
+const CONFIG_KEY = 'runtime_config';
+const GATES_KEY = 'feature_gates';
+const SURFACES_KEY = 'discord_surfaces';
+
+function readSetting(db, key, fallback) {
+  const row = db.prepare('SELECT value_json FROM settings WHERE key=?').get(key);
+  return row ? JSON.parse(row.value_json) : fallback;
+}
+
+function putSetting(db, key, value, actor = 'SYSTEM', timestamp = nowMs()) {
+  db.prepare(`INSERT INTO settings(key,value_json,updated_at,updated_by) VALUES(?,?,?,?)
+    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
+    .run(key, JSON.stringify(value), timestamp, actor);
+}
 
 export function sanitizeRuntimeConfigValues(payload = {}) {
-  const values = { ...payload };
-  // Human backoffice access is derived from Discord's Administrator
-  // permission at each interaction boundary. Retire the old role-based
-  // setting from every config snapshot the application reads or writes.
+  const values = { ...(payload && typeof payload === 'object' ? payload : {}) };
   delete values.adminRoleId;
-
-  // Payment limits are runtime policy rather than source-code constants. Only
-  // normalize keys that were explicitly persisted so old snapshots continue
-  // to inherit safe defaults. `null` intentionally disables the upper/daily cap.
-  if (PAYMENT_POLICY_KEYS.some((key) => Object.hasOwn(values, key))) {
-    const policy = paymentPolicyFromConfigValues(values);
-    if (Object.hasOwn(values, 'topupAutoCreditMinCents')) {
-      values.topupAutoCreditMinCents = policy.autoCreditMinCents.toString();
-    }
-    if (Object.hasOwn(values, 'topupAutoCreditMaxCents')) {
-      values.topupAutoCreditMaxCents = policy.autoCreditMaxCents?.toString() ?? null;
-    }
-    if (Object.hasOwn(values, 'topupDailyLimitCents')) {
-      values.topupDailyLimitCents = policy.dailyRedeemedLimitCents?.toString() ?? null;
-    }
-  }
   return values;
 }
 
-export async function loadRuntimeConfig(pool = getRuntimePool()) {
-  const [gates, config, surfaces] = await Promise.all([
-    pool.query('SELECT gate, enabled, version, reason FROM feature_gates'),
-    pool.query('SELECT * FROM config_versions ORDER BY version DESC LIMIT 1'),
-    pool.query('SELECT * FROM surfaces'),
-  ]);
+export function loadRuntimeConfig(db) {
+  const values = sanitizeRuntimeConfigValues(readSetting(db, CONFIG_KEY, {}));
   return Object.freeze({
-    version: Number(config.rows[0]?.version ?? 1),
-    values: sanitizeRuntimeConfigValues(config.rows[0]?.payload),
-    gates: Object.freeze({
-      ...DEFAULT_FEATURE_GATES,
-      ...Object.fromEntries(gates.rows.map((row) => [row.gate, row.enabled])),
-    }),
-    surfaces: Object.freeze(Object.fromEntries(surfaces.rows.map((row) => [row.surface_key, row]))),
+    version: Number(readSetting(db, 'runtime_config_version', 1)),
+    values,
+    priceRange: configuredPriceRange(values),
+    gates: Object.freeze({ ...DEFAULT_FEATURE_GATES, ...readSetting(db, GATES_KEY, {}) }),
+    surfaces: Object.freeze(readSetting(db, SURFACES_KEY, {})),
   });
 }
 
-export async function setFeatureGate(client, { gate, enabled, reason, actor, context }) {
-  const result = await client.query(`
-    UPDATE feature_gates SET enabled = $2, reason = $3, actor_type = $4,
-      actor_id = $5, trace_id = $6, version = version + 1,
-      updated_at = transaction_timestamp()
-    WHERE gate = $1 RETURNING *
-  `, [gate, enabled, reason, actor.type, actor.id, context.traceId]);
-  if (!result.rows[0]) throw new TypeError(`Unknown feature gate: ${gate}`);
-  return result.rows[0];
+export function setFeatureGate(db, { gate, enabled, reason, actor = { id: 'SYSTEM' } }) {
+  assertFeatureGate(gate);
+  return withImmediateTransaction(db, () => {
+    const gates = { ...DEFAULT_FEATURE_GATES, ...readSetting(db, GATES_KEY, {}) };
+    gates[gate] = enabled === true;
+    putSetting(db, GATES_KEY, gates, actor.id);
+    const values = readSetting(db, 'gate_reasons', {});
+    values[gate] = { reason: String(reason ?? ''), updatedAt: nowMs(), actorId: actor.id };
+    putSetting(db, 'gate_reasons', values, actor.id);
+    return { gate, enabled: gates[gate], reason: values[gate].reason };
+  });
+}
+
+export function saveRuntimeConfig(db, values, actor = 'SYSTEM') {
+  return withImmediateTransaction(db, () => {
+    const version = Number(readSetting(db, 'runtime_config_version', 1)) + 1;
+    putSetting(db, CONFIG_KEY, sanitizeRuntimeConfigValues(values), actor);
+    putSetting(db, 'runtime_config_version', version, actor);
+    return { version, values: sanitizeRuntimeConfigValues(values) };
+  });
+}
+
+export function saveSurface(db, surfaceKey, surface, actor = 'SYSTEM') {
+  return withImmediateTransaction(db, () => saveSurfaceInTransaction(db, surfaceKey, surface, actor));
+}
+
+export function saveSurfaceInTransaction(db, surfaceKey, surface, actor = 'SYSTEM') {
+  const surfaces = readSetting(db, SURFACES_KEY, {});
+  surfaces[surfaceKey] = surface;
+  putSetting(db, SURFACES_KEY, surfaces, actor);
+  return surfaces[surfaceKey];
 }

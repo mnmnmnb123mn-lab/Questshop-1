@@ -1,56 +1,50 @@
 import '../src/config/load-local-environment.js';
 import { loadEnvironment } from '../src/config/env.js';
-import { getRuntimePool, closePools } from '../src/db/pools.js';
-import { createContext } from '../src/shared/correlation.js';
-import { refundCapturedOrderItem, releaseReservation, reverseTopup } from '../src/domain/wallet/service.js';
-import { appendReleaseEvidence, assertReleaseIdentity } from '../src/domain/admin/release-evidence.js';
-import { APP_VERSION, ENGINE_VERSION } from '../src/config/versions.js';
-import { withTransaction } from '../src/db/transaction.js';
-import { appendAdminAudit } from '../src/domain/admin/audit.js';
+import { acquireSingleInstanceLock, closeSqliteDatabase, openSqliteDatabase } from '../src/db/sqlite.js';
+import { refundReadyOrderItem, resolveOrderItemReview, settleOrderItem } from '../src/domain/sqlite/orders.js';
+import { resolveTopupFinancialReview, reverseCreditedTopup } from '../src/domain/sqlite/payments.js';
 
 if (process.env.CONFIRM_PRELAUNCH_CLOSEOUT !== 'I_UNDERSTAND_COMPENSATING_TRANSACTIONS') {
   throw new Error('Set CONFIRM_PRELAUNCH_CLOSEOUT=I_UNDERSTAND_COMPENSATING_TRANSACTIONS after Owner review');
 }
+
 const env = loadEnvironment();
-const release = assertReleaseIdentity({ prelaunch: env.PRELAUNCH, gitSha: env.GIT_SHA,
-  appVersion: APP_VERSION, engineVersion: ENGINE_VERSION });
-const pool = getRuntimePool(env);
-const context = (key) => createContext({ actorType: 'OWNER', actorId: env.OWNER_ID,
-  guildId: env.DISCORD_GUILD_ID, idempotencyKey: `prelaunch-closeout:${key}` });
+if (!env.PRELAUNCH) throw new Error('Pre-launch closeout is permitted only while PRELAUNCH=true');
+// Closeout changes balances, so it must be mutually exclusive with the bot
+// runtime just like restore.  It never attempts to take over a live lock.
+const closeoutLock = await acquireSingleInstanceLock(env.SQLITE_PATH);
+let db;
 const report = { released: 0, refundedCaptured: 0, reversedTopups: 0, failures: [] };
 try {
-  const reserved = (await pool.query(`SELECT i.id FROM order_items i JOIN orders o ON o.id=i.order_id
-    JOIN wallet_reservations r ON r.order_item_id=i.id WHERE o.prelaunch=true AND r.state='RESERVED'`)).rows;
-  for (const item of reserved) {
-    try { await releaseReservation({ orderItemId: item.id, terminalState: 'STOPPED_RELEASED',
-      reason: 'PRELAUNCH_CLOSEOUT' }, context(`release:${item.id}`), { pool }); report.released += 1; }
-    catch (error) { report.failures.push({ itemId: item.id, code: error.code ?? error.name }); }
+  db = await openSqliteDatabase({ databasePath: env.SQLITE_PATH, secret: env.QUESTSHOP_SECRET_KEY });
+  const items = db.prepare(`SELECT i.*,r.id AS review_id FROM order_items i JOIN orders o ON o.id=i.order_id
+    LEFT JOIN manual_reviews r ON r.subject_type='ORDER_ITEM' AND r.subject_id=i.id AND r.state='OPEN'
+    WHERE o.prelaunch=1 AND i.state NOT IN ('FAILED','REFUNDED')`).all();
+  for (const item of items) {
+    try {
+      if (item.state === 'READY_TO_CLAIM') { refundReadyOrderItem(db, { itemId: item.id, actorId: env.OWNER_ID, reason: 'PRELAUNCH_CLOSEOUT' }); report.refundedCaptured += 1; }
+      else if (item.state === 'REVIEW' && item.review_id) { resolveOrderItemReview(db, { reviewId: item.review_id, actorId: env.OWNER_ID, decision: 'RELEASE', reason: 'PRELAUNCH_CLOSEOUT' }); report.released += 1; }
+      else { settleOrderItem(db, { itemId: item.id, outcome: 'FAILED', reason: 'PRELAUNCH_CLOSEOUT', evidence: { prelaunchCloseout: true } }); report.released += 1; }
+    } catch (error) { report.failures.push({ subject: item.id, code: error.code ?? error.name }); }
   }
-  const captured = (await pool.query(`SELECT i.id,r.state_version FROM order_items i
-    JOIN orders o ON o.id=i.order_id JOIN wallet_reservations r ON r.order_item_id=i.id
-    WHERE o.prelaunch=true AND r.state='CAPTURED'`)).rows;
-  for (const item of captured) {
-    try { await refundCapturedOrderItem({ orderItemId: item.id,
-      expectedReservationVersion: item.state_version, reason: 'PRELAUNCH_CAPTURE_COMPENSATION' },
-    context(`capture-refund:${item.id}`), { pool }); report.refundedCaptured += 1; }
-    catch (error) { report.failures.push({ itemId: item.id, code: error.code ?? error.name }); }
-  }
-  const topups = (await pool.query("SELECT id FROM topups WHERE prelaunch=true AND status='CREDITED'")).rows;
+  const topups = db.prepare("SELECT * FROM topups WHERE prelaunch=1 AND status IN ('CREDITED','REVIEW')").all();
   for (const topup of topups) {
-    try { const result = await reverseTopup({ topupId: topup.id, reason: 'PRELAUNCH_CLOSEOUT' },
-      context(`topup-reversal:${topup.id}`), { pool });
-    if (result.status === 'REVERSED') report.reversedTopups += 1;
-    else report.failures.push({ topupId: topup.id, code: 'REVERSAL_MANUAL_REVIEW' }); }
-    catch (error) { report.failures.push({ topupId: topup.id, code: error.code ?? error.name }); }
+    try {
+      if (topup.status === 'CREDITED') {
+        const result = reverseCreditedTopup(db, { topupId: topup.id, actorId: env.OWNER_ID, reason: 'PRELAUNCH_CLOSEOUT' });
+        if (result.reviewOpened) throw Object.assign(new Error('manual reversal review required'), { code: 'REVERSAL_MANUAL_REVIEW' });
+        report.reversedTopups += 1;
+      } else {
+        const review = db.prepare("SELECT * FROM manual_reviews WHERE subject_type='TOPUP' AND subject_id=? AND state='OPEN'").get(topup.id);
+        if (!review) throw Object.assign(new Error('missing top-up review'), { code: 'TOPUP_REVIEW_MISSING' });
+        resolveTopupFinancialReview(db, { reviewId: review.id, actorId: env.OWNER_ID, decision: 'REJECT', reason: 'PRELAUNCH_CLOSEOUT' });
+        resolveTopupFinancialReview(db, { reviewId: review.id, actorId: env.OWNER_ID, decision: 'REJECT', reason: 'PRELAUNCH_CLOSEOUT' });
+      }
+    } catch (error) { report.failures.push({ subject: topup.id, code: error.code ?? error.name }); }
   }
   console.log(JSON.stringify(report));
-  if (report.failures.length) throw new Error('Pre-launch closeout requires manual review');
-  await withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (client) => {
-    const closeoutContext = context('release-evidence');
-    await appendReleaseEvidence(client, { evidenceType: 'PRELAUNCH_CLOSEOUT', subjectType: 'PRELAUNCH',
-      subjectId: release.gitSha, release, evidence: report }, closeoutContext);
-    await appendAdminAudit(client, { action: 'PRELAUNCH_CLOSEOUT', targetType: 'PRELAUNCH',
-      targetId: release.gitSha, actorId: env.OWNER_ID, after: report,
-      reason: 'pre-launch compensation completed', context: closeoutContext });
-  });
-} finally { await closePools(); }
+  if (report.failures.length) process.exitCode = 1;
+} finally {
+  closeSqliteDatabase(db);
+  await closeoutLock.release();
+}

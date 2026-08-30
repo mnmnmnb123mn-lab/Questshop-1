@@ -73,7 +73,7 @@ test('pinned TrueMoney success schema produces a verified exact-cent redemption'
   assert.equal(checkpointed, 1);
   const { providerEvidence, ...settlement } = result;
   assert.deepEqual(settlement, {
-    outcome: 'REDEEMED', amountCents: 1_250n, currency: 'THB', senderName: 'Voucher Sender',
+    outcome: 'SUCCESS', providerReference: 'provider-123', reason: 'SUCCESS', amountCents: 1_250n, currency: 'THB', senderName: 'Voucher Sender',
     senderPhone: '0812345678', providerCode: 'SUCCESS', httpStatus: 200,
     receiverConfirmation: 'REQUEST_BOUND_SUCCESS', providerTransactionId: 'provider-123',
   });
@@ -85,7 +85,7 @@ test('pinned TrueMoney success schema produces a verified exact-cent redemption'
 test('SUCCESS without a provider transaction ID is still a verified settlement', async () => {
   const result = await redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
     requestFactory: successfulRequest(providerSuccess({ transactionId: null })) });
-  assert.equal(result.outcome, 'REDEEMED');
+  assert.equal(result.outcome, 'SUCCESS');
   assert.equal(result.amountCents, 1_250n);
   assert.equal(result.providerTransactionId, null);
   assert.equal(result.providerEvidence.settlementIdentity, 'VOUCHER_HMAC');
@@ -96,21 +96,23 @@ test('error envelopes with null or missing data use the provider code safely', a
   const expired = await redeemVoucher({ code: voucherCode, receiverPhone: '0912345678', requestFactory: successfulRequest({
     status: { code: 'VOUCHER_EXPIRED' }, data: null,
   }, { statusCode: 400 }) });
-  assert.equal(expired.outcome, 'EXPIRED');
-  assert.equal(expired.providerCode, 'VOUCHER_EXPIRED');
-  assert.equal(expired.httpStatus, 400);
+  assert.equal(expired.outcome, 'DEFINITE_FAILURE');
+  assert.equal(expired.reason, 'EXPIRED');
+  assert.equal(expired.evidence.providerCode, 'VOUCHER_EXPIRED');
+  assert.equal(expired.evidence.httpStatus, 400);
 
   const used = await redeemVoucher({ code: voucherCode, receiverPhone: '0912345678', requestFactory: successfulRequest({
     status: { code: 'VOUCHER_OUT_OF_STOCK' }, extra: { ignored: true },
   }, { statusCode: 400 }) });
-  assert.equal(used.outcome, 'ALREADY_REDEEMED');
-  assert.equal(used.providerCode, 'VOUCHER_OUT_OF_STOCK');
+  assert.equal(used.outcome, 'DEFINITE_FAILURE');
+  assert.equal(used.reason, 'ALREADY_REDEEMED');
+  assert.equal(used.evidence.providerCode, 'VOUCHER_OUT_OF_STOCK');
 
   const unknown = await redeemVoucher({ code: voucherCode, receiverPhone: '0912345678', requestFactory: successfulRequest({
     status: { code: 'UNRECOGNIZED_PROVIDER_RESULT' }, data: null,
   }, { statusCode: 400 }) });
   assert.equal(unknown.outcome, 'AMBIGUOUS');
-  assert.equal(unknown.httpStatus, 400);
+  assert.equal(unknown.evidence.httpStatus, 400);
 });
 
 test('incompatible provider schema is rejected before any financial result is returned', async () => {

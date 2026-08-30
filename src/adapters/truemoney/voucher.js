@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { parseBahtToCents } from '../../shared/money.js';
 import { QuestshopError } from '../../shared/errors.js';
+import { EXTERNAL_OUTCOME, externalOutcome } from '../../domain/sqlite/external-outcome.js';
 
 const VOUCHER_CODE = /^[A-Za-z0-9]{16,128}$/;
 const MAX_RESPONSE_BYTES = 256 * 1024;
@@ -101,9 +102,12 @@ function mapProviderFailure(parsed, httpStatus) {
     VOUCHER_NOT_FOUND: 'INVALID',
     CANNOT_GET_OWN_VOUCHER: 'INVALID',
   }[code];
-  if (terminal) return { outcome: terminal, providerCode: code, httpStatus };
-  if (code === 'RATE_LIMIT') return { outcome: 'RETRY_WAIT', providerCode: code, httpStatus };
-  return { outcome: 'AMBIGUOUS', providerCode: code, httpStatus };
+  if (terminal) return externalOutcome({ outcome: EXTERNAL_OUTCOME.DEFINITE_FAILURE, reason: terminal,
+    evidence: { providerCode: code, httpStatus } });
+  // This response follows a dispatched redemption request.  Even a rate-limit
+  // reply cannot prove the voucher was untouched, so it is reviewed rather
+  // than blindly retried.
+  return externalOutcome({ outcome: EXTERNAL_OUTCOME.AMBIGUOUS, reason: code, evidence: { providerCode: code, httpStatus } });
 }
 
 function safeHttpStatus(value) {
@@ -268,7 +272,9 @@ export async function redeemVoucher({
           return;
         }
         resolve({
-          outcome: 'REDEEMED',
+          outcome: EXTERNAL_OUTCOME.SUCCESS,
+          providerReference: providerTransactionId,
+          reason: 'SUCCESS',
           amountCents,
           currency: 'THB',
           senderName: parsed.data.data.owner_profile?.full_name ?? null,

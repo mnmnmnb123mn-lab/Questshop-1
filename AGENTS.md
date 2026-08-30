@@ -7,7 +7,7 @@ credential safety, destructive scope or live-production authority before acting.
 ## 1. Evidence and authority
 
 Questshop is a one-Guild Discord storefront for automated Discord Quest progress using Node.js 22,
-`discord.js`, `pg` and PostgreSQL 16+.
+`discord.js` and SQLite through Node.js `node:sqlite`.
 
 Keep these evidence levels separate:
 
@@ -33,8 +33,8 @@ Primary references:
 
 ## 2. Owner product decisions
 
-- One production Discord Guild, all-in-one runtime, PostgreSQL 16+ durable state; no Redis/ORM/web dashboard/multi-Guild in v1.
-- Node.js `>=22.22.0 <23`, JavaScript ESM, `discord.js` and `pg` remain the runtime contract.
+- One production Discord Guild, all-in-one runtime, one persistent SQLite database at `/data/questshop.db`; no Redis/ORM/web dashboard/multi-Guild in v1.
+- Node.js `>=22.22.0 <23`, JavaScript ESM, `discord.js` and `node:sqlite` remain the runtime contract.
 - Money uses integer satang only. Wallet credit never expires and cannot be withdrawn/transferred.
 - Confirm reserves per Item; verified success captures; definite failure releases; ambiguity remains Reserved for Manual Review.
 - Ledger, Admin audit and release evidence are append-only; corrections are compensating transactions.
@@ -97,23 +97,21 @@ explicit attachment migration so Discord cannot keep an older remote attachment 
 - Discord handlers validate untrusted input, acknowledge exactly once, reauthorize at each side effect and call a domain service.
 - Domain services own transactions, state transitions, idempotency, audit and outbox writes.
 - Every aggregate transition uses its transition map, `state_version`, compare-and-swap and correlation evidence.
-- Financial operations use PostgreSQL `SERIALIZABLE` with bounded whole-transaction retry.
+- Financial operations use short SQLite `BEGIN IMMEDIATE` transactions with idempotency; one process owns the database.
 - Never hold a database transaction over Discord, TrueMoney, Quest API, S3 or other external I/O.
 - External mutations require durable intent/checkpoint before send and fresh verification afterward.
-- Worker commits require lease owner, fencing token and state version; lost ownership stops the stale worker.
-- PostgreSQL time governs money, lease, expiry, deadlines and retention.
+- Jobs and Notifications use a durable lease token/version and restart recovery; stale deliveries cannot overwrite a newer desired version.
+- UTC epoch milliseconds govern money-adjacent timestamps, deadlines and retention.
 - Background Discord messages use Outbox/DLQ except durable surface maintenance paths already defined by the project.
 - Persistent components use opaque versioned IDs plus server-side actor/guild/channel/message/operation/expiry checks.
 
 ## 4. Database and migrations
 
-- Never edit an applied migration; add the next zero-padded migration.
-- Production URLs require `sslmode=verify-full`.
-- `DATABASE_DIRECT_URL` = `questshop_migrator` during deploy; `DATABASE_POOL_URL` = `questshop_runtime` during runtime.
-- Aiven/Admin owns role creation, membership, `CONNECT` and schema grants.
-- Runtime has no DDL and no `UPDATE/DELETE` on protected append-only tables.
-- Object privilege synchronization runs after every migration loop, including `applied: 0`.
-- Never destroy/recreate a non-disposable database. Load tests require a database name containing `questshop_loadtest`.
+- Never edit an applied migration; the current SQLite `0001` remains a Draft until its first deployment.
+- Production uses `SQLITE_PATH=/data/questshop.db`, WAL, `synchronous=FULL`, `foreign_keys=ON`, a `0600` database file and a `0700` directory.
+- Every migration creates and verifies an online backup, then uses `BEGIN IMMEDIATE → schema verification → user_version → COMMIT`.
+- Runtime has no `UPDATE/DELETE` on protected append-only tables; SQLite triggers enforce this.
+- Never destroy/recreate a non-disposable SQLite database. Load tests use a temporary directory only.
 
 ## 5. Credentials and money safety
 
@@ -146,7 +144,7 @@ Minimum source checks:
 ```bash
 npm run check
 npm run lint
-TEST_DATABASE_URL=<disposable-postgresql-16-url> QUESTSHOP_ALLOW_TEST_DATABASE_RESET=true npm test
+npm test
 git diff --check
 ```
 

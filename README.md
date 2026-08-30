@@ -1,13 +1,30 @@
 # Questshop
 
 Questshop คือบอท Discord สำหรับรับทำ Discord Quest อัตโนมัติใน Guild เดียว โดยใช้ Node.js 22,
-`discord.js` และ PostgreSQL 16+ เป็น durable source of truth. ลูกค้าเติมเครดิตด้วย TrueMoney Gift,
+`discord.js` และ SQLite ผ่าน `node:sqlite` เป็น durable source of truth. ฐานข้อมูลอยู่ที่
+`/data/questshop.db` และ Production รันได้เพียงหนึ่ง Process. ลูกค้าเติมเครดิตด้วย TrueMoney Gift,
 ส่ง Discord Token แบบ Ephemeral, เลือก Quest, ยืนยัน Order และติดตามผลจนถึง `READY_TO_CLAIM`.
 ระบบ **ไม่มี Automatic Claim**; ลูกค้ากดรับรางวัลเองเสมอ.
 
+## Runtime และการติดตั้ง
+
+```text
+Node.js 22.22 → node:sqlite → /data/questshop.db → one runtime process
+```
+
+กำหนดอย่างน้อย `SQLITE_PATH=/data/questshop.db`, `QUESTSHOP_SECRET_KEY` แบบถาวร และ `GIT_SHA`
+40 ตัวอักษรใน Production แล้วใช้คำสั่งเดิม:
+
+```bash
+npm ci --omit=dev && npm run deploy && npm start
+```
+
+`deploy` ตรวจ config, สร้าง Pre-migration SQLite backup, ใช้ Migration แบบ atomic และค่อย Register
+Discord commands. ไม่ต้องตั้งค่า Aiven, PostgreSQL role, TLS หรือ database URL.
+
 > [!IMPORTANT]
-> สถานะ release ปัจจุบันคือ **implemented-but-unverified** จนกว่า Discord, TrueMoney, Quest,
-> Aiven/inwcloud และ Owner UAT จะผ่านบน build เดียวกันตาม [Pre-launch UAT](docs/uat/prelaunch.md).
+> สถานะ release ปัจจุบันคือ **migration-in-progress** จนกว่า source/test migration จะครบ และ Discord, TrueMoney, Quest,
+> inwcloud และ Owner UAT จะผ่านบน build เดียวกันตาม [Pre-launch UAT](docs/uat/prelaunch.md).
 
 > [!WARNING]
 > Quest Engine ใช้ Discord user token / self-bot behavior ซึ่งอาจขัดเงื่อนไขของ Discord และทำให้บัญชี
@@ -27,15 +44,13 @@ Questshop คือบอท Discord สำหรับรับทำ Discord Q
 เลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ
 ```
 
-ราคาหน้าร้านไม่ hardcode 5 บาท. Runtime อ่าน active `TYPE` price rules ของ Quest ทั้ง 4 task types:
+ราคาหน้าร้านไม่ hardcode 5 บาท. Runtime อ่าน price map ปัจจุบันจาก SQLite settings ของ Quest ทั้ง 4 task types:
 
 - ถ้า GAME/VIDEO เท่ากัน เช่น 500 สตางค์ทั้งหมด → แสดง `5 บาท`
 - ถ้าต่างกัน เช่น 500–700 สตางค์ → แสดง `5-7 บาท`
 - ถ้าราคา supported TYPE ไม่ครบ → แสดง `ค่าบริการยังไม่พร้อม`
 
-การเปลี่ยนราคาโดย Admin จะถูกตรวจพบจาก Discord Surface reconciliation แม้ config version ไม่เปลี่ยน.
-Maintenance worker ปัจจุบันรันประมาณทุก **60 วินาที** ดังนั้นการแก้ราคาบนข้อความเดิมเป็น automatic eventual refresh,
-ไม่ใช่ synchronous update ณ จังหวะกดปุ่มยืนยันราคา.
+เมื่อผู้ดูแลบันทึก config ใหม่ Surface จะถูก reconcile แบบ eventual; ไม่รับประกันว่า Embed เปลี่ยนทันทีใน click เดียว.
 
 ### Thumbnail และ GIF หน้าร้านภายใน Embed
 
@@ -72,6 +87,10 @@ Discord nonce เป็นตัวช่วยกู้ anchor; footer แบ�
 ถ้าอนาคตเปลี่ยน bytes ของ GIF อย่างตั้งใจ ควรเปลี่ยน filename/version ด้วยเพื่อให้ Discord-side drift detection
 บังคับแทน attachment เดิมได้ชัดเจน.
 
+ไฟล์ภาพต้นฉบับที่ Owner ส่งให้จัดเก็บแยกไว้ใน `assets/owner-originals/` พร้อมชื่อที่สื่อความหมาย, SHA-256 และ
+ตารางจับคู่กับไฟล์ Runtime. โค้ดใช้งานเฉพาะไฟล์ใน `src/discord/assets/` ผ่าน integrity loader ไม่อ่านไฟล์ต้นฉบับ
+โดยตรง.
+
 ## กฎธุรกิจหลัก
 
 ```text
@@ -82,18 +101,29 @@ Confirm Order
 → Ambiguous completion: Reserved คงอยู่ + Manual Review
 ```
 
-- เงินใช้ integer satang (`BIGINT`) เท่านั้น
+- เงินใช้ integer satang (`INTEGER`) เท่านั้น
 - Wallet ห้ามติดลบ; ไม่มีถอน/โอน; Refund เป็น Wallet credit
-- Ledger / Admin audit / release evidence เป็น append-only ตาม contract
+- Ledger, Admin audit และ settlement evidence เป็น append-only ตาม contract
 - TrueMoney หลัง request อาจส่งสำเร็จแล้วห้าม blind retry
+- Adapter ภายนอกคืนเพียง `SUCCESS`, `DEFINITE_FAILURE` หรือ `AMBIGUOUS` พร้อม evidence ที่ปลอดภัย;
+  `SUCCESS` เท่านั้นที่ทำ `REDEEMED → CREDITED`, ส่วน `AMBIGUOUS` เข้า review และ `DEFINITE_FAILURE` จบโดยไม่ credit
+- Manual Review จบได้ครั้งเดียวเป็น `RESOLVED_SUCCESS` หรือ `RESOLVED_FAILURE` พร้อม actor/reason/time/evidence;
+  การกด resolver ซ้ำไม่สร้าง Wallet movement ซ้ำ
+- Voucher เก็บ proof HMAC ตาม version และ identity HMAC คงที่ที่ unique ข้าม version เพื่อกันนำซองเดิมมายื่นซ้ำหลังหมุน version
 - ผล `HTTP 2xx` + `SUCCESS` ที่ยืนยันยอด THB เป็นบวกและผู้รับหนึ่งคน จะเพิ่มเครดิตได้แม้ TrueMoney
   ไม่ส่งเลขธุรกรรม: ระบบใช้ voucher HMAC กับ Top-up ID เป็นหลักฐานภายในและบันทึกเลขธุรกรรมเป็น `NULL`
   ตามความจริง หากหลักฐานข้อใดไม่ครบจะส่ง Owner ตรวจสอบแทน
+- หลังลูกค้าส่งลิงก์ซอง ระบบจะบันทึก Top-up ให้เสร็จก่อน แล้วตอบรับทันทีพร้อม Top-up ID โดยไม่รอ TrueMoney
+  จากนั้นเริ่มตรวจ **เฉพาะรายการนั้น** เบื้องหลังทันทีและส่ง DM การ์ดเดียวที่แก้ข้อความเดิมตามทุกสถานะ
+  ตั้งแต่กำลังตรวจจนถึงสำเร็จ ไม่สำเร็จ หรือรอ Owner ตรวจ ลูกค้าต้องเปิดรับ DM จากสมาชิกเซิร์ฟเวอร์;
+  หาก DM ส่งไม่ได้ Outbox จะลองส่งใหม่ตามรอบ 1, 5, 15, 60, 300 และ 900 วินาที ก่อนบันทึก Financial DLQ
+  โดยไม่กระทบเครดิต การเร่งนี้ยังใช้ lease,
+  dispatch checkpoint, การยืนยัน TrueMoney และ Wallet credit ชุดเดียวกับ Worker จึงไม่ข้ามการกันเครดิตซ้ำ
 - หนึ่ง Quest account มี active job ได้ไม่เกินหนึ่งงานทั่วระบบ
 - Monitor ทุกบัญชีทำ Scan + Test; Monitor-discovered Quest ยัง private จน test ผ่านหรือ Admin ใช้ audited **ส่งเลย**
-- customer-discovered Quest อาจถูกเสนอเฉพาะ account นั้นตาม policy แต่ไม่ประกาศ `quest-new` อัตโนมัติ:
-  Admin ตัดสินใจจาก `LOG_QUEST_OPERATIONS` ว่า **ส่งประกาศ** (audited override) หรือ **ทดสอบก่อน**;
-  public announcement ห้ามระบุตัวลูกค้า
+- customer-discovered Quest อาจถูกเสนอเฉพาะ account นั้นตาม policy โดยไม่ขึ้นกับประกาศหรือการพบใน Monitor.
+  ระบบสร้าง Case ใน `LOG_QUEST_OPERATIONS`, เก็บลิงก์ Quest และค้นทุกบัญชี Monitor แบบ read-only อัตโนมัติ;
+  พบแล้วจึงทดสอบ, ไม่พบจะแสดง **ตรวจและทดสอบอีกครั้ง** หรือ audited **ส่งประกาศ**. `quest-new` เป็นข่าวและห้ามระบุตัวลูกค้า
 
 ## Discord และสิทธิ์หลังบ้าน
 
@@ -112,12 +142,11 @@ Top-up ID”; Owner ยืนยัน Manual Review แบบนี้ได้
 `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` และ `LOG_SYSTEM` แสดงคำอธิบายภาษาไทยก่อนข้อมูลเทคนิคเสมอ:
 การ์ดบอกสิ่งที่เกิดขึ้น สถานะหรือผลกระทบ เหตุผลที่อ่านง่าย และปิดท้ายด้วย `ข้อมูลอ้างอิง` กับ `สรุป:`
 เพื่อให้ผู้ดูแลค้นต่อในฐานข้อมูลได้โดยไม่ต้องอ่านข้อความดิบใน Discord.
-การ์ดทั้งสามห้องมีแถบ `backoffice-log-banner.webp` ด้านล่าง; รูปขวาบนใช้ Quest artwork หรือ global Discord profile
-เมื่อมีข้อมูล และ `LOG_SYSTEM` ใช้โลโก้ GIF ที่ตรวจ integrity แล้ว.
+`LOG_QUEST_OPERATIONS` และ `LOG_SYSTEM` ใช้แถบ `backoffice-log-banner.webp` ด้านล่าง ส่วน `LOG_ADMIN`
+ใช้ `admin-log-banner.webp`; รูปขวาบนใช้ Quest artwork หรือ global Discord profileเมื่อมีข้อมูล และ `LOG_SYSTEM`
+ใช้โลโก้ GIF ที่ตรวจ integrity แล้ว.
 
-การติดตั้งครั้งแรกยังเปิดบอทและแผง Owner ได้แม้ยังไม่มี TrueMoney receiver: Health จะแสดง
-`MISSING_RECEIVER` และระบบรับซองจะปฏิเสธอย่างปลอดภัยจนกว่าจะเพิ่ม receiver ที่ Active. หาก Provider รับซองสำเร็จ
-แล้วพบยอดเกินเพดานต่อซอง ระบบจะเครดิตยอดเต็ม สร้างคำเตือนหลังบ้าน และล็อกการเติมเพิ่มจนสิ้นรอบวัน Bangkok.
+หากยังไม่ได้ตั้งค่าเบอร์รับเงิน ระบบจะไม่เดาผล TrueMoney: Top-up จะถูกส่งเข้า Manual Review โดยไม่เพิ่มเครดิตอัตโนมัติ.
 
 ## Environment Variables หลัก
 
@@ -128,33 +157,21 @@ Top-up ID”; Owner ยืนยัน Manual Review แบบนี้ได้
 | `DISCORD_CLIENT_ID` | Discord Application ID |
 | `DISCORD_GUILD_ID` | Production Guild ID |
 | `OWNER_ID` | Discord User ID ของ Owner |
-| `DATABASE_POOL_URL` | Runtime URL ของ `questshop_runtime`, ต้อง `sslmode=verify-full` |
-| `DATABASE_DIRECT_URL` | Migrator URL ของ `questshop_migrator`, ต้อง `sslmode=verify-full` |
-| `DATABASE_SSL_CA_BASE64` | Aiven CA PEM แบบ Base64 เมื่อจำเป็น |
+| `SQLITE_PATH` | ไฟล์ฐานข้อมูลถาวร เช่น `/data/questshop.db` |
+| `QUESTSHOP_SECRET_KEY` | Secret ถาวรอย่างน้อย 32 ตัวอักษร ใช้ตรวจ verifier/เข้ารหัส/HMAC |
+| `VOUCHER_HMAC_ACTIVE_VERSION` | version ของ voucher proof HMAC (เริ่มต้น `v1`; เปลี่ยนเฉพาะ migration ที่ตรวจสอบแล้ว) |
+| `GIT_SHA` | Git commit SHA 40 ตัวใน Production |
 | `STATUS_TOKEN` | Bearer token ของ `/statusz`, อย่างน้อย 32 ตัวอักษร |
-| `DATA_ENCRYPTION_KEYS_JSON` | Data encryption keyring |
-| `VOUCHER_HMAC_KEYS_JSON` | Voucher HMAC keyring |
-| `BACKUP_MODE` | Aiven ใช้ `AIVEN_MANAGED` |
 | `PRELAUNCH` | UAT ใช้ `true` |
 | `TIMEZONE` | `Asia/Bangkok` |
-| `RUNNER_CONCURRENCY` | ค่าเริ่มต้น `2` |
-| `RUNNER_CONCURRENCY_HARD_MAX` | เพดานสูงสุด `5` |
+| `RUNNER_CONCURRENCY` | ค่าเริ่มต้น `1` |
+| `RUNNER_CONCURRENCY_HARD_MAX` | เพดานสูงสุด `1` (กำหนดได้ไม่เกิน `5`) |
 | `PORT` | health server, ค่าเริ่มต้น `3000` |
 
-ห้าม commit `.env` หรือ paste Bot/User token, database URL/password, keyring, cookie, voucher secret หรือ private key
+ห้าม commit `.env` หรือ paste Bot/User token, database file, `QUESTSHOP_SECRET_KEY`, cookie, voucher secret หรือ private key
 ลง GitHub, Discord, ticket, log หรือ screenshot.
 
-## PostgreSQL role contract
-
-- `questshop_migrator`: `USAGE, CREATE` บน `public`, ใช้เฉพาะ deploy/migration
-- `questshop_runtime`: `USAGE` บน `public`, ไม่มี `CREATE`, ใช้ตอน runtime
-- URL สองตัวต้องเป็นคนละ role
-- ทุก migration loop รวม `applied: 0` จะ synchronize และ validate object privileges
-- Runtime ไม่มี DDL และไม่มี `UPDATE/DELETE` บน protected append-only tables
-
-ดู [PostgreSQL role contract](docs/architecture/postgresql-roles.md).
-
-## Deploy 
+## Deploy บน inwcloud
 
 Runtime: **Node.js 22.x LTS**
 
@@ -164,16 +181,16 @@ Custom Command:
 npm ci --omit=dev && npm run deploy && npm start
 ```
 
-`npm run deploy` = `setup:verify → migrate → register`.
-อย่าใช้ workaround เก่า `/tmp/aiven-ca.pem` หรือ `NODE_EXTRA_CA_CERTS`; source ปัจจุบันจัดการ Aiven CA ใน process.
+`npm run deploy` = `setup:verify → SQLite backup/migrate → register`.
+ต้อง mount `/data` เป็น persistent volume เดียว และห้ามรัน process บอทซ้ำบนไฟล์เดียวกัน.
 
 หลัง deploy ควรเห็น:
 
 ```text
 setup:verify  → ok
-migrate       → privilegeSynchronization: PASS
+migrate       → SQLite backup/migration/integrity: PASS
 register      → Registered 8 guild commands
-start         → Questshop ready
+start         → Questshop SQLite runtime ready
 ```
 
 `Questshop ready` เป็นเพียง runtime readiness ไม่ใช่หลักฐาน TrueMoney/Quest live success.
@@ -208,23 +225,35 @@ start         → Questshop ready
 
 ```bash
 npm run check
+npm run check:imports
 npm run lint
-TEST_DATABASE_URL='postgresql://.../questshop_test' \
-QUESTSHOP_ALLOW_TEST_DATABASE_RESET=true npm test
+npm test
 git diff --check
 ```
 
 Full gate:
 
 ```bash
-TEST_DATABASE_URL='postgresql://.../questshop_ci' \
-QUESTSHOP_ALLOW_TEST_DATABASE_RESET=true npm run test:coverage
-LOAD_TEST_DATABASE_URL='postgresql://.../questshop_loadtest' npm run load:test
+npm run test:coverage
+npm run load:test
 npm audit --audit-level=high
-docker build -t questshop:local .
+git diff --check
+docker build --build-arg GIT_SHA=<exact-40-character-sha> -t questshop:local .
 ```
 
-ห้ามชี้ test/load-test URL ไป production/Aiven database.
+tests ใช้ SQLite file ชั่วคราวเท่านั้น; ห้ามชี้ `SQLITE_PATH` ของ test หรือ load test ไป `/data/questshop.db`.
+
+Credential encryption writes `CREDENTIAL_ENCRYPTION_ACTIVE_VERSION` and reads
+only `CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS`. Use
+`npm run credentials:reencrypt` for an offline locked rotation, then
+`npm run verify:keys` before retiring a version; it checks both the live
+database and local SQLite backups. Same-volume backups support operational
+recovery only and are not disaster recovery.
+
+The Docker gate is passed only by a real build whose `/app/.source-sha` equals
+the exact candidate SHA. A missing local Docker daemon is recorded as
+`NOT_RUN_LOCAL: DOCKER_DAEMON_UNAVAILABLE`; GitHub Actions supplies the build
+evidence without pushing or deploying an image.
 
 ## เอกสารอ้างอิง
 
@@ -232,8 +261,7 @@ docker build -t questshop:local .
 - [Completion audit](docs/architecture/completion-audit.md)
 - [Requirement traceability](docs/architecture/traceability.md)
 - [Definition of Done](docs/architecture/definition-of-done.md)
-- [Deploy on inwcloud + Aiven](docs/deployment/inwcloud-aiven.md)
-- [PostgreSQL role contract](docs/architecture/postgresql-roles.md)
+- [Deploy on inwcloud](docs/deployment/inwcloud-sqlite.md)
 - [State-machine contracts](docs/state-machines/contracts.md)
 - [Emergency runbooks](docs/runbooks/README.md)
 - [Pre-launch UAT](docs/uat/prelaunch.md)
@@ -247,7 +275,7 @@ docker build -t questshop:local .
   technical footer และ price refresh จริง
 - TrueMoney success / ambiguous-after-send / schema drift
 - Video/Desktop Quest execution กับ Discord account จริง
-- Aiven TLS/role provisioning, inwcloud restart และ health endpoint
+- inwcloud `/data` persistence, single-instance restart และ health endpoint
 - Owner pre-launch closeout, rollback rehearsal และ external alert delivery
 
 ห้ามเรียกโปรเจกต์นี้ว่า production-ready ก่อนหลักฐานเหล่านี้ผ่านบน build เดียวกัน.

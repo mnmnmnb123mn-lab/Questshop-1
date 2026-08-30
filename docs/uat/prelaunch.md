@@ -3,17 +3,26 @@
 Use `evidence-template.md` to record every result against one deployed build. Never record raw tokens, database URLs,
 keyrings or a full voucher URL in UAT evidence.
 
+## SQLite runtime proof
+
+- [ ] Run the candidate with Node 22.22 and an empty persistent `/data/questshop.db`; verify Migration succeeds,
+      database and directory are owner-only, and `quick_check` plus `foreign_key_check` pass after startup.
+- [ ] Restart and redeploy the same 40-character Git SHA; verify Wallet, Jobs, Notifications and surface anchors persist.
+- [ ] Create a daily and Pre-migration backup, restore it while Runtime is stopped, verify `integrity_check` and
+      `foreign_key_check`, and confirm stale `-wal`/`-shm` files are not reused.
+- [ ] Attempt a second Runtime against the same database and verify the single-instance lock rejects it.
+
 ## Preconditions
 
 - [ ] `PRELAUNCH=true`; customer routes are restricted to Owner/Admin for this round.
-- [ ] inwcloud runs Node 22.x and the intended branch/commit is deployed; no `GIT_SHA` Environment Variable is required.
+- [ ] inwcloud runs Node 22.22 and the intended 40-character `GIT_SHA` is deployed.
 - [ ] inwcloud Root Directory is explicitly the repository root; the GitHub Actions workflow passed for this build.
-- [ ] `questshop_migrator` and `questshop_runtime` are different effective roles.
-- [ ] Production DB URLs use `sslmode=verify-full`; Runtime has no DDL and protected append-only tables deny update/delete.
+- [ ] `/data/questshop.db` is persistent, SQLite runs WAL plus `synchronous=FULL`, and only one Runtime owns its lock.
 - [ ] Bot has Discord `Administrator`.
 - [ ] Owner has manually configured backoffice channel privacy; no automated human-visibility guard is assumed.
-- [ ] Receiver, Monitor and keyring health are valid; record versions/IDs only.
-- [ ] `npm run check`, `npm run lint`, PostgreSQL-backed coverage/tests, load test, `npm audit --audit-level=high` and Docker build passed for this build.
+- [ ] Receiver and Monitor credentials are valid; record IDs only.
+- [ ] `npm run check`, `npm run check:imports`, `npm run lint`, `npm test`, SQLite coverage/tests, load test,
+      `npm audit --audit-level=high`, `git diff --check` and Docker build using this exact `GIT_SHA` passed for this build.
 
 ## Quest Auto storefront UAT
 
@@ -65,6 +74,9 @@ same Quest payload/evidence; do not infer values from another bot or a screensho
 ## Financial proof
 
 - [ ] Real low-value TrueMoney success: `REDEEMED → CREDITED` exactly once.
+- [ ] Submit a new valid voucher and verify the customer receives the immediate ephemeral acknowledgement only after the
+      Top-up commits, without waiting for TrueMoney. Verify one editable DM then progresses from checking to the terminal
+      result for that exact Top-up, without taking another queued customer's voucher.
 - [ ] Real low-value TrueMoney success without a provider transaction ID (if Provider omits it): `REDEEMED → CREDITED`
       exactly once; the stored transaction ID stays `NULL` and the Payment Log identifies the encrypted voucher +
       Top-up ID settlement reference without exposing a raw response.
@@ -73,6 +85,8 @@ same Quest payload/evidence; do not infer values from another bot or a screensho
       HTTP 400 remains `MANUAL_REVIEW` with no blind retry.
 - [ ] Provider timeout after possible send: `AMBIGUOUS`, no blind retry.
 - [ ] Owner resolves ambiguous payment with audit.
+- [ ] Resolve each review once to `RESOLVED_SUCCESS` or `RESOLVED_FAILURE`, then replay the same resolver and verify
+      that Wallet, settlement evidence and active-account lock do not change a second time.
 - [ ] Owner Manual Review with no provider transaction ID is available only when the recorded 2xx/SUCCESS, exact THB
       amount and intended receiver evidence are complete; it still requires two matching Owner confirmations.
 - [ ] A dispatch-checkpoint failure sends no provider request and remains retryable; every timeout, socket abort or
@@ -94,10 +108,15 @@ Use masked voucher identity only. Full voucher links belong only in the validate
 
 - [ ] Mobile checkout over 25 Quest options: pagination, selection and quote work.
 - [ ] Wrong-user, forged and expired components fail closed without side effects.
+- [ ] Actor, Guild, channel, message, operation and state-version mismatch fail closed; change an Admin's Discord
+      Administrator permission between panel display and action and verify no Admin side effect occurs.
 - [ ] Real supported Video Quest verifies progress and ends at manual claim URL only.
 - [ ] Real supported Desktop Quest verifies progress and ends at manual claim URL only.
 - [ ] Monitor-discovered Quest remains private until current-contract test pass or audited **ส่งเลย**.
 - [ ] Customer-discovered public announcement does not identify the customer or raw Token.
+- [ ] A customer-only Quest creates one `LOG_QUEST_OPERATIONS` Case with its Quest link, searches every active Test Monitor without blocking Checkout, and reports found/not-found/incomplete accurately.
+- [ ] A customer-only Quest that is absent from every Monitor has no Test mutation, retains **ตรวจและทดสอบอีกครั้ง**, and may be announced only with the explicit backoffice action.
+- [ ] A Quest visible to a Monitor is tested only on visible eligible accounts; a passed test updates the same Case and queues one informational `quest-new` announcement.
 - [ ] Quest History keeps the profile thumbnail, links `Quest — progress%` to the matching Quest URL, and shows the
       approved `quest-history-banner.png` below every status card without duplicate attachments.
 - [ ] Discord 404/429/5xx behavior preserves surface/outbox contracts.
@@ -120,19 +139,21 @@ Use masked voucher identity only. Full voucher links belong only in the validate
 - [ ] Verify every `LOG_SYSTEM` card and a `LOG_ADMIN` card authored by `SYSTEM` animate
       `log-system-thumbnail.gif` at upper-right and contain exactly two attachments (GIF plus banner), without duplicates after edits or retries.
 
-## Aiven / operations proof
+## SQLite / operations proof
 
-- [ ] Simulate a Discord DNS/connection outage across multiple Surfaces and confirm one `DISCORD_CONNECTIVITY`
-      message is updated without growing a backlog of obsolete `LOG_SYSTEM` projection events.
-- [ ] Reopen and resolve one operational Incident repeatedly; confirm the same Discord message changes state, uses a
-      green resolved appearance, and reports concise Thai diagnostics rather than raw JSON.
-- [ ] Confirm Outbox SLO reports dispatch-attempt duration while `OUTBOX_STUCK` reports queue age/backlog separately.
-- [ ] Confirm `PANEL_LATENCY_SLO` identifies route P95 and `ERROR_RATE_HIGH` identifies route/error-class aggregates
-      without customer input, raw JSON or duplicate Incident messages.
-- [ ] Verify `LOG_QUEST_OPERATIONS` and `LOG_ADMIN` show the current aggregate/audit message with Trace, safe IDs and
-      Thai status text; no Token, cookie, credential, ciphertext, nonce or auth tag may appear.
-- [ ] Aiven Console provider backup status and Free-plan recovery limitation are recorded.
-- [ ] Runtime restart recovers leases, queue, Runner, Payment, Outbox and Review state.
+- [ ] Verify `/data/questshop.db` survives a process restart and a redeploy of the same Git SHA.
+- [ ] Run a pre-migration and daily backup; verify both with `integrity_check` and `foreign_key_check` before rotation.
+- [ ] Stop Runtime, restore a verified backup into a disposable `/data` copy, discard stale `-wal`/`-shm`, then run
+      full integrity checks before allowing workers to start.
+- [ ] Start a second process against the same SQLite path and verify the single-instance lock rejects it without
+      writing to the database.
+- [ ] Simulate Discord DM failure and a channel timeout. Verify notifications retry/edit the same message and never
+      change Wallet, Top-up, Order or Quest results.
+- [ ] Simulate Discord `403`, timeout and network failure for an existing durable surface; verify the same nonce/anchor
+      is retried and a replacement is created only after Discord `404 Unknown Message`.
+- [ ] Verify `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` and `LOG_SYSTEM` render safe Thai text and do not expose Token,
+      voucher, cookie, credential, ciphertext, nonce or auth tag.
+- [ ] Runtime restart recovers queued Jobs, Notifications and Review state according to their checkpoints.
 - [ ] `/livez`, `/readyz` and authenticated `/statusz` behave as documented.
 - [ ] External/Owner alert delivery is observed.
 - [ ] Rollback rehearsal records app rollback or forward-fix decision without editing applied migrations.
@@ -140,7 +161,7 @@ Use masked voucher identity only. Full voucher links belong only in the validate
 ## Closeout
 
 - [ ] Run `CONFIRM_PRELAUNCH_CLOSEOUT=I_UNDERSTAND_COMPENSATING_TRANSACTIONS npm run prelaunch:closeout`.
-- [ ] Record resulting release-evidence ID and confirm financial/Admin audit evidence was not deleted.
+- [ ] Record the closeout report and confirm settlement/Admin audit evidence was not deleted.
 - [ ] Owner sets `PRELAUNCH=false` only after closeout and all required live rows pass/receive an approved forward-fix.
 
 ## Final decision
