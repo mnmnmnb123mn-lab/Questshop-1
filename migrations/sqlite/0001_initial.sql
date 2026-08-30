@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS promotions (
   rule_json TEXT NOT NULL CHECK (json_valid(rule_json)),
   starts_at INTEGER,
   ends_at INTEGER,
+  state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version > 0),
   updated_at INTEGER NOT NULL
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS promotions_one_active ON promotions(state) WHERE state='ACTIVE';
@@ -81,6 +82,10 @@ CREATE TABLE IF NOT EXISTS monitor_accounts (
   credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL,
   cooldown_until INTEGER,
   last_checked_at INTEGER,
+  health_state TEXT NOT NULL DEFAULT 'UNKNOWN' CHECK (health_state IN ('UNKNOWN','READY','DEGRADED','INVALID')),
+  last_health_error_code TEXT,
+  last_health_quest_count INTEGER,
+  state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version > 0),
   updated_at INTEGER NOT NULL
 ) STRICT;
 
@@ -101,6 +106,20 @@ CREATE TABLE IF NOT EXISTS credentials (
   CHECK ((retention_class='TEMPORARY' AND cleanup_after IS NOT NULL) OR (retention_class='PERSISTENT' AND cleanup_after IS NULL))
 ) STRICT;
 CREATE INDEX IF NOT EXISTS credentials_cleanup ON credentials(retention_class, cleanup_after);
+
+CREATE TABLE IF NOT EXISTS promotion_usages (
+  topup_id TEXT PRIMARY KEY REFERENCES topups(id),
+  promotion_id TEXT NOT NULL REFERENCES promotions(id),
+  discord_user_id TEXT NOT NULL,
+  bangkok_day TEXT NOT NULL CHECK (bangkok_day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  bonus_cents INTEGER NOT NULL CHECK (bonus_cents >= 0),
+  created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS promotion_usages_limit ON promotion_usages(promotion_id,discord_user_id,bangkok_day,created_at);
+CREATE TRIGGER IF NOT EXISTS promotion_usages_append_only_update
+BEFORE UPDATE ON promotion_usages BEGIN SELECT RAISE(ABORT, 'promotion_usages is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS promotion_usages_append_only_delete
+BEFORE DELETE ON promotion_usages BEGIN SELECT RAISE(ABORT, 'promotion_usages is append-only'); END;
 
 CREATE TABLE IF NOT EXISTS topups (
   id TEXT PRIMARY KEY,

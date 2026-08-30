@@ -49,7 +49,7 @@ async function database() {
 test('SQLite migration creates strict financial schema and append-only audit', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const tables = fixture.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'").get();
-  assert.equal(Number(tables.count), 19);
+  assert.equal(Number(tables.count), 20);
   assert.equal(fullIntegrityCheck(fixture.db).ok, true);
   appendWalletTransaction(fixture.db, { discordUserId: 'customer-a', transactionType: 'TOPUP', availableDeltaCents: 500,
     referenceType: 'TEST', referenceId: 'one', idempotencyKey: 'append-only-one', traceId: randomUUID() });
@@ -146,13 +146,18 @@ test('promotion snapshots, rejected reviews, and insufficient reversals retain t
   const fixture = await database(); t.after(() => fixture.close());
   const now = Date.now();
   fixture.db.prepare(`INSERT INTO promotions(id,name,state,rule_json,starts_at,ends_at,updated_at)
-    VALUES(?,?, 'ACTIVE', ?,NULL,NULL,?)`).run('promo', 'โบนัสสิบเปอร์เซ็นต์', JSON.stringify({ minimumCents: 1_000, basisPoints: 1_000, maximumBonusCents: 150 }), now);
+    VALUES(?,?, 'ACTIVE', ?,NULL,NULL,?)`).run('promo', 'โบนัสสิบเปอร์เซ็นต์', JSON.stringify({ minimumCents: 1_000, basisPoints: 1_000, maximumBonusCents: 150, maxUsesPerUser: 1 }), now);
   const first = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'promo-owner',
     voucherUrl: 'https://gift.truemoney.com/campaign/?v=4123456789abcdef0123456789abcdef01' }).topup;
   markTopupProcessing(fixture.db, first.id);
   const credited = creditVerifiedTopup(fixture.db, { topupId: first.id, principalCents: 2_000 });
   assert.deepEqual([Number(credited.topup.principal_cents), Number(credited.topup.bonus_cents), Number(credited.topup.credited_cents)], [2_000, 150, 2_150]);
   assert.equal(recordRedeemedTopup(fixture.db, { topupId: first.id, principalCents: 0 }).idempotent, true);
+  const capped = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'promo-owner',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=7123456789abcdef0123456789abcdef01' }).topup;
+  markTopupProcessing(fixture.db, capped.id);
+  assert.equal(Number(creditVerifiedTopup(fixture.db, { topupId: capped.id, principalCents: 2_000 }).topup.bonus_cents), 0);
+  assert.equal(Number(fixture.db.prepare("SELECT count(*) AS count FROM promotion_usages WHERE promotion_id='promo'").get().count), 1);
 
   const rejected = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'review-reject',
     voucherUrl: 'https://gift.truemoney.com/campaign/?v=5123456789abcdef0123456789abcdef01' }).topup;
@@ -541,8 +546,11 @@ test('SQLite Admin services configure price, receiver, monitor, promotion and au
   assert.equal(configureReceiverPhone(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { phone: '0912345678', actorId: 'admin' }).last4, '5678');
   const monitor = upsertMonitorAccount(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { accountId: '12345678901234567', label: 'Monitor A', token: 'monitor-token', actorId: 'admin' });
   assert.equal(monitor.state, 'ACTIVE');
+  const beforeRotation = fixture.db.prepare('SELECT ciphertext FROM credentials WHERE id=?').get(monitor.credential_id);
   const rotated = upsertMonitorAccount(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { accountId: '12345678901234567', label: 'Monitor A', token: 'rotated-monitor-token', actorId: 'admin' });
   assert.equal(rotated.credential_id, monitor.credential_id);
+  assert.notDeepEqual(fixture.db.prepare('SELECT ciphertext FROM credentials WHERE id=?').get(rotated.credential_id).ciphertext, beforeRotation.ciphertext);
+  assert.equal(Number(fixture.db.prepare("SELECT count(*) AS count FROM credentials WHERE subject_type='MONITOR' AND subject_id='12345678901234567'").get().count), 1);
   assert.equal(upsertPromotion(fixture.db, { name: 'โบนัส', state: 'ACTIVE', minimumCents: 100, basisPoints: 500, actorId: 'admin' }).state, 'ACTIVE');
   const movement = adjustWallet(fixture.db, { discordUserId: '12345678901234567', availableDeltaCents: 700, actorId: 'admin', reason: 'UAT funding' });
   assert.equal(Number(movement.wallet.available_cents), 700);

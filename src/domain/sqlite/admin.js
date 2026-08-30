@@ -12,12 +12,10 @@ import { enqueueJobInTransaction } from './jobs.js';
 
 export const ADMIN_AUDIT_ALLOWED_FIELDS = Object.freeze({
   FEATURE_GATE_CHANGE: ['gate', 'enabled'],
-  PROMOTION_UPDATED: ['name', 'state', 'startsAt', 'endsAt', 'basisPoints', 'minimumCents', 'maximumBonusCents'],
+  PROMOTION_UPDATED: ['name', 'state', 'startsAt', 'endsAt', 'basisPoints', 'minimumCents', 'maximumBonusCents', 'maxUsesPerUser', 'maxBonusPerDayCents'],
   MONITOR_UPDATED: ['label', 'state', 'cooldownUntil'],
   MONITOR_SCAN_QUEUED: ['queued'],
   DLQ_RETRY: ['notificationType', 'destination'],
-  PROMOTION_UPDATED: ['name', 'state', 'startsAt', 'endsAt', 'basisPoints', 'minimumCents', 'maximumBonusCents'],
-  WALLET_ADJUSTMENT: ['availableDeltaCents', 'reservedDeltaCents'],
   WALLET_ADJUSTMENT: ['availableDeltaCents', 'reservedDeltaCents'],
   MANUAL_REVIEW_DECISION: ['decision', 'status'],
   TOPUP_REVERSED: ['status', 'walletTransactionId'],
@@ -27,7 +25,6 @@ export const ADMIN_AUDIT_ALLOWED_FIELDS = Object.freeze({
   SURFACE_SETUP: ['channelId', 'messageId'],
   PRICE_UPDATED: ['taskType', 'amountCents'],
   RECEIVER_UPDATED: ['last4'],
-  MONITOR_UPDATED: ['label', 'state', 'cooldownUntil'],
 });
 
 function filtered(action, value) {
@@ -125,12 +122,15 @@ export function configureReceiverPhone(db, env, { phone, actorId, reason = '' })
   });
 }
 
-export function upsertMonitorAccount(db, env, { accountId, label, token, actorId, state = 'ACTIVE', reason = '' }) {
+export function upsertMonitorAccount(db, env, { accountId, label, token, actorId, state = 'ACTIVE', reason = '', expectedStateVersion = null }) {
   if (!/^\d{1,32}$/.test(String(accountId ?? '')) || !String(label ?? '').trim() || !String(token ?? '').trim()
     || !['ACTIVE', 'COOLDOWN', 'DISABLED'].includes(state)) throw new QuestshopError('MONITOR_INVALID', 'ข้อมูลบัญชีทดสอบไม่ถูกต้อง');
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
     const before = db.prepare('SELECT * FROM monitor_accounts WHERE account_id=?').get(accountId);
+    if (before && expectedStateVersion != null && Number(expectedStateVersion) !== Number(before.state_version)) {
+      throw new QuestshopError('MONITOR_CONFLICT', 'ข้อมูล Monitor ถูกเปลี่ยนแล้ว กรุณาเปิดใหม่');
+    }
     const credentialId = before?.credential_id ?? randomUUID();
     const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, token);
     db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
@@ -138,14 +138,18 @@ export function upsertMonitorAccount(db, env, { accountId, label, token, actorId
       ON CONFLICT(subject_type,subject_id,credential_type) DO UPDATE SET ciphertext=excluded.ciphertext,nonce=excluded.nonce,
         auth_tag=excluded.auth_tag,updated_at=excluded.updated_at`).run(credentialId, 'MONITOR', accountId,
       encrypted.ciphertext, encrypted.nonce, encrypted.authTag, timestamp, timestamp);
-    db.prepare(`INSERT INTO monitor_accounts(account_id,label,state,credential_id,cooldown_until,last_checked_at,updated_at)
-      VALUES(?,?,?,?,NULL,NULL,?) ON CONFLICT(account_id) DO UPDATE SET label=excluded.label,state=excluded.state,
-      credential_id=excluded.credential_id,cooldown_until=NULL,updated_at=excluded.updated_at`)
-      .run(accountId, String(label).trim().slice(0, 100), state, credentialId, timestamp);
+    if (!before) {
+      db.prepare(`INSERT INTO monitor_accounts(account_id,label,state,credential_id,cooldown_until,last_checked_at,updated_at)
+        VALUES(?,?,?,?,NULL,NULL,?)`).run(accountId, String(label).trim().slice(0, 100), state, credentialId, timestamp);
+    } else {
+      const changed = db.prepare(`UPDATE monitor_accounts SET label=?,state=?,credential_id=?,cooldown_until=NULL,state_version=state_version+1,updated_at=?
+        WHERE account_id=? AND state_version=?`).run(String(label).trim().slice(0, 100), state, credentialId, timestamp, accountId, before.state_version);
+      if (!changed.changes) throw new QuestshopError('MONITOR_CONFLICT', 'ข้อมูล Monitor ถูกเปลี่ยนแล้ว กรุณาเปิดใหม่');
+    }
     appendAdminAuditInTransaction(db, { actorId, action: 'MONITOR_UPDATED', targetType: 'MONITOR_ACCOUNT', targetId: accountId, reason,
       before: before ? { label: before.label, state: before.state, cooldownUntil: before.cooldown_until } : null,
       after: { label: String(label).trim().slice(0, 100), state, cooldownUntil: null }, timestamp });
-    return db.prepare('SELECT account_id,label,state,cooldown_until,last_checked_at,updated_at FROM monitor_accounts WHERE account_id=?').get(accountId);
+    return db.prepare('SELECT account_id,label,state,credential_id,cooldown_until,last_checked_at,health_state,last_health_error_code,last_health_quest_count,state_version,updated_at FROM monitor_accounts WHERE account_id=?').get(accountId);
   });
 }
 
@@ -223,23 +227,40 @@ export function adjustWallet(db, { discordUserId, availableDeltaCents, actorId, 
   });
 }
 
-export function upsertPromotion(db, { id = randomUUID(), name, state, minimumCents, basisPoints, maximumBonusCents = null, startsAt = null, endsAt = null,
-  actorId, reason = '' }) {
+export function upsertPromotion(db, { id = randomUUID(), name, state, minimumCents, basisPoints, maximumBonusCents = null,
+  maxUsesPerUser = null, maxBonusPerDayCents = null, startsAt = null, endsAt = null, actorId, reason = '', expectedStateVersion = null }) {
   const minimum = Number(minimumCents); const rate = Number(basisPoints); const maximum = maximumBonusCents == null || maximumBonusCents === '' ? null : Number(maximumBonusCents);
+  const maxUses = maxUsesPerUser == null || maxUsesPerUser === '' ? null : Number(maxUsesPerUser);
+  const maxDaily = maxBonusPerDayCents == null || maxBonusPerDayCents === '' ? null : Number(maxBonusPerDayCents);
   if (!String(name ?? '').trim() || !['ACTIVE', 'INACTIVE'].includes(state) || !Number.isSafeInteger(minimum) || minimum < 0
-    || !Number.isSafeInteger(rate) || rate < 0 || (maximum != null && (!Number.isSafeInteger(maximum) || maximum < 0))) {
+    || !Number.isSafeInteger(rate) || rate < 0 || (maximum != null && (!Number.isSafeInteger(maximum) || maximum < 0))
+    || (maxUses != null && (!Number.isSafeInteger(maxUses) || maxUses < 0)) || (maxDaily != null && (!Number.isSafeInteger(maxDaily) || maxDaily < 0))) {
     throw new QuestshopError('PROMOTION_INVALID', 'ข้อมูลโปรโมชั่นไม่ถูกต้อง');
   }
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
     const before = db.prepare('SELECT * FROM promotions WHERE id=?').get(id);
-    const rule = { minimumCents: minimum, basisPoints: rate, ...(maximum == null ? {} : { maximumBonusCents: maximum }) };
-    db.prepare(`INSERT INTO promotions(id,name,state,rule_json,starts_at,ends_at,updated_at) VALUES(?,?,?,?,?,?,?)
-      ON CONFLICT(id) DO UPDATE SET name=excluded.name,state=excluded.state,rule_json=excluded.rule_json,starts_at=excluded.starts_at,ends_at=excluded.ends_at,updated_at=excluded.updated_at`)
-      .run(id, String(name).trim().slice(0, 100), state, JSON.stringify(rule), startsAt == null || startsAt === '' ? null : Number(startsAt), endsAt == null || endsAt === '' ? null : Number(endsAt), timestamp);
+    if (before && expectedStateVersion != null && Number(expectedStateVersion) !== Number(before.state_version)) {
+      throw new QuestshopError('PROMOTION_CONFLICT', 'โปรโมชั่นถูกเปลี่ยนแล้ว กรุณาเปิดใหม่');
+    }
+    const rule = { minimumCents: minimum, basisPoints: rate, ...(maximum == null ? {} : { maximumBonusCents: maximum }),
+      ...(maxUses == null ? {} : { maxUsesPerUser: maxUses }), ...(maxDaily == null ? {} : { maxBonusPerDayCents: maxDaily }) };
+    if (state === 'ACTIVE') {
+      db.prepare("UPDATE promotions SET state='INACTIVE',state_version=state_version+1,updated_at=? WHERE state='ACTIVE' AND id<>?").run(timestamp, id);
+    }
+    if (!before) {
+      db.prepare(`INSERT INTO promotions(id,name,state,rule_json,starts_at,ends_at,updated_at) VALUES(?,?,?,?,?,?,?)`)
+        .run(id, String(name).trim().slice(0, 100), state, JSON.stringify(rule), startsAt == null || startsAt === '' ? null : Number(startsAt), endsAt == null || endsAt === '' ? null : Number(endsAt), timestamp);
+    } else {
+      const changed = db.prepare(`UPDATE promotions SET name=?,state=?,rule_json=?,starts_at=?,ends_at=?,state_version=state_version+1,updated_at=?
+        WHERE id=? AND state_version=?`).run(String(name).trim().slice(0, 100), state, JSON.stringify(rule),
+        startsAt == null || startsAt === '' ? null : Number(startsAt), endsAt == null || endsAt === '' ? null : Number(endsAt), timestamp, id, before.state_version);
+      if (!changed.changes) throw new QuestshopError('PROMOTION_CONFLICT', 'โปรโมชั่นถูกเปลี่ยนแล้ว กรุณาเปิดใหม่');
+    }
     appendAdminAuditInTransaction(db, { actorId, action: 'PROMOTION_UPDATED', targetType: 'PROMOTION', targetId: id, reason,
       before: before ? { name: before.name, state: before.state } : null,
-      after: { name: String(name).trim().slice(0, 100), state, startsAt, endsAt, basisPoints: rate, minimumCents: minimum, maximumBonusCents: maximum }, timestamp });
+      after: { name: String(name).trim().slice(0, 100), state, startsAt, endsAt, basisPoints: rate, minimumCents: minimum,
+        maximumBonusCents: maximum, maxUsesPerUser: maxUses, maxBonusPerDayCents: maxDaily }, timestamp });
     return db.prepare('SELECT * FROM promotions WHERE id=?').get(id);
   });
 }

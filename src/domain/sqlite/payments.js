@@ -59,7 +59,14 @@ function activePromotion(db, timestamp) {
   try { return { ...row, rule: JSON.parse(row.rule_json) }; } catch { return null; }
 }
 
-function promotionSnapshot(db, principalCents, timestamp) {
+function bangkokDay(timestamp) {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit' })
+    .formatToParts(new Date(timestamp));
+  const byType = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
+}
+
+function promotionSnapshot(db, discordUserId, principalCents, timestamp) {
   const promotion = activePromotion(db, timestamp);
   if (!promotion) return { bonusCents: 0, snapshot: null };
   const rule = promotion.rule ?? {};
@@ -71,7 +78,17 @@ function promotionSnapshot(db, principalCents, timestamp) {
   }
   let bonus = Number(percentageBonusHalfUp(principalCents, basisPoints));
   if (maximum != null && Number.isSafeInteger(Number(maximum))) bonus = Math.min(bonus, Number(maximum));
-  return { bonusCents: bonus, snapshot: { id: promotion.id, name: promotion.name, basisPoints, minimumCents: minimum, bonusCents: bonus } };
+  const maxUses = rule.maxUsesPerUser == null || rule.maxUsesPerUser === '' ? null : Number(rule.maxUsesPerUser);
+  const maxDaily = rule.maxBonusPerDayCents == null || rule.maxBonusPerDayCents === '' ? null : Number(rule.maxBonusPerDayCents);
+  if ((maxUses != null && (!Number.isSafeInteger(maxUses) || maxUses < 0))
+    || (maxDaily != null && (!Number.isSafeInteger(maxDaily) || maxDaily < 0))) return { bonusCents: 0, snapshot: null };
+  const usage = db.prepare(`SELECT count(*) AS uses,COALESCE(sum(CASE WHEN bangkok_day=? THEN bonus_cents ELSE 0 END),0) AS daily_bonus
+    FROM promotion_usages WHERE promotion_id=? AND discord_user_id=?`).get(bangkokDay(timestamp), promotion.id, discordUserId);
+  if (maxUses != null && Number(usage.uses) >= maxUses) bonus = 0;
+  if (maxDaily != null) bonus = Math.min(bonus, Math.max(0, maxDaily - Number(usage.daily_bonus)));
+  return { bonusCents: bonus, snapshot: { id: promotion.id, name: promotion.name, basisPoints, minimumCents: minimum,
+    maximumBonusCents: maximum ?? null, maxUsesPerUser: maxUses, maxBonusPerDayCents: maxDaily, bonusCents: bonus,
+    bangkokDay: bangkokDay(timestamp) } };
 }
 
 function openFinancialReview(db, topup, reasonCode, safeReason, timestamp) {
@@ -148,7 +165,7 @@ export function recordRedeemedTopup(db, {
     if (!Number.isSafeInteger(principal) || principal <= 0) {
       throw new TypeError('Invalid verified top-up amount');
     }
-    const promotion = bonusCents == null ? promotionSnapshot(db, principal, timestamp) : {
+    const promotion = bonusCents == null ? promotionSnapshot(db, topup.discord_user_id, principal, timestamp) : {
       bonusCents: Number(bonusCents), snapshot: Number(bonusCents) > 0 ? { source: 'VERIFIED_INPUT', bonusCents: Number(bonusCents) } : null,
     };
     if (!Number.isSafeInteger(promotion.bonusCents) || promotion.bonusCents < 0) throw new TypeError('Invalid verified bonus amount');
@@ -158,6 +175,12 @@ export function recordRedeemedTopup(db, {
       principal, promotion.bonusCents, principal + promotion.bonusCents, promotion.snapshot ? JSON.stringify(promotion.snapshot) : null,
       providerTransactionId, receiverLast4, timestamp, timestamp, topup.id, topup.state_version,
     );
+    if (promotion.snapshot?.id && promotion.bonusCents > 0) {
+      db.prepare(`INSERT INTO promotion_usages(topup_id,promotion_id,discord_user_id,bangkok_day,bonus_cents,created_at)
+        VALUES(?,?,?,?,?,?) ON CONFLICT(topup_id) DO NOTHING`).run(
+        topup.id, promotion.snapshot.id, topup.discord_user_id, promotion.snapshot.bangkokDay, promotion.bonusCents, timestamp,
+      );
+    }
     updatePaymentAttemptInTransaction(db, { topupId, attemptId, outcome: 'SUCCESS', httpStatus: providerEvidence.httpStatus,
       providerCode: 'SUCCESS', providerReference: providerTransactionId, evidence: providerEvidence, timestamp });
     if (workerJob) appendExternalOperationEvidenceInTransaction(db, { jobId: workerJob.jobId, subjectType: 'TOPUP', subjectId: topupId,
@@ -352,13 +375,19 @@ export function resolveTopupFinancialReview(db, {
         || providerEvidence?.providerCode !== 'SUCCESS' || providerEvidence?.receiverConfirmation !== 'REQUEST_BOUND_SUCCESS') {
         throw new QuestshopError('REVIEW_EVIDENCE_INCOMPLETE', 'หลักฐาน TrueMoney ยังไม่ครบสำหรับเพิ่มเครดิต');
       }
-      const promotion = promotionSnapshot(db, principal, timestamp);
+      const promotion = promotionSnapshot(db, topup.discord_user_id, principal, timestamp);
       db.prepare(`UPDATE topups SET status='REDEEMED',principal_cents=?,bonus_cents=?,credited_cents=?,promotion_snapshot_json=?,
         provider_transaction_id=?,receiver_last4=COALESCE(?,receiver_last4),failure_reason=NULL,redeemed_at=?,state_version=state_version+1,updated_at=?
         WHERE id=? AND status='REVIEW' AND state_version=?`).run(principal, promotion.bonusCents, principal + promotion.bonusCents,
         promotion.snapshot ? JSON.stringify(promotion.snapshot) : null, providerTransactionId, providerEvidence.receiverLast4 ?? null,
         timestamp, timestamp, topup.id, topup.state_version);
       const redeemed = db.prepare('SELECT * FROM topups WHERE id=?').get(topup.id);
+      if (promotion.snapshot?.id && promotion.bonusCents > 0) {
+        db.prepare(`INSERT INTO promotion_usages(topup_id,promotion_id,discord_user_id,bangkok_day,bonus_cents,created_at)
+          VALUES(?,?,?,?,?,?) ON CONFLICT(topup_id) DO NOTHING`).run(
+          topup.id, promotion.snapshot.id, topup.discord_user_id, promotion.snapshot.bangkokDay, promotion.bonusCents, timestamp,
+        );
+      }
       const credit = appendWalletTransactionInTransaction(db, { discordUserId: redeemed.discord_user_id, transactionType: 'TOPUP',
         availableDeltaCents: Number(redeemed.credited_cents), referenceType: 'TOPUP', referenceId: redeemed.id,
         idempotencyKey: `topup-credit:${redeemed.id}`, traceId: redeemed.trace_id, timestamp });
