@@ -7,16 +7,22 @@ import { appendWalletTransactionInTransaction } from './wallet.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { percentageBonusHalfUp } from '../../shared/money.js';
 import { appendExternalOperationEvidenceInTransaction, assertActiveJobLeaseInTransaction } from './jobs.js';
+import { currentPaymentContainment } from './payment-containment.js';
 
 const TEMPORARY_CREDENTIAL_LIFETIME_MS = 7 * 86_400_000;
 
-export function submitTopup(db, env, { discordUserId, voucherUrl, traceId = randomUUID(), prelaunch = false }) {
+export function submitTopup(db, env, { discordUserId, voucherUrl, traceId = randomUUID(), prelaunch = false, paymentProbe = false }) {
   const voucher = normalizeVoucherUrl(voucherUrl);
   const voucherHmacVersion = env.VOUCHER_HMAC_ACTIVE_VERSION ?? CURRENT_VOUCHER_HMAC_VERSION;
   const fingerprint = voucherHmac(env.QUESTSHOP_SECRET_KEY, voucher.code, voucherHmacVersion);
   const identity = voucherIdentityHmac(env.QUESTSHOP_SECRET_KEY, voucher.code);
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
+    const containment = currentPaymentContainment(db);
+    if (containment.state !== 'CLOSED' && !(paymentProbe === true && containment.state === 'PROBE_PENDING'
+      && containment.probeOwnerId === discordUserId)) {
+      throw new QuestshopError('PAYMENT_CONTAINMENT_OPEN', 'การเติมเงินอัตโนมัติถูกระงับเพื่อความปลอดภัย');
+    }
     const existing = db.prepare('SELECT * FROM topups WHERE voucher_identity_hmac=?').get(identity);
     if (existing) {
       if (existing.discord_user_id !== discordUserId) {
@@ -303,12 +309,15 @@ export function failTopup(db, { topupId, reasonCode, workerJob = null }) {
   });
 }
 
-export function reverseCreditedTopup(db, { topupId, actorId = 'SYSTEM', reason = 'REVERSAL_APPROVED' }) {
+export function reverseCreditedTopup(db, { topupId, actorId = 'SYSTEM', reason = 'REVERSAL_APPROVED', expectedStateVersion = null }) {
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
     const topup = db.prepare('SELECT * FROM topups WHERE id=?').get(topupId);
     if (!topup) throw new QuestshopError('TOPUP_NOT_FOUND', 'ไม่พบรายการเติมเงิน');
     if (topup.status === 'REVERSED') return { topup, idempotent: true };
+    if (expectedStateVersion != null && Number(expectedStateVersion) !== Number(topup.state_version)) {
+      throw new QuestshopError('TOPUP_CONFLICT', 'รายการเติมเงินถูกเปลี่ยนแล้ว กรุณาเปิดเมนูใหม่');
+    }
     if (topup.status !== 'CREDITED') throw new QuestshopError('TOPUP_STATE_INVALID', 'รายการนี้ยังย้อนเครดิตไม่ได้');
     let reversal;
     try {

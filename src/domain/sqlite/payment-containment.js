@@ -72,7 +72,8 @@ export function beginPaymentProbe(db, { actorId, timestamp = nowMs() }) {
   return withImmediateTransaction(db, () => {
     const before = currentPaymentContainment(db);
     if (before.state !== 'OPEN') throw new QuestshopError('PAYMENT_PROBE_STATE_INVALID', 'ยังไม่อยู่ในสถานะระงับการเติมเงิน');
-    const next = { ...before, state: 'PROBE_PENDING', stateVersion: before.stateVersion + 1, probeStartedAt: timestamp, probeStartedBy: actorId };
+    const next = { ...before, state: 'PROBE_PENDING', stateVersion: before.stateVersion + 1, probeStartedAt: timestamp, probeStartedBy: actorId,
+      probeOwnerId: actorId, probeTopupId: null, probeVerifiedAt: null };
     save(db, next, { actorId, timestamp });
     audit(db, { actorId, action: 'PAYMENT_PROBE_STARTED', reason: before.reasonCode, before, after: next, timestamp });
     return next;
@@ -83,7 +84,7 @@ export function verifyPaymentProbe(db, { topupId, actorId = 'SYSTEM', timestamp 
   return withImmediateTransaction(db, () => {
     const before = currentPaymentContainment(db);
     if (before.state !== 'PROBE_PENDING') return before;
-    const topup = db.prepare("SELECT * FROM topups WHERE id=? AND status='CREDITED'").get(topupId);
+    const topup = db.prepare("SELECT * FROM topups WHERE id=? AND status='CREDITED' AND discord_user_id=?").get(topupId, before.probeOwnerId);
     if (!topup) throw new QuestshopError('PAYMENT_PROBE_NOT_CREDITED', 'รายการทดสอบยังไม่ได้รับเครดิตสำเร็จ');
     const next = { ...before, state: 'PROBE_VERIFIED', stateVersion: before.stateVersion + 1, probeTopupId: topup.id,
       probeVerifiedAt: timestamp, probeVerifiedBy: actorId };
@@ -91,6 +92,15 @@ export function verifyPaymentProbe(db, { topupId, actorId = 'SYSTEM', timestamp 
     audit(db, { actorId, action: 'PAYMENT_PROBE_VERIFIED', reason: before.reasonCode, before, after: next, timestamp });
     return next;
   });
+}
+
+/** A probe is the sole contained exception: it is still submitted, settled,
+ * and credited through the ordinary top-up path, but only for the Owner that
+ * opened the explicit probe. */
+export function paymentProbeAllowsTopup(db, topupId) {
+  const containment = currentPaymentContainment(db);
+  if (containment.state !== 'PROBE_PENDING' || !containment.probeOwnerId) return false;
+  return Boolean(db.prepare('SELECT 1 FROM topups WHERE id=? AND discord_user_id=?').get(topupId, containment.probeOwnerId));
 }
 
 export function closePaymentContainment(db, { actorId, timestamp = nowMs() }) {

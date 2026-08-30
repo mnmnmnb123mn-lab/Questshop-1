@@ -85,8 +85,10 @@ test('payment containment closes automation durably and needs a verified probe b
   assert.equal(openPaymentContainment(fixture.db, { reasonCode: 'PROVIDER_SUCCESS_SCHEMA_UNCERTAIN' }).idempotent, true);
   beginPaymentProbe(fixture.db, { actorId: 'owner' });
   assert.throws(() => closePaymentContainment(fixture.db, { actorId: 'owner' }), (error) => error.code === 'PAYMENT_PROBE_REQUIRED');
+  assert.throws(() => submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'not-owner',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=b123456789abcdef0123456789abcdef01' }), (error) => error.code === 'PAYMENT_CONTAINMENT_OPEN');
   const topup = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'owner',
-    voucherUrl: 'https://gift.truemoney.com/campaign/?v=b123456789abcdef0123456789abcdef01' }).topup;
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=b123456789abcdef0123456789abcdef01', paymentProbe: true }).topup;
   creditVerifiedTopup(fixture.db, { topupId: topup.id, principalCents: 100 });
   assert.equal(verifyPaymentProbe(fixture.db, { topupId: topup.id, actorId: 'owner' }).state, 'PROBE_VERIFIED');
   assert.equal(closePaymentContainment(fixture.db, { actorId: 'owner' }).state, 'CLOSED');

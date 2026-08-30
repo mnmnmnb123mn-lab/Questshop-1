@@ -17,7 +17,7 @@ import { reconcileSurfaceAnchors } from '../discord/surfaces/setup.js';
 import { recordSystemIncident } from '../domain/sqlite/incidents.js';
 import { recomputeHealthStatus } from '../bootstrap/health-status.js';
 import { EXTERNAL_OUTCOME } from '../domain/sqlite/external-outcome.js';
-import { currentPaymentContainment, openPaymentContainment, verifyPaymentProbe } from '../domain/sqlite/payment-containment.js';
+import { currentPaymentContainment, openPaymentContainment, paymentProbeAllowsTopup, verifyPaymentProbe } from '../domain/sqlite/payment-containment.js';
 
 function cleanupExpiredRows(db) {
   const timestamp = nowMs();
@@ -464,7 +464,8 @@ export function createSqliteWorkers({ runtime }) {
       leaseTimer.unref?.();
       try {
         const gate = requiredGate(job);
-        if (gate && !currentFeatureGates(runtime.db)[gate]) {
+        const probeAllowed = job.job_type === 'PAYMENT_SETTLE' && paymentProbeAllowsTopup(runtime.db, job.subject_id);
+        if (gate && !currentFeatureGates(runtime.db)[gate] && !probeAllowed) {
           await completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, retryAt: nowMs() + 60_000,
             errorCode: `${gate}_DISABLED`, checkpoint: job.checkpoint });
           return;

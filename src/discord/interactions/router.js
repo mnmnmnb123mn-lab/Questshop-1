@@ -689,7 +689,8 @@ async function routeButton(interaction, runtime, route, sessionId) {
   if (route === 'admin_order_refund') {
     await assertOwner(interaction, runtime);
     const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_ORDER_REFUND');
-    const result = refundOrderItem(runtime.db, { itemId: session.payload.itemId, actorId: interaction.user.id, reason: 'OWNER_CONFIRMED_REFUND' });
+    const result = refundOrderItem(runtime.db, { itemId: session.payload.itemId, actorId: interaction.user.id, reason: 'OWNER_CONFIRMED_REFUND',
+      expectedStateVersion: session.payload.stateVersion });
     return interaction.update({ content: result.idempotent ? 'รายการนี้คืนเครดิตไปแล้ว' : `คืนเครดิต ${(Number(result.wallet.available_cents) / 100).toFixed(2)} บาทแล้ว`, embeds: [], components: [], allowedMentions: { parse: [] } });
   }
   if (route === 'admin_topup_lookup') {
@@ -702,7 +703,8 @@ async function routeButton(interaction, runtime, route, sessionId) {
   if (route === 'admin_topup_reverse') {
     await assertOwner(interaction, runtime);
     const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_TOPUP_REVERSE');
-    const result = reverseTopup(runtime.db, { topupId: session.payload.topupId, actorId: interaction.user.id, reason: 'OWNER_CONFIRMED_REVERSAL' });
+    const result = reverseTopup(runtime.db, { topupId: session.payload.topupId, actorId: interaction.user.id, reason: 'OWNER_CONFIRMED_REVERSAL',
+      expectedStateVersion: session.payload.stateVersion });
     const text = result.reviewOpened ? 'ยอด Wallet ไม่พอ จึงเปิด Financial Review แล้ว' : result.idempotent ? 'รายการนี้ถูกย้อนเครดิตแล้ว' : 'ย้อนเครดิตรายการเติมเงินแล้ว';
     return interaction.update({ content: text, embeds: [], components: [], allowedMentions: { parse: [] } });
   }
@@ -710,7 +712,10 @@ async function routeButton(interaction, runtime, route, sessionId) {
     await assertOwner(interaction, runtime);
     await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_CONTAINMENT_PROBE');
     beginPaymentProbe(runtime.db, { actorId: interaction.user.id });
-    return interaction.update({ content: 'เริ่ม probe แล้ว: Owner ต้องส่ง voucher มูลค่าต่ำผ่านรายการทดสอบก่อนยืนยันเปิด containment', embeds: [], components: [], allowedMentions: { parse: [] } });
+    const submitId = sessionContext(interaction, runtime, 'ADMIN_CONTAINMENT_PROBE_SUBMIT');
+    return interaction.showModal(openAdminModal('admin_containment_probe_submit', submitId, 'Payment probe ของ Owner', [
+      textInput('url', 'ลิงก์ซอง TrueMoney มูลค่าต่ำ', { maxLength: 500 }),
+    ]));
   }
   if (route === 'admin_containment_close') {
     await assertOwner(interaction, runtime);
@@ -781,6 +786,13 @@ async function routeModal(interaction, runtime, route) {
       reason: interaction.fields.getTextInputValue('reason'), expectedConfigVersion: session.payload.expectedConfigVersion });
     runtime.config = loadRuntimeConfig(runtime.db);
     return interaction.reply(ephemeral(`บันทึกราคา ${session.payload.taskType} แล้ว (${next.priceRules[session.payload.taskType].amountCents / 100} บาท)`));
+  }
+  if (route === 'admin_containment_probe_submit') {
+    await assertOwner(interaction, runtime);
+    await consumeAdminModalSession(interaction, runtime, parseCustomId(interaction.customId).sessionId, 'ADMIN_CONTAINMENT_PROBE_SUBMIT');
+    const result = submitTopup(runtime.db, runtime.env, { discordUserId: interaction.user.id,
+      voucherUrl: interaction.fields.getTextInputValue('url'), traceId: randomUUID(), prelaunch: runtime.env.PRELAUNCH, paymentProbe: true });
+    return acknowledgeTopupAndStartSettlement({ interaction, result, runtime });
   }
   if (route === 'admin_topup_lookup_submit') {
     await assertOwner(interaction, runtime);

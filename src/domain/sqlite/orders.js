@@ -187,12 +187,15 @@ export function updateOrderItemProgress(db, { itemId, progressPercent, workerJob
   });
 }
 
-export function refundReadyOrderItem(db, { itemId, actorId = 'SYSTEM', reason = 'REFUND_APPROVED' }) {
+export function refundReadyOrderItem(db, { itemId, actorId = 'SYSTEM', reason = 'REFUND_APPROVED', expectedStateVersion = null }) {
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
     const item = db.prepare(`SELECT i.*,o.discord_user_id,o.trace_id FROM order_items i JOIN orders o ON o.id=i.order_id WHERE i.id=?`).get(itemId);
     if (!item) throw new QuestshopError('ORDER_ITEM_NOT_FOUND', 'ไม่พบรายการ Quest');
     if (item.state === 'REFUNDED') return { item, idempotent: true };
+    if (expectedStateVersion != null && Number(expectedStateVersion) !== Number(item.state_version)) {
+      throw new QuestshopError('ORDER_ITEM_CONFLICT', 'รายการ Quest ถูกเปลี่ยนแล้ว กรุณาเปิดเมนูใหม่');
+    }
     if (item.state !== 'READY_TO_CLAIM') throw new QuestshopError('ORDER_ITEM_STATE_INVALID', 'คืนเครดิตได้เฉพาะงานที่ทำเสร็จแล้ว');
     const refund = appendWalletTransactionInTransaction(db, {
       discordUserId: item.discord_user_id, transactionType: 'REFUND', availableDeltaCents: Number(item.price_cents),
