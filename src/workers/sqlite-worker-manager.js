@@ -1,11 +1,11 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
 import { decryptCredential } from '../domain/sqlite/crypto.js';
-import { appendExternalOperationEvidenceInTransaction, assertActiveJobLeaseInTransaction, claimDueJob, completeJob, finishRecoveredJob, markJobPossiblySent, recoverInterruptedJobs, renewJobLease } from '../domain/sqlite/jobs.js';
-import { creditRedeemedTopup, markTopupProcessing, moveTopupToReview, recordRedeemedTopup, recordTopupAmbiguity,
+import { appendExternalOperationEvidenceInTransaction, assertActiveJobLeaseInTransaction, claimDueJob, claimJobBySubject, completeJob, finishRecoveredJob, markJobPossiblySent, recoverInterruptedJobs, renewJobLease } from '../domain/sqlite/jobs.js';
+import { beginPaymentAttempt, creditRedeemedTopup, moveTopupToReview, recordRedeemedTopup, recordTopupAmbiguity,
   recordTopupDefiniteFailure, recordTopupNotSent } from '../domain/sqlite/payments.js';
 import { settleOrderItem } from '../domain/sqlite/orders.js';
-import { claimDueNotification, deferNotification, finishNotificationDelivery, recoverSendingNotifications } from '../domain/sqlite/notifications.js';
+import { claimDueNotification, deferNotification, enqueueNotificationInTransaction, finishNotificationDelivery, recoverSendingNotifications, renewNotificationLease } from '../domain/sqlite/notifications.js';
 import { nowMs, quickIntegrityCheck, withImmediateTransaction } from '../db/sqlite.js';
 import { normalizeVoucherUrl, redeemVoucher } from '../adapters/truemoney/voucher.js';
 import { renderSqliteNotification } from '../discord/renderers/sqlite-projections.js';
@@ -19,10 +19,13 @@ import { recomputeHealthStatus } from '../bootstrap/health-status.js';
 import { EXTERNAL_OUTCOME } from '../domain/sqlite/external-outcome.js';
 import { currentPaymentContainment, openPaymentContainment, paymentProbeAllowsTopup, verifyPaymentProbe } from '../domain/sqlite/payment-containment.js';
 
-function cleanupExpiredRows(db) {
-  const timestamp = nowMs();
+export function runRetentionCleanup(db, { now = nowMs() } = {}) {
+  const timestamp = now;
+  const retentionCutoff = timestamp - 30 * 86_400_000;
+  const projectionCutoff = timestamp - 90 * 86_400_000;
+  const removed = { credentials: 0, jobs: 0, questChecks: 0, rateLimits: 0, notifications: 0, sessions: 0, operationalReviews: 0 };
   withImmediateTransaction(db, () => {
-    db.prepare(`DELETE FROM credentials AS c WHERE c.retention_class='TEMPORARY' AND c.cleanup_after<=?
+    removed.credentials = db.prepare(`DELETE FROM credentials AS c WHERE c.retention_class='TEMPORARY' AND c.cleanup_after<=?
       AND (
         (c.credential_type='VOUCHER' AND EXISTS (SELECT 1 FROM topups t WHERE t.id=c.subject_id AND t.status IN ('CREDITED','FAILED','REVERSED'))
           AND NOT EXISTS (SELECT 1 FROM manual_reviews r WHERE r.subject_type='TOPUP' AND r.subject_id=c.subject_id AND r.state='OPEN')
@@ -33,12 +36,45 @@ function cleanupExpiredRows(db) {
           AND o.state NOT IN ('COMPLETED','PARTIAL','CANCELLED'))
           AND NOT EXISTS (SELECT 1 FROM orders o JOIN notifications n ON n.aggregate_type='ORDER' AND n.aggregate_id=o.id
             WHERE o.credential_id=c.id AND n.notification_type='QUEST_HISTORY' AND n.delivered_version<n.desired_version))
-      )`).run(timestamp);
-    db.prepare(`DELETE FROM jobs WHERE state IN ('COMPLETED','FAILED') AND completed_at IS NOT NULL AND completed_at<?`).run(timestamp - 7 * 86_400_000);
-    db.prepare(`DELETE FROM quest_checks WHERE updated_at<?`).run(timestamp - 7 * 86_400_000);
-    db.prepare('DELETE FROM interaction_sessions WHERE expires_at<?').run(timestamp);
-    db.prepare(`DELETE FROM manual_reviews WHERE category='OPERATIONAL' AND state IN ('RESOLVED_SUCCESS','RESOLVED_FAILURE') AND resolved_at<?`).run(timestamp - 30 * 86_400_000);
+      )`).run(timestamp).changes;
   });
+  // These tables are deliberately operational, not financial evidence. Keep
+  // each purge isolated so one protected/append-only table can never roll
+  // back credential cleanup or another retention category.
+  withImmediateTransaction(db, () => {
+    removed.jobs = db.prepare(`DELETE FROM jobs WHERE state IN ('COMPLETED','FAILED') AND completed_at IS NOT NULL AND completed_at<?`).run(retentionCutoff).changes;
+    removed.questChecks = db.prepare(`DELETE FROM quest_checks WHERE updated_at<?`).run(retentionCutoff).changes;
+    removed.rateLimits = db.prepare(`DELETE FROM interaction_rate_limits WHERE updated_at<? AND window_started_at<?`).run(retentionCutoff, retentionCutoff).changes;
+  });
+  withImmediateTransaction(db, () => {
+    removed.notifications = db.prepare(`DELETE FROM notifications WHERE (state='DISCARDED' OR (state='DELIVERED' AND delivered_version=desired_version)) AND updated_at<?
+      AND notification_type NOT IN ('TOPUP_STATUS_DM','PAYMENT_LOG','QUEST_HISTORY','ADMIN_LOG') AND destination NOT IN ('LOG_PAYMENTS','LOG_ADMIN')`).run(projectionCutoff).changes;
+  });
+  withImmediateTransaction(db, () => {
+    removed.sessions = db.prepare('DELETE FROM interaction_sessions WHERE expires_at<?').run(timestamp).changes;
+    removed.operationalReviews = db.prepare(`DELETE FROM manual_reviews WHERE category='OPERATIONAL' AND state IN ('RESOLVED_SUCCESS','RESOLVED_FAILURE') AND resolved_at<?`).run(retentionCutoff).changes;
+  });
+  return removed;
+}
+
+/** Run retention as an observable maintenance action.  The individual purge
+ * groups remain isolated in runRetentionCleanup; this records one durable
+ * aggregate counter only after all enabled groups completed. */
+export function runRetentionMaintenance(runtime, { now = nowMs() } = {}) {
+  try {
+    const removed = runRetentionCleanup(runtime.db, { now });
+    withImmediateTransaction(runtime.db, () => runtime.db.prepare(`INSERT INTO settings(key,value_json,updated_at,updated_by)
+      VALUES('retention_last_cleanup',?,?, 'SYSTEM')
+      ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
+      .run(JSON.stringify({ at: now, removed }), now));
+    return removed;
+  } catch (error) {
+    // Cleanup never has authority to hide its own failure.  Record a
+    // targeted incident before the worker's outer loop handles the cycle.
+    recordSystemIncident(runtime.db, { code: 'RETENTION_CLEANUP_FAILED', scope: 'RETENTION', severity: 'ERROR',
+      details: { code: String(error?.code ?? 'SQLITE_RETENTION_FAILED').slice(0, 100) } });
+    throw error;
+  }
 }
 
 async function createDailyBackupIfDue(runtime) {
@@ -80,7 +116,11 @@ export function refreshOperationalHealth(runtime) {
   health.checks.worker = 'OK';
   health.workers.sqlite = { lastHeartbeatAt: timestamp };
   const containment = currentPaymentContainment(db);
-  health.checks.paymentContainment = !paymentGatesOpen || containment.state === 'CLOSED' ? 'OK' : 'DEGRADED';
+  // A missing or malformed containment setting is deliberately fail-closed.
+  // Surface it even when gates are already shut, otherwise a damaged safety
+  // boundary could look healthy and be missed before the next enable action.
+  const containmentSettingInvalid = String(containment.reasonCode ?? '').startsWith('CONTAINMENT_SETTING_');
+  health.checks.paymentContainment = containmentSettingInvalid || (paymentGatesOpen && containment.state !== 'CLOSED') ? 'DEGRADED' : 'OK';
   let receiverReady = false;
   try { receiverReady = Boolean(getReceiverPhone(db, runtime.env)); } catch { receiverReady = false; }
   health.checks.receiver = !paymentGatesOpen || receiverReady ? 'OK' : 'MISSING_RECEIVER';
@@ -103,22 +143,6 @@ function getReceiverPhone(db, env) {
   return { phone, last4: phone.slice(-4) };
 }
 
-function createAttempt(db, topupId, attemptNumber, traceId, workerJob) {
-  const id = randomUUID();
-  const timestamp = nowMs();
-  withImmediateTransaction(db, () => {
-    assertActiveJobLeaseInTransaction(db, { jobId: workerJob.jobId, leaseToken: workerJob.leaseToken,
-      subjectType: 'TOPUP', subjectId: topupId });
-    db.prepare(`INSERT INTO payment_attempts(id,topup_id,attempt_number,dispatch_state,evidence_json,trace_id,started_at)
-      VALUES(?,?,?,'INTENT_RECORDED','{}',?,?)`).run(id, topupId, attemptNumber, traceId, timestamp);
-    db.prepare(`UPDATE jobs SET checkpoint='INTENT_RECORDED',state_version=state_version+1,updated_at=?
-      WHERE id=? AND state='RUNNING' AND lease_token=?`).run(timestamp, workerJob.jobId, workerJob.leaseToken);
-    appendExternalOperationEvidenceInTransaction(db, { jobId: workerJob.jobId, subjectType: 'TOPUP', subjectId: topupId,
-      stage: 'INTENT', evidence: { attemptNumber }, traceId, timestamp });
-  });
-  return id;
-}
-
 function appendRecoveryStage(db, job, stage, evidence = {}) {
   let payload = {};
   try { payload = JSON.parse(job.payload_json ?? '{}'); } catch { /* operation key is the safe fallback */ }
@@ -128,11 +152,11 @@ function appendRecoveryStage(db, job, stage, evidence = {}) {
   }));
 }
 
-function ensureRecoveryReview(db, job, { category = 'OPERATIONAL', reasonCode, safeReason }) {
+function ensureRecoveryReview(db, job, { category = 'OPERATIONAL', reasonCode, safeReason, subjectType = job.subject_type, subjectId = job.subject_id }) {
   const timestamp = nowMs();
   withImmediateTransaction(db, () => db.prepare(`INSERT INTO manual_reviews(id,subject_type,subject_id,category,state,reason_code,safe_reason,created_at,updated_at)
     VALUES(?,?,?,?,'OPEN',?,?,?,?) ON CONFLICT(subject_type,subject_id) WHERE state='OPEN' DO NOTHING`).run(
-    randomUUID(), job.subject_type, job.subject_id, category, reasonCode, safeReason, timestamp, timestamp,
+    randomUUID(), subjectType, subjectId, category, reasonCode, safeReason, timestamp, timestamp,
   ));
 }
 
@@ -158,7 +182,7 @@ export function recoverInterruptedSubjects(runtime) {
         finishRecoveredJob(runtime.db, { jobId: job.id, state: 'COMPLETED', recoveryDecision: 'TOPUP_ALREADY_TERMINAL' });
       } else if (topup.status === 'FAILED') {
         finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', errorCode: topup.failure_reason, recoveryDecision: 'TOPUP_ALREADY_FAILED' });
-      } else if (topup.status === 'REVIEW') {
+      } else if (topup.status === 'MANUAL_REVIEW') {
         ensureRecoveryReview(runtime.db, job, { category: 'FINANCIAL', reasonCode: topup.failure_reason ?? 'RECOVERY_REVIEW_REQUIRED',
           safeReason: 'รายการเติมเงินนี้ต้องได้รับการตรวจสอบจากผู้ดูแล' });
         finishRecoveredJob(runtime.db, { jobId: job.id, state: 'REVIEW', checkpoint: 'POSSIBLY_SENT', errorCode: topup.failure_reason,
@@ -175,7 +199,7 @@ export function recoverInterruptedSubjects(runtime) {
     if (job.job_type !== 'QUEST_RUN') {
       // An extension job without a declared subject recovery policy must not
       // be retried after a possible external send.
-      ensureRecoveryReview(runtime.db, job, { reasonCode: 'RESTART_AFTER_POSSIBLY_SENT',
+      ensureRecoveryReview(runtime.db, job, { subjectType: 'JOB', subjectId: job.id, reasonCode: 'RESTART_AFTER_POSSIBLY_SENT',
         safeReason: 'งานภายนอกถูกขัดจังหวะและต้องได้รับการตรวจสอบ' });
       appendRecoveryStage(runtime.db, job, 'AMBIGUOUS', { reasonCode: 'RESTART_AFTER_POSSIBLY_SENT' });
       finishRecoveredJob(runtime.db, { jobId: job.id, state: 'REVIEW', checkpoint: 'POSSIBLY_SENT', errorCode: 'RESTART_AFTER_POSSIBLY_SENT',
@@ -185,7 +209,7 @@ export function recoverInterruptedSubjects(runtime) {
     const item = runtime.db.prepare('SELECT * FROM order_items WHERE id=?').get(job.subject_id);
     if (!item) { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', errorCode: 'ORDER_ITEM_NOT_FOUND', recoveryDecision: 'ORDER_ITEM_NOT_FOUND' }); continue; }
     if (item.state === 'READY_TO_CLAIM') { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'COMPLETED', recoveryDecision: 'ITEM_ALREADY_CAPTURED' }); continue; }
-    if (['FAILED', 'REFUNDED'].includes(item.state)) { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', recoveryDecision: 'ITEM_ALREADY_RELEASED' }); continue; }
+    if (['FAILED_RELEASED', 'REFUNDED'].includes(item.state)) { finishRecoveredJob(runtime.db, { jobId: job.id, state: 'FAILED', recoveryDecision: 'ITEM_ALREADY_RELEASED' }); continue; }
     const result = verifiedQuestResult(runtime.db, job.id);
     if (result?.outcome === 'SUCCESS') {
       settleOrderItem(runtime.db, { itemId: item.id, outcome: 'SUCCESS', claimUrl: result.claimUrl, verified: true, evidence: result.evidence ?? {} });
@@ -227,10 +251,8 @@ function enqueueVerifiedMonitorAnnouncements(db) {
       if (changed.changes) {
         // Unique notification identity makes this restart-safe and prevents
         // a gate toggle from bumping a durable desired version.
-        db.prepare(`INSERT INTO notifications(id,notification_type,aggregate_type,aggregate_id,destination,nonce,state,next_run_at,payload_json,created_at,updated_at)
-          VALUES(?,?,?,?,?,?, 'PENDING',?,?,?,?) ON CONFLICT(notification_type,aggregate_type,aggregate_id,destination) DO NOTHING`)
-          .run(randomUUID(), 'QUEST_NEW', 'QUEST', quest.quest_id, 'QUEST_NEW', randomUUID(), timestamp,
-            JSON.stringify({ questId: quest.quest_id, verifiedByMonitor: true }), timestamp, timestamp);
+        enqueueNotificationInTransaction(db, { notificationType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: quest.quest_id,
+          destination: 'QUEST_NEW', payload: { questId: quest.quest_id, verifiedByMonitor: true }, timestamp });
       }
     }
     return rows.length;
@@ -244,8 +266,20 @@ export async function processPaymentJob(runtime, job) {
     creditRedeemedTopup(runtime.db, { topupId: topup.id, workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
   }
-  topup = markTopupProcessing(runtime.db, job.subject_id, { workerJob });
-  if (!topup || topup.status === 'CREDITED') return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
+  if (!topup || ['CREDITED', 'REVERSED'].includes(topup.status)) {
+    return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
+  }
+  if (topup.status === 'FAILED') {
+    return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED', errorCode: topup.failure_reason ?? 'TOPUP_ALREADY_FAILED' });
+  }
+  if (topup.status === 'MANUAL_REVIEW') {
+    return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
+      errorCode: topup.failure_reason ?? 'TOPUP_REVIEW_REQUIRED', checkpoint: 'POSSIBLY_SENT' });
+  }
+  if (!['PAYMENT_QUEUED', 'PROCESSING'].includes(topup.status)) {
+    return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
+      errorCode: 'TOPUP_STATE_UNRECOGNIZED', checkpoint: job.checkpoint });
+  }
   const credential = runtime.db.prepare("SELECT * FROM credentials WHERE subject_type='TOPUP' AND subject_id=? AND credential_type='VOUCHER'").get(topup.id);
   const receiver = getReceiverPhone(runtime.db, runtime.env);
   if (!credential || !receiver) {
@@ -258,7 +292,11 @@ export async function processPaymentJob(runtime, job) {
     moveTopupToReview(runtime.db, { topupId: topup.id, reasonCode: 'VOUCHER_DECRYPT_FAILED', safeReason: 'ไม่สามารถอ่านข้อมูลซองอย่างปลอดภัย', workerJob });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW', errorCode: 'VOUCHER_DECRYPT_FAILED' });
   }
-  const attemptId = createAttempt(runtime.db, topup.id, Number(topup.attempt_count) + 1, topup.trace_id, workerJob);
+  const attempt = beginPaymentAttempt(runtime.db, { topupId: topup.id, workerJob });
+  topup = attempt.topup;
+  if (!attempt.attempt) return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token,
+    state: 'REVIEW', errorCode: 'TOPUP_ATTEMPT_NOT_CREATED' });
+  const attemptId = attempt.attempt.id;
   if (!markJobPossiblySent(runtime.db, { jobId: job.id, leaseToken: job.lease_token })) {
     throw Object.assign(new Error('Payment lease lost before provider dispatch'), { code: 'JOB_LEASE_LOST' });
   }
@@ -316,8 +354,8 @@ export async function processPaymentJob(runtime, job) {
   }
 }
 
-async function processNonPaymentJob(runtime, job) {
-  if (['CUSTOMER_QUEST_DISCOVERY', 'MONITOR_SEARCH', 'MONITOR_TEST', 'QUEST_RUN'].includes(job.job_type)) {
+export async function processNonPaymentJob(runtime, job) {
+  if (['CUSTOMER_QUEST_DISCOVERY', 'MONITOR_DISCOVERY', 'MONITOR_SEARCH', 'MONITOR_TEST', 'QUEST_RUN'].includes(job.job_type)) {
     return processQuestWorkflowJob(runtime, job);
   }
   // Optional maintenance extensions may still be injected at the runtime
@@ -375,18 +413,49 @@ async function findNotificationByNonce(channel, notification) {
 }
 
 function notificationDeliveryIsCurrent(db, notification) {
-  const current = db.prepare(`SELECT state,lease_token,desired_version,sending_version FROM notifications WHERE id=?`).get(notification.id);
+  const current = db.prepare(`SELECT state,lease_token,lease_expires_at,desired_version,sending_version FROM notifications WHERE id=?`).get(notification.id);
   return Boolean(current && current.state === 'SENDING' && current.lease_token === notification.lease_token
-    && Number(current.desired_version) === Number(notification.sending_version));
+    && Number(current.lease_expires_at) > nowMs() && Number(current.desired_version) === Number(notification.sending_version));
+}
+
+function discardExpiredQuestAnnouncement(db, notification) {
+  const timestamp = nowMs();
+  return withImmediateTransaction(db, () => {
+    const quest = db.prepare('SELECT starts_at,expires_at FROM quests WHERE quest_id=?').get(notification.aggregate_id);
+    const active = quest?.expires_at && Number(quest.expires_at) > timestamp
+      && (quest.starts_at == null || Number(quest.starts_at) <= timestamp);
+    if (active) return false;
+    const changed = db.prepare(`UPDATE notifications SET state='DISCARDED',lease_token=NULL,lease_expires_at=NULL,last_error_code='QUEST_EXPIRED',updated_at=?
+      WHERE id=? AND state='SENDING' AND lease_token=? AND lease_expires_at>?`).run(
+      timestamp, notification.id, notification.lease_token, timestamp,
+    );
+    if (!changed.changes) return false;
+    db.prepare(`UPDATE quests SET announcement_status=CASE WHEN announcement_status='QUEUED' THEN 'NOT_ANNOUNCED' ELSE announcement_status END,
+      state_version=state_version+1,updated_at=? WHERE quest_id=?`).run(timestamp, notification.aggregate_id);
+    const auditId = randomUUID();
+    db.prepare(`INSERT INTO admin_audit(id,actor_id,action,target_type,target_id,reason,before_json,after_json,trace_id,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`).run(auditId, 'SYSTEM', 'QUEST_ANNOUNCEMENT_DISCARDED', 'QUEST', notification.aggregate_id,
+      'QUEST_EXPIRED', JSON.stringify({ state: 'QUEUED' }), JSON.stringify({ state: 'DISCARDED' }), notification.id, timestamp);
+    enqueueNotificationInTransaction(db, { notificationType: 'ADMIN_LOG', aggregateType: 'ADMIN_AUDIT', aggregateId: auditId,
+      destination: 'LOG_ADMIN', payload: { auditId }, timestamp });
+    return true;
+  });
 }
 
 export async function deliverNotification(runtime, notification) {
+  if (notification.notification_type === 'QUEST_NEW' && discardExpiredQuestAnnouncement(runtime.db, notification)) return;
   if (notification.notification_type === 'QUEST_NEW' && !currentFeatureGates(runtime.db).QUEST_ANNOUNCEMENT_ENABLED) {
     deferNotification(runtime.db, { notificationId: notification.id, leaseToken: notification.lease_token, retryAt: nowMs() + 60_000,
       reason: 'QUEST_ANNOUNCEMENT_DISABLED' });
     return;
   }
   const financial = ['TOPUP_STATUS_DM', 'PAYMENT_LOG'].includes(notification.notification_type);
+  const renew = () => renewNotificationLease(runtime.db, { notificationId: notification.id, leaseToken: notification.lease_token });
+  if (!renew()) return;
+  const leaseTimer = setInterval(() => {
+    try { renew(); } catch (error) { runtime.logger?.warn?.({ error, notificationId: notification.id }, 'Notification lease renewal failed'); }
+  }, 10_000);
+  leaseTimer.unref?.();
   try {
     const [channel, payload] = await Promise.all([
       destinationFor(runtime, notification), renderSqliteNotification(runtime, notification),
@@ -409,6 +478,7 @@ export async function deliverNotification(runtime, notification) {
       finishNotificationDelivery(runtime.db, { notificationId: notification.id, leaseToken: notification.lease_token, financial });
       return;
     }
+    if (!renew()) return;
     if (message) await message.edit(body);
     else message = await channel.send(body);
     const delivered = finishNotificationDelivery(runtime.db, { notificationId: notification.id, leaseToken: notification.lease_token,
@@ -424,6 +494,8 @@ export async function deliverNotification(runtime, notification) {
       recordSystemIncident(runtime.db, { code: 'DISCORD_DELIVERY_FAILED', scope: notification.destination,
         severity: financial ? 'ERROR' : 'WARNING', details: { notificationType: notification.notification_type } });
     }
+  } finally {
+    clearInterval(leaseTimer);
   }
 }
 
@@ -434,7 +506,7 @@ export function createSqliteWorkers({ runtime }) {
   const maxActiveJobs = Math.max(1, Number(runtime.env.RUNNER_CONCURRENCY) || 1);
   function requiredGate(job) {
     if (job.job_type === 'PAYMENT_SETTLE') return 'AUTO_CREDIT_ENABLED';
-    if (job.job_type === 'CUSTOMER_QUEST_DISCOVERY') return 'QUEST_SCANNER_ENABLED';
+    if (job.job_type === 'CUSTOMER_QUEST_DISCOVERY' || job.job_type === 'MONITOR_DISCOVERY') return 'QUEST_SCANNER_ENABLED';
     if (job.job_type === 'MONITOR_SEARCH' || job.job_type === 'MONITOR_TEST') return 'QUEST_BACKGROUND_TESTING_ENABLED';
     if (job.job_type === 'QUEST_RUN') return 'RUNNER_DISPATCH_ENABLED';
     return null;
@@ -511,7 +583,7 @@ export function createSqliteWorkers({ runtime }) {
           recoveryAt = nowMs() + 60_000;
         }
         if (nowMs() >= cleanupAt) {
-          if (currentFeatureGates(runtime.db).RETENTION_JOBS_ENABLED) cleanupExpiredRows(runtime.db);
+          if (currentFeatureGates(runtime.db).RETENTION_JOBS_ENABLED) runRetentionMaintenance(runtime);
           cleanupAt = nowMs() + 60_000;
         }
         if (nowMs() >= backupAt) {
@@ -560,9 +632,18 @@ export function createSqliteWorkers({ runtime }) {
       await Promise.allSettled([...activeJobs, ...activePayments]);
     },
     async processTopupNow(topupId) {
-      runtime.db.prepare("UPDATE jobs SET next_run_at=?,state_version=state_version+1 WHERE job_type='PAYMENT_SETTLE' AND subject_id=? AND state IN ('PENDING','RETRY_WAIT')")
-        .run(nowMs(), topupId);
-      return runOne();
+      const timestamp = nowMs();
+      runtime.db.prepare("UPDATE jobs SET next_run_at=?,state_version=state_version+1,updated_at=? WHERE job_type='PAYMENT_SETTLE' AND subject_id=? AND state IN ('PENDING','WAITING_RETRY','WAITING_RATE_LIMIT')")
+        .run(timestamp, timestamp, topupId);
+      const topup = runtime.db.prepare('SELECT status FROM topups WHERE id=?').get(topupId);
+      if (!topup || ['CREDITED', 'REVERSED', 'FAILED'].includes(topup.status)) {
+        return { claimed: false, deferred: false, alreadyTerminal: true, topupId, jobId: null };
+      }
+      if (activePayments.size >= 1) return { claimed: false, deferred: true, alreadyTerminal: false, topupId, jobId: null };
+      const job = claimJobBySubject(runtime.db, { jobType: 'PAYMENT_SETTLE', subjectId: topupId, now: timestamp });
+      if (!job) return { claimed: false, deferred: true, alreadyTerminal: false, topupId, jobId: null };
+      dispatchJob(job);
+      return { claimed: true, deferred: false, alreadyTerminal: false, topupId, jobId: job.id };
     },
   };
 }

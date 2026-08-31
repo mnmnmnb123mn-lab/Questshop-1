@@ -55,13 +55,26 @@ export function claimDueNotification(db, { now = nowMs(), leaseMs = 30_000 } = {
   });
 }
 
+/** Renew an in-flight Discord delivery before it performs another network
+ * action.  A stale sender therefore cannot complete after recovery has taken
+ * ownership of the projection. */
+export function renewNotificationLease(db, { notificationId, leaseToken, now = nowMs(), leaseMs = 30_000 } = {}) {
+  return withImmediateTransaction(db, () => {
+    const changed = db.prepare(`UPDATE notifications SET lease_expires_at=?,updated_at=?
+      WHERE id=? AND state='SENDING' AND lease_token=? AND lease_expires_at>?`).run(
+      now + leaseMs, now, notificationId, leaseToken, now,
+    );
+    return changed.changes === 1;
+  });
+}
+
 const RETRY_DELAYS_MS = Object.freeze([1_000, 5_000, 15_000, 60_000, 300_000, 900_000]);
 
 export function finishNotificationDelivery(db, { notificationId, leaseToken, messageId = null, errorCode = null,
   now = nowMs() }) {
   return withImmediateTransaction(db, () => {
     const row = db.prepare('SELECT * FROM notifications WHERE id=?').get(notificationId);
-    if (!row || row.state !== 'SENDING' || row.lease_token !== leaseToken) return null;
+    if (!row || row.state !== 'SENDING' || row.lease_token !== leaseToken || Number(row.lease_expires_at) <= now) return null;
     if (!errorCode) {
       const current = Number(row.desired_version) > Number(row.sending_version);
       db.prepare(`UPDATE notifications SET message_id=COALESCE(?,message_id),delivered_version=?,state=?,
@@ -83,7 +96,7 @@ export function finishNotificationDelivery(db, { notificationId, leaseToken, mes
 export function deferNotification(db, { notificationId, leaseToken, retryAt, reason = 'FEATURE_DISABLED', now = nowMs() }) {
   return withImmediateTransaction(db, () => {
     const row = db.prepare('SELECT * FROM notifications WHERE id=?').get(notificationId);
-    if (!row || row.state !== 'SENDING' || row.lease_token !== leaseToken) return null;
+    if (!row || row.state !== 'SENDING' || row.lease_token !== leaseToken || Number(row.lease_expires_at) <= now) return null;
     db.prepare(`UPDATE notifications SET state='RETRY_WAIT',lease_token=NULL,lease_expires_at=NULL,next_run_at=?,
       attempt_count=MAX(0,attempt_count-1),last_error_code=?,updated_at=? WHERE id=?`).run(retryAt, reason, now, notificationId);
     return db.prepare('SELECT * FROM notifications WHERE id=?').get(notificationId);

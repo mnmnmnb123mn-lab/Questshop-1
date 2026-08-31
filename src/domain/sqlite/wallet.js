@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { nowMs, withImmediateTransaction } from '../../db/sqlite.js';
+import { QuestshopError } from '../../shared/errors.js';
 
 export function ensureWallet(db, discordUserId, timestamp = nowMs()) {
   db.prepare(`INSERT INTO wallets(discord_user_id,available_cents,reserved_cents,version,created_at,updated_at)
@@ -27,7 +28,17 @@ export function appendWalletTransactionInTransaction(db, {
   referenceType, referenceId, idempotencyKey, traceId, reason = null, timestamp = nowMs(),
 }) {
   const duplicate = db.prepare('SELECT * FROM wallet_transactions WHERE idempotency_key=?').get(idempotencyKey);
-  if (duplicate) return { transaction: duplicate, wallet: ensureWallet(db, discordUserId, timestamp), idempotent: true };
+  if (duplicate) {
+    const matches = duplicate.discord_user_id === discordUserId
+      && duplicate.transaction_type === transactionType
+      && Number(duplicate.available_delta_cents) === Number(availableDeltaCents)
+      && Number(duplicate.reserved_delta_cents) === Number(reservedDeltaCents)
+      && duplicate.reference_type === referenceType
+      && duplicate.reference_id === referenceId
+      && duplicate.trace_id === traceId;
+    if (!matches) throw new QuestshopError('IDEMPOTENCY_CONFLICT', 'รหัสธุรกรรมนี้ถูกใช้กับคำขออื่นแล้ว');
+    return { transaction: duplicate, wallet: ensureWallet(db, discordUserId, timestamp), idempotent: true };
+  }
   const wallet = ensureWallet(db, discordUserId, timestamp);
   const available = Number(wallet.available_cents) + Number(availableDeltaCents);
   const reserved = Number(wallet.reserved_cents) + Number(reservedDeltaCents);

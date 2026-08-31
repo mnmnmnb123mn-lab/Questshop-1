@@ -85,6 +85,8 @@ anchor; this presentation repair does not mutate Wallet, Ledger, Order or paymen
   possibly-sent request is never blind-retried.
 - Invalid provider schema/receiver/currency/amount fails closed without credit.
 - Financial/Audit DLQ may be replayed but cannot be discarded.
+- Financial Manual Review stores append-only first/second confirmations. The same Owner must confirm the same
+  sanitized payload within five minutes; CREDIT additionally requires verified HTTP, provider and receiver evidence.
 
 ### Credentials and cryptography
 
@@ -99,8 +101,11 @@ anchor; this presentation repair does not mutate Wallet, Ledger, Order or paymen
 
 - Production uses `/data/questshop.db`, WAL mode, `synchronous=FULL`, `foreign_keys=ON` and owner-only `0600` files.
 - A process lock permits one Runtime instance only; concurrent workers are not supported.
-- `wallet_transactions`, `settlement_evidence` and `admin_audit` have SQLite triggers blocking `UPDATE` and `DELETE`.
+- `wallet_transactions`, `settlement_evidence`, `admin_audit`, Manual Review confirmations and external-operation
+  evidence have SQLite triggers blocking `UPDATE` and `DELETE`.
 - Migration uses a verified online backup, `BEGIN IMMEDIATE`, schema verification and `user_version` commit.
+- Operational retention is isolated by table category: Jobs/checks/rate-limit records retain 30 days, while only
+  non-financial delivered projections retain 90 days. External-operation evidence intentionally survives Job purge.
 
 ### Discord, workers and external mutations
 

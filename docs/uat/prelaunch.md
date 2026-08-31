@@ -11,6 +11,8 @@ keyrings or a full voucher URL in UAT evidence.
 - [ ] Create a daily and Pre-migration backup, restore it while Runtime is stopped, verify `integrity_check` and
       `foreign_key_check`, and confirm stale `-wal`/`-shm` files are not reused.
 - [ ] Attempt a second Runtime against the same database and verify the single-instance lock rejects it.
+- [ ] Verify SQLite schema v2: `manual_review_confirmations`, payment-attempt lineage and lease-integrity triggers
+      exist; a failed/invalid schema check prevents workers from starting.
 
 ## Preconditions
 
@@ -154,6 +156,11 @@ Use masked voucher identity only. Full voucher links belong only in the validate
 - [ ] Verify `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` and `LOG_SYSTEM` render safe Thai text and do not expose Token,
       voucher, cookie, credential, ciphertext, nonce or auth tag.
 - [ ] Runtime restart recovers queued Jobs, Notifications and Review state according to their checkpoints.
+- [ ] Exercise a financial Manual Review: first Owner confirmation only records sanitized intent; the same Owner must
+      confirm the exact payload within five minutes before credit/reject/reversal. A different Owner, changed payload
+      or expired confirmation must fail without Wallet mutation.
+- [ ] Run retention with rows older than 30/90 days; verify operational Jobs/checks/rate limits and non-financial
+      delivered projections purge independently, while financial evidence and external-operation evidence remain.
 - [ ] `/livez`, `/readyz` and authenticated `/statusz` behave as documented.
 - [ ] External/Owner alert delivery is observed.
 - [ ] Rollback rehearsal records app rollback or forward-fix decision without editing applied migrations.

@@ -23,7 +23,7 @@ export function claimDueJob(db, { now = nowMs(), leaseMs = 30_000, jobType = nul
     const exclusions = Array.isArray(excludeJobTypes) ? excludeJobTypes.filter(Boolean).map(String) : [];
     const typeClause = jobType ? ' AND j.job_type=?' : '';
     const exclusionClause = exclusions.length ? ` AND j.job_type NOT IN (${exclusions.map(() => '?').join(',')})` : '';
-    const due = db.prepare(`SELECT j.* FROM jobs j WHERE j.state IN ('PENDING','RETRY_WAIT') AND j.next_run_at<=?${typeClause}${exclusionClause}
+    const due = db.prepare(`SELECT j.* FROM jobs j WHERE j.state IN ('PENDING','WAITING_RETRY','WAITING_RATE_LIMIT') AND j.next_run_at<=?${typeClause}${exclusionClause}
       AND (j.job_type<>'QUEST_RUN' OR NOT EXISTS (
         SELECT 1 FROM jobs running
         JOIN order_items running_item ON running_item.id=running.subject_id
@@ -37,8 +37,25 @@ export function claimDueJob(db, { now = nowMs(), leaseMs = 30_000, jobType = nul
     if (!due) return null;
     const leaseToken = randomUUID();
     const updated = db.prepare(`UPDATE jobs SET state='RUNNING',state_version=state_version+1,lease_token=?,lease_expires_at=?,attempt_count=attempt_count+1,
-      updated_at=? WHERE id=? AND state IN ('PENDING','RETRY_WAIT')`).run(leaseToken, now + leaseMs, now, due.id);
+      updated_at=? WHERE id=? AND state IN ('PENDING','WAITING_RETRY','WAITING_RATE_LIMIT')`).run(leaseToken, now + leaseMs, now, due.id);
     return updated.changes ? db.prepare('SELECT * FROM jobs WHERE id=?').get(due.id) : null;
+  });
+}
+
+/** Claim one exact durable subject. This is intentionally separate from the
+ * priority queue so an interaction-local settlement can never lease another
+ * customer's work. */
+export function claimJobBySubject(db, { jobType, subjectId, now = nowMs(), leaseMs = 30_000 } = {}) {
+  return withImmediateTransaction(db, () => {
+    const due = db.prepare(`SELECT * FROM jobs WHERE job_type=? AND subject_id=? AND state IN ('PENDING','WAITING_RETRY','WAITING_RATE_LIMIT')
+      AND next_run_at<=? ORDER BY created_at LIMIT 1`).get(jobType, subjectId, now);
+    if (!due) return null;
+    const leaseToken = randomUUID();
+    const changed = db.prepare(`UPDATE jobs SET state='RUNNING',state_version=state_version+1,lease_token=?,lease_expires_at=?,attempt_count=attempt_count+1,
+      updated_at=? WHERE id=? AND state IN ('PENDING','WAITING_RETRY','WAITING_RATE_LIMIT') AND state_version=?`).run(
+      leaseToken, now + leaseMs, now, due.id, due.state_version,
+    );
+    return changed.changes ? db.prepare('SELECT * FROM jobs WHERE id=?').get(due.id) : null;
   });
 }
 
@@ -47,7 +64,7 @@ export function completeJob(db, { jobId, leaseToken, state = 'COMPLETED', checkp
   return withImmediateTransaction(db, () => {
     const row = db.prepare('SELECT * FROM jobs WHERE id=?').get(jobId);
     if (!row || row.lease_token !== leaseToken || row.state !== 'RUNNING' || Number(row.lease_expires_at) <= now) return null;
-    const nextState = retryAt == null ? state : 'RETRY_WAIT';
+    const nextState = retryAt == null ? state : 'WAITING_RETRY';
     db.prepare(`UPDATE jobs SET state=?,checkpoint=?,state_version=state_version+1,last_error_code=?,next_run_at=?,lease_token=NULL,lease_expires_at=NULL,
       completed_at=?,updated_at=? WHERE id=?`).run(nextState, checkpoint, errorCode, retryAt ?? now,
       nextState === 'COMPLETED' || nextState === 'FAILED' || nextState === 'REVIEW' ? now : null, now, jobId);
@@ -75,11 +92,14 @@ export function assertActiveJobLeaseInTransaction(db, {
 }
 
 export function appendExternalOperationEvidenceInTransaction(db, {
-  jobId, subjectType, subjectId, stage, evidence = {}, traceId, timestamp = nowMs(),
+  jobId, subjectType, subjectId, stage, evidence = {}, traceId, operationId = 'default', attemptId = null,
+  timestamp = nowMs(),
 }) {
-  db.prepare(`INSERT INTO external_operation_evidence(id,job_id,subject_type,subject_id,stage,evidence_json,trace_id,created_at)
-    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(job_id,stage) DO NOTHING`).run(
-    randomUUID(), jobId, subjectType, subjectId, stage, JSON.stringify(evidence), traceId, timestamp,
+  const job = db.prepare('SELECT job_type,operation_key FROM jobs WHERE id=?').get(jobId);
+  db.prepare(`INSERT INTO external_operation_evidence(id,job_id,operation_id,attempt_id,job_type,operation_key,subject_type,subject_id,stage,evidence_json,trace_id,created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id,stage,operation_id) DO NOTHING`).run(
+    randomUUID(), jobId, String(operationId), attemptId, job?.job_type ?? null, job?.operation_key ?? null,
+    subjectType, subjectId, stage, JSON.stringify(evidence), traceId, timestamp,
   );
 }
 

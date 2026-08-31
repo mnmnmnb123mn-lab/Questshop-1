@@ -11,13 +11,20 @@ function caseNotification(db, notificationId) {
   return row;
 }
 
+function assertQuestActiveForAdminAction(quest, timestamp) {
+  if (!quest?.expires_at || Number(quest.expires_at) <= timestamp || (quest.starts_at != null && Number(quest.starts_at) > timestamp)) {
+    throw new QuestshopError('QUEST_EXPIRED', 'Quest นี้หมดอายุหรือยังไม่พร้อม จึงไม่สามารถทดสอบหรือประกาศได้');
+  }
+}
+
 export function retryCustomerDiscovery(db, { notificationId, actorId }) {
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
     const notification = caseNotification(db, notificationId);
     const questId = notification.aggregate_id;
+    assertQuestActiveForAdminAction(db.prepare('SELECT starts_at,expires_at FROM quests WHERE quest_id=?').get(questId), timestamp);
     const active = db.prepare(`SELECT * FROM jobs WHERE job_type='MONITOR_SEARCH' AND subject_id=?
-      AND state IN ('PENDING','RUNNING','RETRY_WAIT')`).get(questId);
+      AND state IN ('PENDING','RUNNING','WAITING_RETRY','WAITING_RATE_LIMIT')`).get(questId);
     if (!active) enqueueJobInTransaction(db, { jobType: 'MONITOR_SEARCH', subjectType: 'QUEST', subjectId: questId,
       operationKey: `monitor-search:${questId}:${timestamp}`, payload: { questId, requestedBy: actorId }, runAt: timestamp });
     const auditId = randomUUID();
@@ -36,6 +43,7 @@ export function announceCustomerDiscovery(db, { notificationId, actorId, expecte
     const notification = caseNotification(db, notificationId);
     const quest = db.prepare('SELECT * FROM quests WHERE quest_id=?').get(notification.aggregate_id);
     if (!quest) throw new QuestshopError('QUEST_NOT_FOUND', 'ไม่พบ Quest ที่ต้องการประกาศ');
+    assertQuestActiveForAdminAction(quest, timestamp);
     if (quest.announcement_status !== 'NOT_ANNOUNCED') return { questId: quest.quest_id, queued: false };
     if (expectedQuestVersion != null && Number(expectedQuestVersion) !== Number(quest.state_version)) {
       throw new QuestshopError('INTERACTION_CONFLICT', 'สถานะ Quest เปลี่ยนแล้ว กรุณาใช้ข้อความล่าสุด');

@@ -120,7 +120,8 @@ Confirm Order
   โดยไม่กระทบเครดิต การเร่งนี้ยังใช้ lease,
   dispatch checkpoint, การยืนยัน TrueMoney และ Wallet credit ชุดเดียวกับ Worker จึงไม่ข้ามการกันเครดิตซ้ำ
 - หนึ่ง Quest account มี active job ได้ไม่เกินหนึ่งงานทั่วระบบ
-- Monitor ทุกบัญชีทำ Scan + Test; Monitor-discovered Quest ยัง private จน test ผ่านหรือ Admin ใช้ audited **ส่งเลย**
+- Monitor scan ค้นหา Quest จากบัญชี Monitor ที่ active ด้วย และ Monitor-discovered Quest ยัง private จน test ผ่าน
+  หรือ Admin ใช้ audited **ส่งเลย**; หากมีหลายบัญชีที่มองเห็น Quest เดียวกัน ระบบเลือกทดสอบเพียงหนึ่งบัญชีตามลำดับคงที่
 - customer-discovered Quest อาจถูกเสนอเฉพาะ account นั้นตาม policy โดยไม่ขึ้นกับประกาศหรือการพบใน Monitor.
   ระบบสร้าง Case ใน `LOG_QUEST_OPERATIONS`, เก็บลิงก์ Quest และค้นทุกบัญชี Monitor แบบ read-only อัตโนมัติ;
   พบแล้วจึงทดสอบ, ไม่พบจะแสดง **ตรวจและทดสอบอีกครั้ง** หรือ audited **ส่งประกาศ**. `quest-new` เป็นข่าวและห้ามระบุตัวลูกค้า
@@ -132,12 +133,13 @@ Owner ใช้ `OWNER_ID`; Admin คนอื่นต้องมี Discord `
 
 ตาม Owner policy บอทไม่ตรวจ human visibility/privacy ของห้องหลังบ้าน. `LOG_PAYMENTS` อาจมี full TrueMoney voucher link;
 Owner ต้องตั้ง channel visibility เอง. Discord 403 ถูกบันทึกเป็น incident แต่บอทไม่เปลี่ยน permission ให้เอง.
-payload ซองที่เข้ารหัสจะถูกเก็บตาม retention 7 วัน: ลิงก์เต็มในข้อความ `LOG_PAYMENTS` เดิมยังอยู่ตามนโยบาย Owner
+payload ซองที่เข้ารหัสจะถูกเก็บตาม retention 7 วัน: Jobs, Quest checks และ interaction-rate records ที่เป็น operational
+จะถูกล้างหลัง 30 วัน; notification ที่ส่งสำเร็จและไม่ใช่ข้อมูลการเงินจะถูกล้างหลัง 90 วัน. ลิงก์เต็มในข้อความ `LOG_PAYMENTS` เดิมยังอยู่ตามนโยบาย Owner
 แต่หากข้อความนั้นสูญหายหลังครบอายุ ระบบจะกู้ได้เพียงการ์ดแบบปกปิดเท่านั้น.
 
 Payment Log แสดงสถานะภาษาไทย, HTTP status ที่ปลอดภัย และวิธีอ้างอิงรายการโดยไม่แสดง response body, ชื่อหรือ
 เบอร์ผู้ส่งจาก Provider. กรณีไม่มีเลขธุรกรรมแต่หลักฐานรับเงินครบจะแสดงว่าอ้างอิงด้วย “รหัสซองที่เข้ารหัสและ
-Top-up ID”; Owner ยืนยัน Manual Review แบบนี้ได้สองครั้งและต้องใช้ยอดที่ตรงกับผล TrueMoney เท่านั้น.
+Top-up ID”; Owner ยืนยัน Manual Review แบบนี้ได้สองครั้งโดยคนเดิมภายใน 5 นาที ระบบเก็บ payload ที่ sanitize แล้วจากครั้งแรกและห้ามพิมพ์หลักฐานใหม่ในครั้งที่สอง.
 
 `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` และ `LOG_SYSTEM` แสดงคำอธิบายภาษาไทยก่อนข้อมูลเทคนิคเสมอ:
 การ์ดบอกสิ่งที่เกิดขึ้น สถานะหรือผลกระทบ เหตุผลที่อ่านง่าย และปิดท้ายด้วย `ข้อมูลอ้างอิง` กับ `สรุป:`

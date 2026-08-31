@@ -25,9 +25,9 @@ import { beginPaymentProbe, closePaymentContainment, currentPaymentContainment }
 
 function ephemeral(content) { return { content, ephemeral: true, allowedMentions: { parse: [] } }; }
 
-function sessionContext(interaction, runtime, operation, payload = {}, messageId = null) {
+function sessionContext(interaction, runtime, operation, payload = {}, messageId = null, expiresAt = undefined) {
   return createInteractionSession(runtime.db, { actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId, operation, payload });
+    channelId: interaction.channelId, messageId, operation, payload, ...(expiresAt == null ? {} : { expiresAt }) });
 }
 
 async function replyAndBindSessions(interaction, runtime, body, sessionIds) {
@@ -232,9 +232,10 @@ async function handleAdminMenu(interaction, runtime) {
   throw new QuestshopError('ADMIN_MENU_INVALID', 'เมนูผู้ดูแลไม่ถูกต้อง');
 }
 
-function textInput(custom, label, { required = true, style = TextInputStyle.Short, maxLength = 1_000, placeholder = null } = {}) {
+function textInput(custom, label, { required = true, style = TextInputStyle.Short, maxLength = 1_000, placeholder = null, value = null } = {}) {
   const input = new TextInputBuilder().setCustomId(custom).setLabel(label).setStyle(style).setRequired(required).setMaxLength(maxLength);
   if (placeholder) input.setPlaceholder(placeholder);
+  if (value != null) input.setValue(String(value));
   return new ActionRowBuilder().addComponents(input);
 }
 
@@ -340,19 +341,20 @@ async function handleSurfaceCommand(interaction, runtime) {
 
 function recordCustomerToken(runtime, interaction, token) {
   const timestamp = nowMs();
-  const id = randomUUID();
+  const credentialId = randomUUID();
+  const jobId = randomUUID();
   const encrypted = encryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, token, { keyVersion: runtime.env.CREDENTIAL_ENCRYPTION_ACTIVE_VERSION });
   withImmediateTransaction(runtime.db, () => {
     runtime.db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,key_version,retention_class,ciphertext,nonce,auth_tag,cleanup_after,created_at,updated_at)
-      VALUES(?,?,?,'CUSTOMER_QUEST_TOKEN',?,'TEMPORARY',?,?,?,?,?,?)`).run(id, 'CHECKOUT', id, encrypted.keyVersion,
+      VALUES(?,?,?,'CUSTOMER_QUEST_TOKEN',?,'TEMPORARY',?,?,?,?,?,?)`).run(credentialId, 'CHECKOUT', credentialId, encrypted.keyVersion,
       encrypted.ciphertext, encrypted.nonce, encrypted.authTag, timestamp + 7 * 86_400_000, timestamp, timestamp);
     runtime.db.prepare(`INSERT INTO jobs(id,job_type,subject_type,subject_id,operation_key,state,checkpoint,next_run_at,payload_json,created_at,updated_at)
-      VALUES(?,?, 'CHECKOUT', ?, ?, 'PENDING','NOT_STARTED',?,?,?,?)`).run(randomUUID(), 'CUSTOMER_QUEST_DISCOVERY', id,
-      `customer-discovery:${id}`, timestamp, JSON.stringify({ discordUserId: interaction.user.id, credentialId: id,
+      VALUES(?,?, 'CHECKOUT', ?, ?, 'PENDING','NOT_STARTED',?,?,?,?)`).run(jobId, 'CUSTOMER_QUEST_DISCOVERY', credentialId,
+      `customer-discovery:${credentialId}`, timestamp, JSON.stringify({ discordUserId: interaction.user.id, credentialId,
         guildId: interaction.guildId, channelId: interaction.channelId, discoveryMessageId: null, checkoutMessageId: null,
         expiresAt: timestamp + 15 * 60_000 }), timestamp, timestamp);
   });
-  return id;
+  return jobId;
 }
 
 function parsePayload(value, fallback = {}) {
@@ -386,7 +388,7 @@ function selectedQuests(runtime, payload, selectedIds) {
   runtime.config = config;
   return rows.map((quest) => {
     if ((quest.starts_at != null && Number(quest.starts_at) > timestamp)
-      || (quest.expires_at != null && Number(quest.expires_at) <= timestamp)) {
+      || !quest.expires_at || Number(quest.expires_at) <= timestamp) {
       throw new QuestshopError('QUEST_UNAVAILABLE', 'Quest บางรายการยังไม่เริ่มหรือหมดอายุแล้ว');
     }
     const priceCents = priceForQuest(config.values, quest.task_type);
@@ -410,7 +412,7 @@ function pricedCheckoutQuestRows(runtime, payload) {
   return ids.map((questId) => {
     const quest = byId.get(questId);
     if (!quest || (quest.starts_at != null && Number(quest.starts_at) > timestamp)
-      || (quest.expires_at != null && Number(quest.expires_at) <= timestamp)) return null;
+      || !quest.expires_at || Number(quest.expires_at) <= timestamp) return null;
     const priceCents = priceForQuest(config.values, quest.task_type);
     return priceCents == null ? null : { ...quest, priceCents };
   }).filter(Boolean);
@@ -493,7 +495,7 @@ async function freshCheckoutQuests(runtime, payload, selected) {
   for (const selectedQuest of selected) {
     const current = byId.get(selectedQuest.questId);
     if (!current || current.completed === true || (current.startsAt && Date.parse(current.startsAt) > nowMs())
-      || (current.expiresAt && Date.parse(current.expiresAt) <= nowMs())
+      || !current.expiresAt || !Number.isFinite(Date.parse(current.expiresAt)) || Date.parse(current.expiresAt) <= nowMs()
       || (selectedQuest.contractHash && current.contractHash !== selectedQuest.contractHash)) {
       throw new QuestshopError('QUEST_CHANGED', 'Quest ที่เลือกเปลี่ยนแปลงหรือทำเสร็จแล้ว กรุณาสร้างราคาใหม่');
     }
@@ -542,7 +544,7 @@ async function confirmCheckout(interaction, runtime, quoteId) {
   const quests = snapshot.items;
   for (const item of quests) {
     const current = runtime.db.prepare(`SELECT task_type,contract_hash,starts_at,expires_at FROM quests WHERE quest_id=?`).get(item.questId);
-    if (!current || current.task_type !== item.taskType || current.contract_hash !== item.contractHash
+    if (!current || !current.expires_at || Number(current.expires_at) <= nowMs() || current.task_type !== item.taskType || current.contract_hash !== item.contractHash
       || current.starts_at !== item.startsAt || current.expires_at !== item.expiresAt) {
       throw new QuestshopError('QUOTE_STALE', 'ข้อมูล Quest มีการเปลี่ยนแปลง กรุณาสร้างราคาใหม่');
     }
@@ -610,6 +612,7 @@ async function routeButton(interaction, runtime, route, sessionId) {
     return interaction.showModal(openAdminModal('admin_monitor_submit', submitId, 'เพิ่มบัญชี Monitor', [
       textInput('accountId', 'Discord Account ID', { maxLength: 32 }), textInput('label', 'ชื่อเรียกบัญชี', { maxLength: 100 }),
       textInput('token', 'Discord Token สำหรับ Monitor', { style: TextInputStyle.Paragraph, maxLength: 300 }),
+      textInput('state', 'ACTIVE, DISABLED หรือ COOLDOWN', { maxLength: 10, value: 'ACTIVE' }),
     ]));
   }
   if (route === 'admin_monitor_edit') {
@@ -687,6 +690,13 @@ async function routeButton(interaction, runtime, route, sessionId) {
       textInput('reason', 'เหตุผล', { required: false, maxLength: 300 }), textInput('amountCents', 'จำนวนเงินจากหลักฐาน (สตางค์; เฉพาะ CREDIT)', { required: false, maxLength: 12 }),
       textInput('evidence', 'หลักฐาน JSON (CREDIT ต้องมี providerCode, httpStatus, receiverConfirmation)', { required: false, style: TextInputStyle.Paragraph, maxLength: 1_000 }),
     ]));
+  }
+  if (route === 'admin_review_confirm') {
+    await assertOwner(interaction, runtime);
+    const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_REVIEW_CONFIRM');
+    const result = confirmFinancialReview(runtime.db, { ...session.payload, actorId: interaction.user.id });
+    return interaction.update({ content: `ยืนยัน Manual Review แล้ว — ${result.status ?? result.state}`,
+      embeds: [], components: [], allowedMentions: { parse: [] } });
   }
   if (route === 'admin_dlq_retry') {
     const session = await consumeAdminSession(interaction, runtime, sessionId, 'ADMIN_DLQ_RETRY');
@@ -942,9 +952,18 @@ async function routeModal(interaction, runtime, route) {
       ? confirmFinancialReview(runtime.db, { reviewId: session.payload.reviewId, actorId: interaction.user.id, decision, reason,
         principalCents: amountText ? Number(amountText) : null, providerEvidence: evidence,
         providerTransactionId: evidence.providerTransactionId ?? null })
-      : resolveOperationalReview(runtime.db, { reviewId: session.payload.reviewId, actorId: interaction.user.id, decision, reason,
+      : resolveOperationalReview(runtime.db, { reviewId: session.payload.reviewId, subjectType: session.payload.subjectType, actorId: interaction.user.id, decision, reason,
         claimUrl: evidence.claimUrl ?? null, evidence });
-    return interaction.reply(ephemeral(result.state === 'AWAITING_SECOND_CONFIRMATION' ? 'บันทึกการยืนยันขั้นที่ 1 แล้ว ให้ยืนยันซ้ำอีกครั้ง' : 'ตัดสิน Manual Review แล้ว'));
+    if (result.state === 'AWAITING_SECOND_CONFIRMATION') {
+      const confirmationId = sessionContext(interaction, runtime, 'ADMIN_REVIEW_CONFIRM', {
+        reviewId: session.payload.reviewId, decision, reason, principalCents: amountText ? Number(amountText) : null,
+        providerEvidence: evidence, providerTransactionId: evidence.providerTransactionId ?? null,
+      }, null, Number(result.expiresAt));
+      return replyAndBindSessions(interaction, runtime, { content: 'บันทึกการยืนยันขั้นที่ 1 แล้ว กรุณากดปุ่มเดิมภายใน 5 นาทีเพื่อยืนยันขั้นที่ 2',
+        components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('admin_review_confirm', confirmationId))
+          .setLabel('ยืนยัน Manual Review ขั้นที่ 2').setStyle(ButtonStyle.Danger))] }, [confirmationId]);
+    }
+    return interaction.reply(ephemeral('ตัดสิน Manual Review แล้ว'));
   }
   throw new QuestshopError('ROUTE_INTERACTION_INVALID', 'แบบฟอร์มนี้หมดอายุแล้ว กรุณาเริ่มใหม่');
 }

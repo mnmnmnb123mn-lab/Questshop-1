@@ -85,39 +85,43 @@ export async function acquireSingleInstanceLock(databasePath, { staleAfterMs = R
   let handle;
   let timer;
   let released = false;
-  const heartbeat = async () => {
+  const lose = (error) => {
     if (released) return;
-    const current = await readFile(lockPath, 'utf8').catch(() => null);
-    if (!current) {
-      released = true;
-      clearInterval(timer);
-      const error = Object.assign(new Error('SQLite runtime lock disappeared'), { code: 'SQLITE_SINGLE_INSTANCE_LOST' });
-      void onLost?.(error);
-      return;
+    released = true;
+    clearInterval(timer);
+    void handle?.close?.().catch(() => null);
+    void onLost?.(error);
+  };
+  const heartbeat = async () => {
+    try {
+      if (released) return;
+      const current = await readFile(lockPath, 'utf8').catch(() => null);
+      if (!current) {
+        lose(Object.assign(new Error('SQLite runtime lock disappeared'), { code: 'SQLITE_SINGLE_INSTANCE_LOST' }));
+        return;
+      }
+      let parsed;
+      try { parsed = JSON.parse(current); } catch {
+        lose(Object.assign(new Error('SQLite runtime lock became invalid'), { code: 'SQLITE_SINGLE_INSTANCE_LOST' }));
+        return;
+      }
+      if (parsed.owner !== owner) {
+        lose(Object.assign(new Error('SQLite runtime lock was replaced by another process'), { code: 'SQLITE_SINGLE_INSTANCE_LOST' }));
+        return;
+      }
+      const next = JSON.stringify({ ...parsed, heartbeatAt: nowMs() });
+      // FileHandle.writeFile() writes at the current cursor.  After a truncate
+      // that cursor may still be at the old EOF, which would corrupt the JSON
+      // lease with leading NUL bytes.  Always write the heartbeat from offset 0
+      // and truncate the old tail afterwards.
+      const bytes = Buffer.from(next, 'utf8');
+      await handle.write(bytes, 0, bytes.length, 0);
+      await handle.truncate(bytes.length);
+    } catch (cause) {
+      lose(Object.assign(new Error('SQLite runtime lock heartbeat failed'), {
+        code: 'SQLITE_SINGLE_INSTANCE_LOST', cause,
+      }));
     }
-    let parsed;
-    try { parsed = JSON.parse(current); } catch {
-      released = true;
-      clearInterval(timer);
-      const error = Object.assign(new Error('SQLite runtime lock became invalid'), { code: 'SQLITE_SINGLE_INSTANCE_LOST' });
-      void onLost?.(error);
-      return;
-    }
-    if (parsed.owner !== owner) {
-      released = true;
-      clearInterval(timer);
-      const error = Object.assign(new Error('SQLite runtime lock was replaced by another process'), { code: 'SQLITE_SINGLE_INSTANCE_LOST' });
-      void onLost?.(error);
-      return;
-    }
-    const next = JSON.stringify({ ...parsed, heartbeatAt: nowMs() });
-    // FileHandle.writeFile() writes at the current cursor.  After a truncate
-    // that cursor may still be at the old EOF, which would corrupt the JSON
-    // lease with leading NUL bytes.  Always write the heartbeat from offset 0
-    // and truncate the old tail afterwards.
-    const bytes = Buffer.from(next, 'utf8');
-    await handle.write(bytes, 0, bytes.length, 0);
-    await handle.truncate(bytes.length);
   };
   try {
     handle = await openFile(lockPath, 'wx', DATABASE_FILE_MODE);
@@ -143,10 +147,10 @@ export async function acquireSingleInstanceLock(databasePath, { staleAfterMs = R
         const stalePath = `${lockPath}.stale-${nowMs()}-${owner}`;
         try {
           await rename(lockPath, stalePath);
-          return acquireSingleInstanceLock(databasePath, { staleAfterMs });
+          return acquireSingleInstanceLock(databasePath, { staleAfterMs, onLost });
         } catch (renameError) {
           if (renameError.code !== 'ENOENT') throw renameError;
-          return acquireSingleInstanceLock(databasePath, { staleAfterMs });
+          return acquireSingleInstanceLock(databasePath, { staleAfterMs, onLost });
         }
       }
       const conflict = new Error('Another Questshop runtime already owns this SQLite database');

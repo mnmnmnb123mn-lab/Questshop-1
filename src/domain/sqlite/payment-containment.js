@@ -7,15 +7,17 @@ import { QuestshopError } from '../../shared/errors.js';
 
 const KEY = 'payment_containment';
 const CLOSED = Object.freeze({ state: 'CLOSED', stateVersion: 1, reasonCode: null, probeTopupId: null });
+export const PAYMENT_PROBE_MAX_CENTS = 2_000;
 
 function read(row) {
+  if (!row) return { ...CLOSED, state: 'OPEN', reasonCode: 'CONTAINMENT_SETTING_MISSING' };
   try {
     const value = JSON.parse(row?.value_json ?? '{}');
     if (['CLOSED', 'OPEN', 'PROBE_PENDING', 'PROBE_VERIFIED'].includes(value.state)) {
       return { ...CLOSED, ...value, stateVersion: Number(value.stateVersion) || 1 };
     }
   } catch { /* fail closed below */ }
-  return { ...CLOSED };
+  return { ...CLOSED, state: 'OPEN', reasonCode: 'CONTAINMENT_SETTING_INVALID' };
 }
 
 function save(db, value, { actorId, timestamp }) {
@@ -80,12 +82,41 @@ export function beginPaymentProbe(db, { actorId, timestamp = nowMs() }) {
   });
 }
 
+/** Reserve exactly one durable Top-up for the Owner-bound containment probe.
+ * Call only from the transaction which creates that Top-up. */
+export function reservePaymentProbeTopupInTransaction(db, { topupId, actorId, timestamp = nowMs() }) {
+  const before = currentPaymentContainment(db);
+  if (before.state !== 'PROBE_PENDING' || before.probeOwnerId !== actorId) {
+    throw new QuestshopError('PAYMENT_PROBE_STATE_INVALID', 'รายการทดสอบนี้ไม่ได้รับอนุญาต');
+  }
+  if (before.probeTopupId && before.probeTopupId !== topupId) {
+    throw new QuestshopError('PAYMENT_PROBE_ALREADY_SUBMITTED', 'มีรายการทดสอบที่กำลังตรวจอยู่แล้ว');
+  }
+  const next = { ...before, probeTopupId: topupId, probeSubmittedAt: timestamp };
+  save(db, next, { actorId, timestamp });
+  return next;
+}
+
 export function verifyPaymentProbe(db, { topupId, actorId = 'SYSTEM', timestamp = nowMs() }) {
   return withImmediateTransaction(db, () => {
     const before = currentPaymentContainment(db);
     if (before.state !== 'PROBE_PENDING') return before;
     const topup = db.prepare("SELECT * FROM topups WHERE id=? AND status='CREDITED' AND discord_user_id=?").get(topupId, before.probeOwnerId);
     if (!topup) throw new QuestshopError('PAYMENT_PROBE_NOT_CREDITED', 'รายการทดสอบยังไม่ได้รับเครดิตสำเร็จ');
+    if (before.probeTopupId !== topup.id) throw new QuestshopError('PAYMENT_PROBE_NOT_AUTHORIZED', 'รายการนี้ไม่ใช่รายการทดสอบที่ได้รับอนุญาต');
+    if (Number(topup.principal_cents) > PAYMENT_PROBE_MAX_CENTS) {
+      const next = { ...before, state: 'OPEN', stateVersion: before.stateVersion + 1,
+        reasonCode: 'PAYMENT_PROBE_AMOUNT_EXCEEDED', probeVerifiedAt: null, probeVerifiedBy: null };
+      save(db, next, { actorId, timestamp });
+      const gates = currentFeatureGates(db);
+      db.prepare(`INSERT INTO settings(key,value_json,updated_at,updated_by) VALUES('feature_gates',?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
+        .run(JSON.stringify({ ...gates, TOPUP_ACCEPTING: false, AUTO_CREDIT_ENABLED: false }), timestamp, actorId);
+      audit(db, { actorId, action: 'PAYMENT_PROBE_REJECTED_AMOUNT', reason: next.reasonCode, before, after: next, timestamp });
+      recordSystemIncidentInTransaction(db, { code: 'PAYMENT_PROBE_AMOUNT_EXCEEDED', scope: 'TRUEMONEY', severity: 'ERROR',
+        details: { topupId: topup.id, amountCents: Number(topup.principal_cents) }, timestamp });
+      return next;
+    }
     const next = { ...before, state: 'PROBE_VERIFIED', stateVersion: before.stateVersion + 1, probeTopupId: topup.id,
       probeVerifiedAt: timestamp, probeVerifiedBy: actorId };
     save(db, next, { actorId, timestamp });
@@ -99,7 +130,7 @@ export function verifyPaymentProbe(db, { topupId, actorId = 'SYSTEM', timestamp 
  * opened the explicit probe. */
 export function paymentProbeAllowsTopup(db, topupId) {
   const containment = currentPaymentContainment(db);
-  if (containment.state !== 'PROBE_PENDING' || !containment.probeOwnerId) return false;
+  if (containment.state !== 'PROBE_PENDING' || !containment.probeOwnerId || containment.probeTopupId !== topupId) return false;
   return Boolean(db.prepare('SELECT 1 FROM topups WHERE id=? AND discord_user_id=?').get(topupId, containment.probeOwnerId));
 }
 

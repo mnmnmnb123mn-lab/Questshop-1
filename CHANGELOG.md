@@ -39,6 +39,21 @@ section below is normative when its statements conflict with older migration not
 
 ### Added
 
+- SQLite schema v2 safety hardening: append-only per-step Manual Review confirmations, payment-attempt lineage,
+  Monitor/customer discovery provenance, lease-integrity triggers, and external-operation evidence that outlives
+  retained operational Jobs.
+- v2 now rebuilds constrained state tables atomically and maps v1 Top-up/Job/Item values to
+  `PAYMENT_QUEUED`, `MANUAL_REVIEW`, `WAITING_RETRY`, `WAITING_RATE_LIMIT`, and `FAILED_RELEASED`; Item capture/
+  release is trigger-checked against its immutable settlement evidence and matching Wallet movement.
+- Payment containment parsing is now health-visible fail-closed, Financial CREDIT review requires THB evidence,
+  retention writes a durable cleanup counter/incident, and Monitor Test admission has a one-active-Test-per-Quest
+  database guard after all Monitor searches have completed read-only.
+- Financial Manual Review now preserves the first Owner's sanitized decision payload and requires the same Owner to
+  confirm the exact payload again within five minutes before credit, reject, or reversal takes effect.
+- Retention now keeps operational Jobs, Quest checks and interaction-rate records for 30 days and non-financial
+  delivered Discord projections for 90 days; each purge category is isolated so an integrity constraint cannot roll
+  back the whole maintenance pass.
+
 - `LOG_QUEST_OPERATIONS`, `LOG_ADMIN` and `LOG_SYSTEM` now attach the verified shared
   `backoffice-log-banner.webp` beneath every event card. `LOG_SYSTEM` and system-authored Admin Audit cards use the
   verified animated Questshop GIF thumbnail; operational cards use safe Quest artwork or global Discord avatars.
@@ -96,6 +111,11 @@ section below is normative when its statements conflict with older migration not
   evidence and the Administrator decision without retaining the customer Token.
 
 ### Changed
+
+- Checkout interactions use the durable discovery Job ID (not the credential ID); expired or unknown-expiry Quests
+  cannot enter quote, checkout, Monitor Test, or announcement work.
+- Monitor scans now enqueue monitor-origin discovery with durable provenance and select one deterministic eligible
+  Monitor for a mutation test; public `quest-new` remains gated on a verified test result or audited Owner action.
 
 - Customer voucher submission now starts a targeted post-commit settlement attempt immediately instead of waiting for
   the next payment-worker tick and waits only about eight seconds in the same ephemeral window. The target lease cannot

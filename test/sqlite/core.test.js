@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -8,18 +8,18 @@ import { setImmediate as nextTurn, setTimeout as sleep } from 'node:timers/promi
 import { acquireSingleInstanceLock, closeSqliteDatabase, configureSecretVerifier, fullIntegrityCheck, openSqliteDatabase, quickIntegrityCheck, withImmediateTransaction } from '../../src/db/sqlite.js';
 import { migrateSqlite } from '../../src/db/sqlite-migrations.js';
 import { appendWalletTransaction } from '../../src/domain/sqlite/wallet.js';
-import { creditRedeemedTopup, creditVerifiedTopup, recordRedeemedTopup, resolveTopupFinancialReview, reverseCreditedTopup, submitTopup, markTopupProcessing, moveTopupToReview, failTopup } from '../../src/domain/sqlite/payments.js';
+import { beginPaymentAttempt, creditRedeemedTopup, creditVerifiedTopup, recordRedeemedTopup, recordTopupNotSent, resolveTopupFinancialReview, reverseCreditedTopup, submitTopup, markTopupProcessing, moveTopupToReview, failTopup } from '../../src/domain/sqlite/payments.js';
 import { createOrder, resolveOrderItemReview, settleOrderItem } from '../../src/domain/sqlite/orders.js';
 import { claimDueNotification, enqueueNotification, finishNotificationDelivery } from '../../src/domain/sqlite/notifications.js';
 import { createRotatedSqliteBackup, replaceDatabaseFromBackup } from '../../src/db/sqlite-backup.js';
-import { parseBahtToCents, percentageBonusHalfUp } from '../../src/shared/money.js';
+import { formatCents, parseBahtToCents, percentageBonusHalfUp, sumCents } from '../../src/shared/money.js';
 import { decryptCredential, encryptCredential, voucherHmac, voucherIdentityHmac } from '../../src/domain/sqlite/crypto.js';
-import { claimDueJob, completeJob, enqueueJob, markJobPossiblySent, recordQuestVerifiedResult, recoverInterruptedJobs, renewJobLease, updateRunningJobPayload } from '../../src/domain/sqlite/jobs.js';
+import { appendExternalOperationEvidenceInTransaction, claimDueJob, completeJob, enqueueJob, markJobPossiblySent, recordQuestVerifiedResult, recoverInterruptedJobs, renewJobLease, updateRunningJobPayload } from '../../src/domain/sqlite/jobs.js';
 import { processQuestWorkflowJob } from '../../src/domain/sqlite/quest-workflow.js';
-import { deliverNotification, processPaymentJob, recoverInterruptedSubjects, refreshOperationalHealth } from '../../src/workers/sqlite-worker-manager.js';
+import { deliverNotification, processNonPaymentJob, processPaymentJob, recoverInterruptedSubjects, refreshOperationalHealth, runRetentionCleanup, runRetentionMaintenance } from '../../src/workers/sqlite-worker-manager.js';
 import { setupSurface, surfaceNonce, updateOrCreateSurfaceAnchor } from '../../src/discord/surfaces/setup.js';
 import { bindInteractionSessionMessage, consumeInteractionSession, consumeModalInteractionSession, createInteractionSession } from '../../src/domain/sqlite/interaction-sessions.js';
-import { adjustWallet, adminOverview, checkAllMonitorHealth, checkMonitorHealth, configureReceiverPhone, queueMonitorScanAndTest, retryNotificationDlq, setQuestPrice, upsertMonitorAccount, upsertPromotion } from '../../src/domain/sqlite/admin.js';
+import { adjustWallet, adminOverview, checkAllMonitorHealth, checkMonitorHealth, configureReceiverPhone, queueMonitorScanAndTest, resolveOperationalReview, retryNotificationDlq, setQuestPrice, upsertMonitorAccount, upsertPromotion } from '../../src/domain/sqlite/admin.js';
 import { loadRuntimeConfig } from '../../src/config/runtime-config.js';
 import { recomputeHealthStatus } from '../../src/bootstrap/health-status.js';
 import { renderQuestAuto } from '../../src/discord/renderers/surfaces.js';
@@ -37,7 +37,12 @@ import { desktopExecutor } from '../../src/quest-engine/executors/desktop.js';
 import { EXTERNAL_OUTCOME, externalOutcome } from '../../src/domain/sqlite/external-outcome.js';
 import { consumeInteractionRateLimit } from '../../src/domain/sqlite/interaction-rate-limits.js';
 import { recordSystemIncident } from '../../src/domain/sqlite/incidents.js';
-import { beginPaymentProbe, closePaymentContainment, currentPaymentContainment, openPaymentContainment, verifyPaymentProbe } from '../../src/domain/sqlite/payment-containment.js';
+import { beginPaymentProbe, closePaymentContainment, currentPaymentContainment, openPaymentContainment, paymentProbeAllowsTopup, verifyPaymentProbe } from '../../src/domain/sqlite/payment-containment.js';
+import { routeInteraction } from '../../src/discord/interactions/router.js';
+import { announceCustomerDiscovery, retryCustomerDiscovery } from '../../src/domain/sqlite/discovery.js';
+import { createLogger } from '../../src/shared/logger.js';
+import { redact, redactText, safeError, serializeError } from '../../src/shared/redaction.js';
+import { runWorkerLoop } from '../../src/workers/loop.js';
 
 const secret = 'sqlite-test-secret-key-which-is-at-least-32-characters';
 
@@ -52,12 +57,103 @@ async function database() {
 test('SQLite migration creates strict financial schema and append-only audit', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const tables = fixture.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'").get();
-  assert.equal(Number(tables.count), 21);
+  assert.equal(Number(tables.count), 22);
   assert.equal(fullIntegrityCheck(fixture.db).ok, true);
   appendWalletTransaction(fixture.db, { discordUserId: 'customer-a', transactionType: 'TOPUP', availableDeltaCents: 500,
     referenceType: 'TEST', referenceId: 'one', idempotencyKey: 'append-only-one', traceId: randomUUID() });
   assert.throws(() => fixture.db.prepare('DELETE FROM wallet_transactions').run(), /append-only/);
   assert.ok(fixture.db.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='external_operation_evidence_append_only_update'").get());
+});
+
+test('a populated v1 SQLite database upgrades through only migration v2 without losing its rows', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'questshop-v1-upgrade-'));
+  const databasePath = path.join(directory, 'questshop.db');
+  const db = await openSqliteDatabase({ databasePath, secret });
+  t.after(async () => { closeSqliteDatabase(db); await rm(directory, { recursive: true, force: true }); });
+  db.exec(await readFile(path.resolve('migrations/sqlite/0001_initial.sql'), 'utf8'));
+  configureSecretVerifier(db, secret);
+  db.exec('PRAGMA user_version=1');
+  const timestamp = Date.now();
+  db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?)`).run('v1-quest', 'ข้อมูลเดิม', 'WATCH_VIDEO', 'https://discord.com/quests/v1-quest', 'CUSTOMER', timestamp, timestamp, timestamp);
+  db.prepare(`INSERT INTO topups(id,discord_user_id,voucher_hmac_version,voucher_identity_hmac,voucher_hmac,status,trace_id,created_at,updated_at)
+    VALUES(?,?, 'v1', ?, ?, 'PENDING',?,?,?)`).run('v1-topup', 'v1-user', Buffer.from('identity-v1'), Buffer.from('voucher-v1'), 'v1-trace', timestamp, timestamp);
+  db.prepare(`INSERT INTO jobs(id,job_type,subject_type,subject_id,operation_key,state,checkpoint,next_run_at,created_at,updated_at)
+    VALUES(?,?,? ,?,?,'RETRY_WAIT','NOT_STARTED',?,?,?)`).run('v1-job', 'TEST', 'TOPUP', 'v1-topup', 'v1-job-key', timestamp, timestamp, timestamp);
+  db.prepare(`INSERT INTO orders(id,discord_user_id,quest_account_id,state,total_cents,trace_id,created_at,updated_at)
+    VALUES(?,?,?,'PENDING',?,?,?,?)`).run('v1-order', 'v1-user', 'v1-account', 100, 'v1-order-trace', timestamp, timestamp);
+  db.prepare(`INSERT INTO order_items(id,order_id,quest_id,state,price_cents,reserved_at,updated_at)
+    VALUES(?,?,?,'FAILED',?,?,?)`).run('v1-item', 'v1-order', 'v1-quest', 100, timestamp, timestamp);
+  const result = await migrateSqlite({ db, directory: path.resolve('migrations/sqlite'), secret, backup: async () => {} });
+  assert.deepEqual(result, { from: 1, to: 2 });
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
+  assert.equal(db.prepare('SELECT name FROM quests WHERE quest_id=?').get('v1-quest').name, 'ข้อมูลเดิม');
+  assert.equal(Number(db.prepare('SELECT discovered_by_customer FROM quests WHERE quest_id=?').get('v1-quest').discovered_by_customer), 1);
+  assert.equal(db.prepare("SELECT status FROM topups WHERE id='v1-topup'").get().status, 'PAYMENT_QUEUED');
+  assert.equal(db.prepare("SELECT state FROM jobs WHERE id='v1-job'").get().state, 'WAITING_RETRY');
+  assert.equal(db.prepare("SELECT state FROM order_items WHERE id='v1-item'").get().state, 'FAILED_RELEASED');
+});
+
+test('v2 preflight refuses inconsistent financial v1 rows without changing schema version', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'questshop-v1-invalid-'));
+  const databasePath = path.join(directory, 'questshop.db');
+  const db = await openSqliteDatabase({ databasePath, secret });
+  t.after(async () => { closeSqliteDatabase(db); await rm(directory, { recursive: true, force: true }); });
+  db.exec(await readFile(path.resolve('migrations/sqlite/0001_initial.sql'), 'utf8'));
+  configureSecretVerifier(db, secret); db.exec('PRAGMA user_version=1');
+  const now = Date.now();
+  db.prepare(`INSERT INTO topups(id,discord_user_id,voucher_hmac_version,voucher_identity_hmac,voucher_hmac,status,trace_id,created_at,updated_at)
+    VALUES(?,?, 'v1', ?, ?, 'CREDITED',?,?,?)`).run('invalid-credit', 'user', Buffer.from('invalid-identity'), Buffer.from('invalid-voucher'), 'trace', now, now);
+  await assert.rejects(() => migrateSqlite({ db, directory: path.resolve('migrations/sqlite'), secret, backup: async () => {} }),
+    (error) => error.code === 'SQLITE_MIGRATION_FINANCIAL_INVARIANT');
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 1);
+});
+
+test('customer storefront buttons create server-bound token and voucher modal sessions', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const timestamp = Date.now();
+  fixture.db.prepare("INSERT INTO settings(key,value_json,updated_at,updated_by) VALUES('feature_gates',?,?,?)")
+    .run(JSON.stringify({ STORE_OPEN: true, CUSTOMER_INTERACTIONS_ENABLED: true, ORDER_ACCEPTING: true, TOPUP_ACCEPTING: true }), timestamp, 'test');
+  fixture.db.prepare("INSERT INTO settings(key,value_json,updated_at,updated_by) VALUES('runtime_config',?,?,?)").run(JSON.stringify({ priceRules: {
+    WATCH_VIDEO: { amountCents: 100 }, WATCH_VIDEO_ON_MOBILE: { amountCents: 100 }, PLAY_ON_DESKTOP: { amountCents: 100 }, PLAY_ON_DESKTOP_V2: { amountCents: 100 },
+  } }), timestamp, 'test');
+  const customerId = '12345678901234567';
+  appendWalletTransaction(fixture.db, { discordUserId: customerId, transactionType: 'TOPUP', availableDeltaCents: 500,
+    referenceType: 'TEST', referenceId: 'button-funding', idempotencyKey: 'button-funding', traceId: randomUUID() });
+  const topupCustomerId = '12345678901234568';
+  appendWalletTransaction(fixture.db, { discordUserId: topupCustomerId, transactionType: 'TOPUP', availableDeltaCents: 500,
+    referenceType: 'TEST', referenceId: 'topup-button-funding', idempotencyKey: 'topup-button-funding', traceId: randomUUID() });
+  const warnings = [];
+  const runtime = { acceptingInteractions: true, db: fixture.db, env: { DISCORD_GUILD_ID: 'guild', OWNER_ID: 'owner', QUESTSHOP_SECRET_KEY: secret },
+    config: { surfaces: { QUEST_AUTO: { channelId: 'channel', messageId: 'surface-message' } } }, logger: { warn: (entry) => warnings.push(entry) }, client: { guilds: { fetch: async () => null } } };
+  const modalIds = [];
+  const replies = [];
+  const interactionFor = (route, userId = customerId) => ({ client: { questshop: runtime }, customId: customId(route, randomUUID()), guildId: 'guild', channelId: 'channel',
+    message: { id: 'surface-message' }, user: { id: userId }, inGuild: () => true, isButton: () => true,
+    isChatInputCommand: () => false, isStringSelectMenu: () => false, isModalSubmit: () => false,
+    showModal: async (modal) => { modalIds.push(modal.data.custom_id); }, reply: async (payload) => { replies.push(payload); } });
+  await routeInteraction(interactionFor('start'));
+  await routeInteraction(interactionFor('topup', topupCustomerId));
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(replies, []);
+  assert.equal(modalIds.length, 2);
+  assert.equal(fixture.db.prepare("SELECT count(*) AS count FROM interaction_sessions WHERE operation IN ('TOKEN_SUBMIT','VOUCHER_SUBMIT')").get().count, 2);
+  const tokenEdits = [];
+  const tokenSubmit = { client: { questshop: runtime }, customId: modalIds[0], guildId: 'guild', channelId: 'channel', user: { id: customerId },
+    inGuild: () => true, isButton: () => false, isChatInputCommand: () => false, isStringSelectMenu: () => false, isModalSubmit: () => true,
+    fields: { getTextInputValue: () => 'customer-token-for-ephemeral-discovery-only' }, deferReply: async () => {},
+    editReply: async (payload) => { tokenEdits.push(payload); }, fetchReply: async () => ({ id: 'token-progress-message' }), reply: async () => {} };
+  await routeInteraction(tokenSubmit);
+  assert.equal(tokenEdits.length, 1);
+  assert.equal(fixture.db.prepare("SELECT count(*) AS count FROM jobs WHERE job_type='CUSTOMER_QUEST_DISCOVERY'").get().count, 1);
+  const voucherEdits = [];
+  const voucherSubmit = { client: { questshop: runtime }, customId: modalIds[1], guildId: 'guild', channelId: 'channel', user: { id: topupCustomerId },
+    inGuild: () => true, isButton: () => false, isChatInputCommand: () => false, isStringSelectMenu: () => false, isModalSubmit: () => true,
+    fields: { getTextInputValue: () => 'https://gift.truemoney.com/campaign/?v=6123456789abcdef0123456789abcdef01' }, deferReply: async () => {},
+    editReply: async (payload) => { voucherEdits.push(payload); }, reply: async () => {} };
+  await routeInteraction(voucherSubmit);
+  assert.equal(voucherEdits.length, 1);
+  assert.equal(fixture.db.prepare('SELECT count(*) AS count FROM topups WHERE discord_user_id=?').get(topupCustomerId).count, 1);
 });
 
 test('customer mutation limits survive restart in SQLite', async (t) => {
@@ -66,6 +162,96 @@ test('customer mutation limits survive restart in SQLite', async (t) => {
   assert.throws(() => consumeInteractionRateLimit(fixture.db, { discordUserId: '12345678901234567', action: 'ORDER_CONFIRM', limit: 1, windowMs: 600_000, timestamp: 1_001 }),
     (error) => error.code === 'INTERACTION_RATE_LIMITED');
   assert.equal(consumeInteractionRateLimit(fixture.db, { discordUserId: '12345678901234567', action: 'ORDER_CONFIRM', limit: 1, windowMs: 600_000, timestamp: 601_000 }).remaining, 0);
+  assert.throws(() => consumeInteractionRateLimit(fixture.db, { discordUserId: 'x', action: 'bad', limit: 0, windowMs: 0 }), TypeError);
+});
+
+test('shared formatting and logger redact both structured fields and free text', () => {
+  assert.equal(formatCents(-123n), '-1.23');
+  assert.equal(formatCents(123n), '1.23');
+  assert.throws(() => parseBahtToCents('90000000000000.01'), RangeError);
+  assert.throws(() => parseBahtToCents('01.00'), TypeError);
+  assert.equal(sumCents([1, '2', 3n]), 6n);
+  assert.equal(percentageBonusHalfUp(101, 500), 5n);
+  assert.throws(() => percentageBonusHalfUp(-1, 1), RangeError);
+  const lines = [];
+  const logger = createLogger({ token: 'must-not-leak' }, { write: (line) => lines.push(String(line)) });
+  logger.info({ cookie: 'must-not-leak' }, 'token=must-not-leak');
+  logger.warn(null, { message: 'object message' });
+  logger.child({ password: 'must-not-leak' }).error({}, 'safe');
+  assert.equal(lines.length, 3);
+  assert.ok(lines.every((line) => !line.includes('must-not-leak')));
+});
+
+test('redaction handles circular data and bounded causal errors without secrets', () => {
+  const circular = { nested: { access_token: 'must-not-leak' } }; circular.self = circular;
+  const redacted = redact(circular);
+  assert.equal(redacted.nested.access_token, '[REDACTED]');
+  assert.equal(redacted.self, '[CIRCULAR]');
+  assert.match(redactText('cookie=must-not-leak https://gift.truemoney.com/campaign/?v=1234567890abcdef'), /\[REDACTED\]/);
+  const root = new Error('database_url=postgres://user:pass@example.test/db');
+  root.code = 'ROOT'; root.cause = { not: 'an Error' };
+  assert.equal(serializeError(root).cause.code, 'NON_ERROR_CAUSE');
+  const primitiveCause = new Error('x'); primitiveCause.cause = 42;
+  assert.equal(serializeError(primitiveCause).cause.code, 'NON_ERROR_CAUSE');
+  const cyclicError = new Error('x'); cyclicError.cause = cyclicError;
+  assert.equal(serializeError(cyclicError).cause.code, 'CIRCULAR_CAUSE');
+  const deep = new Error('0'); deep.cause = new Error('1'); deep.cause.cause = new Error('2'); deep.cause.cause.cause = new Error('3'); deep.cause.cause.cause.cause = new Error('4');
+  assert.equal(serializeError(deep).cause.cause.cause.cause.code, 'CAUSE_DEPTH_LIMIT');
+  assert.equal(redact([new Error('token=must-not-leak'), null])[1], null);
+  assert.match(serializeError({ name: null, message: 'x'.repeat(1_001), code: null }).message, /\[TRUNCATED\]$/);
+  const alreadySeen = new WeakSet([root]);
+  assert.equal(serializeError(root, { seen: alreadySeen }).code, 'CIRCULAR_ERROR');
+  assert.equal(safeError(null).code, 'UNKNOWN');
+});
+
+test('generic worker loop records a failed iteration then stops on requested shutdown', async () => {
+  const controller = new AbortController();
+  const health = { workers: {} };
+  let errors = 0;
+  await runWorkerLoop({ name: 'coverage', signal: controller.signal, health,
+    logger: { error: () => { errors += 1; } }, runOnce: async () => { throw new Error('expected'); },
+    onIteration: async () => { controller.abort('test done'); }, sleep: async () => {} });
+  assert.equal(errors, 1);
+  assert.equal(health.workers.coverage.state, 'STOPPED');
+  assert.equal(health.workers.coverage.failures, 1);
+});
+
+test('generic worker loop records completed work even when its observer fails', async () => {
+  const controller = new AbortController();
+  const health = { workers: {} };
+  await runWorkerLoop({ name: 'completed', signal: controller.signal, health, logger: { error() {} },
+    runOnce: async () => { controller.abort('done'); return true; }, onIteration: async () => { throw new Error('observer'); }, sleep: async () => {} });
+  assert.equal(health.workers.completed.state, 'STOPPED');
+  assert.equal(health.workers.completed.consecutiveFailures, 0);
+});
+
+test('generic worker loop takes its idle path when no work is due', async () => {
+  const controller = new AbortController();
+  const health = { workers: {} };
+  let slept = 0;
+  await runWorkerLoop({ name: 'idle', signal: controller.signal, health, logger: { error() {} },
+    runOnce: async () => { controller.abort('done'); return false; }, sleep: async () => { slept += 1; } });
+  assert.equal(slept, 1);
+  assert.equal(health.workers.idle.state, 'STOPPED');
+});
+
+test('Admin discovery retry and announcement are expiry, version, and duplicate safe', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const now = Date.now();
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,starts_at,expires_at,source,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?)`).run('admin-discovery', 'ตรวจแอดมิน', 'WATCH_VIDEO', 'https://discord.com/quests/admin-discovery', now - 1, now + 60_000, 'CUSTOMER', now, now, now);
+  const notification = enqueueNotification(fixture.db, { notificationType: 'CUSTOMER_QUEST_DISCOVERY', aggregateType: 'QUEST',
+    aggregateId: 'admin-discovery', destination: 'LOG_QUEST_OPERATIONS' });
+  assert.equal(retryCustomerDiscovery(fixture.db, { notificationId: notification.id, actorId: 'owner' }).queued, true);
+  assert.equal(retryCustomerDiscovery(fixture.db, { notificationId: notification.id, actorId: 'owner' }).queued, false);
+  const quest = fixture.db.prepare("SELECT * FROM quests WHERE quest_id='admin-discovery'").get();
+  assert.throws(() => announceCustomerDiscovery(fixture.db, { notificationId: notification.id, actorId: 'owner', expectedQuestVersion: quest.state_version + 1 }),
+    (error) => error.code === 'INTERACTION_CONFLICT');
+  assert.equal(announceCustomerDiscovery(fixture.db, { notificationId: notification.id, actorId: 'owner', expectedQuestVersion: quest.state_version }).queued, true);
+  assert.equal(announceCustomerDiscovery(fixture.db, { notificationId: notification.id, actorId: 'owner' }).queued, false);
+  fixture.db.prepare("UPDATE quests SET expires_at=? WHERE quest_id='admin-discovery'").run(now - 1);
+  assert.throws(() => retryCustomerDiscovery(fixture.db, { notificationId: notification.id, actorId: 'owner' }), (error) => error.code === 'QUEST_EXPIRED');
+  assert.throws(() => retryCustomerDiscovery(fixture.db, { notificationId: 'missing', actorId: 'owner' }), (error) => error.code === 'DISCOVERY_CASE_NOT_FOUND');
 });
 
 test('operational incidents reuse one durable system notification', async (t) => {
@@ -78,21 +264,34 @@ test('operational incidents reuse one durable system notification', async (t) =>
 
 test('payment containment closes automation durably and needs a verified probe before reopening', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
+  assert.throws(() => beginPaymentProbe(fixture.db, { actorId: 'owner' }), (error) => error.code === 'PAYMENT_PROBE_STATE_INVALID');
+  assert.equal(paymentProbeAllowsTopup(fixture.db, 'missing'), false);
+  assert.equal(verifyPaymentProbe(fixture.db, { topupId: 'missing', actorId: 'owner' }).state, 'CLOSED');
   const opened = openPaymentContainment(fixture.db, { reasonCode: 'PROVIDER_SUCCESS_SCHEMA_UNCERTAIN' });
   assert.equal(opened.containment.state, 'OPEN');
   assert.equal(opened.gates.TOPUP_ACCEPTING, false);
   assert.equal(opened.gates.AUTO_CREDIT_ENABLED, false);
   assert.equal(openPaymentContainment(fixture.db, { reasonCode: 'PROVIDER_SUCCESS_SCHEMA_UNCERTAIN' }).idempotent, true);
   beginPaymentProbe(fixture.db, { actorId: 'owner' });
+  assert.equal(paymentProbeAllowsTopup(fixture.db, 'missing'), false);
   assert.throws(() => closePaymentContainment(fixture.db, { actorId: 'owner' }), (error) => error.code === 'PAYMENT_PROBE_REQUIRED');
   assert.throws(() => submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'not-owner',
     voucherUrl: 'https://gift.truemoney.com/campaign/?v=b123456789abcdef0123456789abcdef01' }), (error) => error.code === 'PAYMENT_CONTAINMENT_OPEN');
   const topup = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'owner',
     voucherUrl: 'https://gift.truemoney.com/campaign/?v=b123456789abcdef0123456789abcdef01', paymentProbe: true }).topup;
+  assert.equal(paymentProbeAllowsTopup(fixture.db, topup.id), true);
   creditVerifiedTopup(fixture.db, { topupId: topup.id, principalCents: 100 });
   assert.equal(verifyPaymentProbe(fixture.db, { topupId: topup.id, actorId: 'owner' }).state, 'PROBE_VERIFIED');
   assert.equal(closePaymentContainment(fixture.db, { actorId: 'owner' }).state, 'CLOSED');
   assert.equal(currentPaymentContainment(fixture.db).state, 'CLOSED');
+  openPaymentContainment(fixture.db, { reasonCode: 'SECOND_PROBE' });
+  beginPaymentProbe(fixture.db, { actorId: 'owner' });
+  const oversizedProbe = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'owner', paymentProbe: true,
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=d123456789abcdef0123456789abcdef01' }).topup;
+  creditVerifiedTopup(fixture.db, { topupId: oversizedProbe.id, principalCents: 2_500 });
+  assert.equal(verifyPaymentProbe(fixture.db, { topupId: oversizedProbe.id, actorId: 'owner' }).state, 'OPEN');
+  assert.equal(currentFeatureGates(fixture.db).TOPUP_ACCEPTING, false);
+  assert.ok(fixture.db.prepare("SELECT 1 FROM notifications WHERE notification_type='SYSTEM_LOG' AND aggregate_type='INCIDENT'").get());
 });
 
 test('external outcome and surface fallbacks reject unsafe data without changing customer contracts', () => {
@@ -158,7 +357,7 @@ test('REDEEMED is a durable boundary and restart recovery can credit it exactly 
     voucherUrl: 'https://gift.truemoney.com/campaign/?v=2123456789abcdef0123456789abcdef01' }).topup;
   markTopupProcessing(fixture.db, topup.id);
   const redeemed = recordRedeemedTopup(fixture.db, { topupId: topup.id, principalCents: 2_500,
-    providerEvidence: { httpStatus: 200, providerCode: 'SUCCESS', receiverConfirmation: 'REQUEST_BOUND_SUCCESS' } });
+    providerEvidence: { httpStatus: 200, providerCode: 'SUCCESS', currency: 'THB', receiverConfirmation: 'REQUEST_BOUND_SUCCESS' } });
   assert.equal(redeemed.topup.status, 'REDEEMED');
   assert.equal(fixture.db.prepare('SELECT count(*) AS count FROM wallet_transactions WHERE reference_id=?').get(topup.id).count, 0);
   const firstCredit = creditRedeemedTopup(fixture.db, { topupId: topup.id });
@@ -177,14 +376,44 @@ test('financial review requires two confirmations and credits only with complete
   markTopupProcessing(fixture.db, topup.id);
   moveTopupToReview(fixture.db, { topupId: topup.id, reasonCode: 'AMBIGUOUS', safeReason: 'ต้องตรวจหลักฐาน' });
   const review = fixture.db.prepare("SELECT * FROM manual_reviews WHERE subject_id=? AND state='OPEN'").get(topup.id);
-  assert.equal(resolveTopupFinancialReview(fixture.db, { reviewId: review.id, actorId: 'owner', decision: 'CREDIT' }).state,
-    'AWAITING_SECOND_CONFIRMATION');
-  assert.throws(() => resolveTopupFinancialReview(fixture.db, { reviewId: review.id, actorId: 'owner', decision: 'CREDIT', principalCents: 500,
-    providerEvidence: { httpStatus: 200, providerCode: 'SUCCESS' } }), (error) => error.code === 'REVIEW_EVIDENCE_INCOMPLETE');
-  const credited = resolveTopupFinancialReview(fixture.db, { reviewId: review.id, actorId: 'owner', decision: 'CREDIT', principalCents: 500,
-    providerEvidence: { httpStatus: 200, providerCode: 'SUCCESS', receiverConfirmation: 'REQUEST_BOUND_SUCCESS', receiverLast4: '1234' } });
+  const confirmation = { reviewId: review.id, actorId: 'owner', decision: 'CREDIT', principalCents: 500,
+    providerEvidence: { httpStatus: 200, providerCode: 'SUCCESS' } };
+  assert.throws(() => resolveTopupFinancialReview(fixture.db, confirmation), (error) => error.code === 'REVIEW_EVIDENCE_INCOMPLETE');
+  confirmation.providerEvidence = { httpStatus: 200, providerCode: 'SUCCESS', currency: 'THB', receiverConfirmation: 'REQUEST_BOUND_SUCCESS', receiverLast4: '1234' };
+  assert.equal(resolveTopupFinancialReview(fixture.db, confirmation).state, 'AWAITING_SECOND_CONFIRMATION');
+  const credited = resolveTopupFinancialReview(fixture.db, confirmation);
   assert.equal(credited.status, 'CREDITED');
   assert.equal(fixture.db.prepare('SELECT state FROM manual_reviews WHERE id=?').get(review.id).state, 'RESOLVED_SUCCESS');
+});
+
+test('payment processing transition and first durable attempt are one idempotent transaction boundary', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const topup = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'attempt-owner',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=5123456789abcdef0123456789abcdef01' }).topup;
+  const job = claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' });
+  const first = beginPaymentAttempt(fixture.db, { topupId: topup.id, workerJob: { jobId: job.id, leaseToken: job.lease_token } });
+  assert.equal(first.topup.status, 'PROCESSING');
+  assert.equal(first.attempt.attempt_number, 1);
+  assert.equal(fixture.db.prepare('SELECT checkpoint FROM jobs WHERE id=?').get(job.id).checkpoint, 'INTENT_RECORDED');
+  const same = beginPaymentAttempt(fixture.db, { topupId: topup.id, workerJob: { jobId: job.id, leaseToken: job.lease_token } });
+  assert.equal(same.idempotent, true);
+  assert.equal(same.attempt.id, first.attempt.id);
+  assert.equal(fixture.db.prepare('SELECT count(*) AS count FROM payment_attempts WHERE topup_id=?').get(topup.id).count, 1);
+});
+
+test('a proven-unsent payment intent closes before a parent-linked retry is admitted', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const topup = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'retry-lineage',
+    voucherUrl: 'https://gift.truemoney.com/campaign/?v=9123456789abcdef0123456789abcdef02' }).topup;
+  const firstJob = claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' });
+  const first = beginPaymentAttempt(fixture.db, { topupId: topup.id, workerJob: { jobId: firstJob.id, leaseToken: firstJob.lease_token } }).attempt;
+  recordTopupNotSent(fixture.db, { topupId: topup.id, attemptId: first.id, reasonCode: 'PROVIDER_NOT_SENT',
+    workerJob: { jobId: firstJob.id, leaseToken: firstJob.lease_token } });
+  completeJob(fixture.db, { jobId: firstJob.id, leaseToken: firstJob.lease_token, retryAt: 0, errorCode: 'PROVIDER_NOT_SENT' });
+  const retryJob = claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE', now: Date.now() });
+  const retry = beginPaymentAttempt(fixture.db, { topupId: topup.id, workerJob: { jobId: retryJob.id, leaseToken: retryJob.lease_token } }).attempt;
+  assert.deepEqual([first.attempt_number, first.dispatch_state, retry.attempt_number, retry.parent_attempt_id], [1, 'INTENT_RECORDED', 2, first.id]);
+  assert.equal(fixture.db.prepare('SELECT dispatch_state FROM payment_attempts WHERE id=?').get(first.id).dispatch_state, 'CONFIRMED_NOT_SENT');
 });
 
 test('promotion snapshots, rejected reviews, and insufficient reversals retain the correct financial state', async (t) => {
@@ -332,14 +561,14 @@ test('customer Quest discovery persists safe metadata, an ephemeral-ready sessio
 test('Monitor search and test use only matching active account credentials', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const now = Date.now();
-  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,first_seen_at,last_seen_at,updated_at)
-    VALUES(?,?,?,?,?,?,?,?)`).run('monitor-quest', 'Quest Monitor', 'WATCH_VIDEO', 'https://discord.com/quests/monitor-quest', 'CUSTOMER', now, now, now);
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,expires_at,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run('monitor-quest', 'Quest Monitor', 'WATCH_VIDEO', 'https://discord.com/quests/monitor-quest', 'CUSTOMER', now + 60_000, now, now, now);
   const credentialId = randomUUID();
   const sealed = encryptCredential(secret, 'monitor-token');
   fixture.db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
     VALUES(?,?,?,'MONITOR_TOKEN','PERSISTENT',?,?,?,?,?)`).run(credentialId, 'MONITOR', 'monitor-account', sealed.ciphertext, sealed.nonce, sealed.authTag, now, now);
-  fixture.db.prepare(`INSERT INTO monitor_accounts(account_id,label,state,credential_id,updated_at) VALUES(?,?,?,?,?)`)
-    .run('monitor-account', 'บัญชีทดสอบ', 'ACTIVE', credentialId, now);
+  fixture.db.prepare(`INSERT INTO monitor_accounts(account_id,label,state,credential_id,health_state,updated_at) VALUES(?,?,?,?,?,?)`)
+    .run('monitor-account', 'บัญชีทดสอบ', 'ACTIVE', credentialId, 'READY', now);
   const runtime = { db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret, RUNNER_CONCURRENCY: 1 }, abortController: new AbortController(),
     questApiFactory: ({ token }) => ({
       fetchCurrentUser: async () => ({ id: token === 'monitor-token' ? 'monitor-account' : 'wrong' }),
@@ -356,14 +585,14 @@ test('Monitor search and test use only matching active account credentials', asy
 test('Monitor test does not pass a Quest completed before its own mutation', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const now = Date.now();
-  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,first_seen_at,last_seen_at,updated_at)
-    VALUES(?,?,?,?,?,?,?,?)`).run('ready-quest', 'Quest ready', 'WATCH_VIDEO', 'https://discord.com/quests/ready-quest', 'CUSTOMER', now, now, now);
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,expires_at,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run('ready-quest', 'Quest ready', 'WATCH_VIDEO', 'https://discord.com/quests/ready-quest', 'CUSTOMER', now + 60_000, now, now, now);
   const credentialId = randomUUID();
   const sealed = encryptCredential(secret, 'monitor-ready-token');
   fixture.db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
     VALUES(?,?,?,'MONITOR_TOKEN','PERSISTENT',?,?,?,?,?)`).run(credentialId, 'MONITOR', 'ready-monitor', sealed.ciphertext, sealed.nonce, sealed.authTag, now, now);
-  fixture.db.prepare('INSERT INTO monitor_accounts(account_id,label,state,credential_id,updated_at) VALUES(?,?,?,?,?)')
-    .run('ready-monitor', 'พร้อมทดสอบ', 'ACTIVE', credentialId, now);
+  fixture.db.prepare('INSERT INTO monitor_accounts(account_id,label,state,credential_id,health_state,updated_at) VALUES(?,?,?,?,?,?)')
+    .run('ready-monitor', 'พร้อมทดสอบ', 'ACTIVE', credentialId, 'READY', now);
   let reads = 0;
   const runtime = { db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret, RUNNER_CONCURRENCY: 1 }, abortController: new AbortController(),
     questApiFactory: () => ({ fetchCurrentUser: async () => ({ id: 'ready-monitor' }), fetchQuests: async () => [{
@@ -378,11 +607,41 @@ test('Monitor test does not pass a Quest completed before its own mutation', asy
   assert.equal(fixture.db.prepare("SELECT state FROM quest_checks WHERE check_type='TEST'").get().state, 'FAILED');
 });
 
+test('Monitor Test falls back to the next read-verified account only after a definite pre-mutation failure', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const now = Date.now();
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,expires_at,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run('fallback-quest', 'Fallback', 'WATCH_VIDEO', 'https://discord.com/quests/fallback', 'CUSTOMER', now + 60_000, now, now, now);
+  for (const accountId of ['fallback-a', 'fallback-b']) {
+    const credentialId = randomUUID(); const sealed = encryptCredential(secret, `${accountId}-token`);
+    fixture.db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
+      VALUES(?,?,?,'MONITOR_TOKEN','PERSISTENT',?,?,?,?,?)`).run(credentialId, 'MONITOR', accountId, sealed.ciphertext, sealed.nonce, sealed.authTag, now, now);
+    fixture.db.prepare('INSERT INTO monitor_accounts(account_id,label,state,credential_id,health_state,updated_at) VALUES(?,?,?,?,?,?)')
+      .run(accountId, accountId, 'ACTIVE', credentialId, 'READY', now);
+  }
+  const reads = new Map();
+  const runtime = { db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret }, abortController: new AbortController(), questApiFactory: ({ token }) => {
+    const accountId = token.replace('-token', '');
+    return { fetchCurrentUser: async () => ({ id: accountId }), fetchQuests: async () => {
+      const count = (reads.get(accountId) ?? 0) + 1; reads.set(accountId, count);
+      return [{ id: 'fallback-quest', name: 'Fallback', eventName: 'WATCH_VIDEO', url: 'https://discord.com/quests/fallback',
+        expiresAt: new Date(now + 60_000).toISOString(), completed: accountId === 'fallback-a' && count > 1 }];
+    } };
+  } };
+  enqueueJob(fixture.db, { jobType: 'MONITOR_SEARCH', subjectType: 'QUEST', subjectId: 'fallback-quest', operationKey: 'fallback-search', payload: { questId: 'fallback-quest' } });
+  await processQuestWorkflowJob(runtime, claimDueJob(fixture.db));
+  await processQuestWorkflowJob(runtime, claimDueJob(fixture.db));
+  const queued = fixture.db.prepare("SELECT * FROM jobs WHERE job_type='MONITOR_TEST' AND state='PENDING'").all();
+  assert.equal(queued.length, 1);
+  assert.match(queued[0].subject_id, /fallback-b/);
+  assert.equal(fixture.db.prepare("SELECT count(*) AS count FROM jobs WHERE job_type='MONITOR_TEST' AND state='RUNNING'").get().count, 0);
+});
+
 test('a Quest absent from every active Monitor becomes not found without a test mutation', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const now = Date.now();
-  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,first_seen_at,last_seen_at,updated_at)
-    VALUES(?,?,?,?,?,?,?,?)`).run('absent-quest', 'Quest absent', 'WATCH_VIDEO', 'https://discord.com/quests/absent-quest', 'CUSTOMER', now, now, now);
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,expires_at,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run('absent-quest', 'Quest absent', 'WATCH_VIDEO', 'https://discord.com/quests/absent-quest', 'CUSTOMER', now + 60_000, now, now, now);
   enqueueJob(fixture.db, { jobType: 'MONITOR_SEARCH', subjectType: 'QUEST', subjectId: 'absent-quest',
     operationKey: 'absent-search', payload: { questId: 'absent-quest' } });
   const runtime = { db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret, RUNNER_CONCURRENCY: 1 }, abortController: new AbortController() };
@@ -394,14 +653,14 @@ test('a Quest absent from every active Monitor becomes not found without a test 
 test('an unusable Monitor is reported as incomplete rather than pretending Quest is absent', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const now = Date.now();
-  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,first_seen_at,last_seen_at,updated_at)
-    VALUES(?,?,?,?,?,?,?,?)`).run('incomplete-quest', 'Quest incomplete', 'WATCH_VIDEO', 'https://discord.com/quests/incomplete-quest', 'CUSTOMER', now, now, now);
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,source,expires_at,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run('incomplete-quest', 'Quest incomplete', 'WATCH_VIDEO', 'https://discord.com/quests/incomplete-quest', 'CUSTOMER', now + 60_000, now, now, now);
   const credentialId = randomUUID();
   const sealed = encryptCredential(secret, 'wrong-monitor-token');
   fixture.db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
     VALUES(?,?,?,'MONITOR_TOKEN','PERSISTENT',?,?,?,?,?)`).run(credentialId, 'MONITOR', 'expected-account', sealed.ciphertext, sealed.nonce, sealed.authTag, now, now);
-  fixture.db.prepare('INSERT INTO monitor_accounts(account_id,label,state,credential_id,updated_at) VALUES(?,?,?,?,?)')
-    .run('expected-account', 'Token ไม่ตรง', 'ACTIVE', credentialId, now);
+  fixture.db.prepare('INSERT INTO monitor_accounts(account_id,label,state,credential_id,health_state,updated_at) VALUES(?,?,?,?,?,?)')
+    .run('expected-account', 'Token ไม่ตรง', 'ACTIVE', credentialId, 'READY', now);
   enqueueJob(fixture.db, { jobType: 'MONITOR_SEARCH', subjectType: 'QUEST', subjectId: 'incomplete-quest',
     operationKey: 'incomplete-search', payload: { questId: 'incomplete-quest' } });
   const runtime = { db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret, RUNNER_CONCURRENCY: 1 }, abortController: new AbortController(),
@@ -430,7 +689,7 @@ test('Quest already completed before a paid run is released without capture', as
   const job = claimDueJob(fixture.db);
   await processQuestWorkflowJob(runtime, job);
   const item = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(order.id);
-  assert.equal(item.state, 'FAILED');
+  assert.equal(item.state, 'FAILED_RELEASED');
   assert.equal(item.claim_url, null);
   const wallet = fixture.db.prepare('SELECT available_cents,reserved_cents FROM wallets WHERE discord_user_id=?').get('runner-buyer');
   assert.deepEqual([Number(wallet.available_cents), Number(wallet.reserved_cents)], [600, 0]);
@@ -455,7 +714,7 @@ test('an incomplete Quest result remains reserved for operational review', async
       progressSecs: 10, secondsNeeded: 10, url: 'https://discord.com/quests/incomplete-runner-quest' }] }) };
   await processQuestWorkflowJob(runtime, claimDueJob(fixture.db));
   const item = fixture.db.prepare('SELECT * FROM order_items WHERE order_id=?').get(order.id);
-  assert.equal(item.state, 'REVIEW');
+  assert.equal(item.state, 'MANUAL_REVIEW');
   assert.deepEqual(Object.values(fixture.db.prepare('SELECT available_cents,reserved_cents FROM wallets WHERE discord_user_id=?').get('incomplete-buyer')).slice(0, 2).map(Number), [100, 500]);
   assert.equal(fixture.db.prepare("SELECT state FROM manual_reviews WHERE subject_id=?").get(item.id).state, 'OPEN');
 });
@@ -469,7 +728,7 @@ test('unknown TrueMoney provider outcomes become financial review rather than fa
   const runtime = { db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret }, abortController: new AbortController(),
     paymentProvider: async () => ({ outcome: 'AMBIGUOUS', providerCode: 'UNKNOWN_PROVIDER_RESULT', httpStatus: 400, providerEvidence: {} }) };
   await processPaymentJob(runtime, job);
-  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(topup.id).status, 'REVIEW');
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(topup.id).status, 'MANUAL_REVIEW');
   assert.equal(fixture.db.prepare("SELECT state FROM manual_reviews WHERE subject_type='TOPUP' AND subject_id=?").get(topup.id).state, 'OPEN');
   assert.equal(fixture.db.prepare('SELECT outcome FROM payment_attempts WHERE topup_id=?').get(topup.id).outcome, 'AMBIGUOUS');
 });
@@ -506,7 +765,7 @@ test('operational review releases once or captures only with explicit verificati
   const review = fixture.db.prepare("SELECT * FROM manual_reviews WHERE subject_id=? AND state='OPEN'").get(item.id);
   assert.throws(() => resolveOrderItemReview(fixture.db, { reviewId: review.id, actorId: 'owner', decision: 'CAPTURE' }),
     (error) => error.code === 'REVIEW_EVIDENCE_INCOMPLETE');
-  assert.equal(resolveOrderItemReview(fixture.db, { reviewId: review.id, actorId: 'owner', decision: 'RELEASE' }).item.state, 'FAILED');
+  assert.equal(resolveOrderItemReview(fixture.db, { reviewId: review.id, actorId: 'owner', decision: 'RELEASE' }).item.state, 'FAILED_RELEASED');
   assert.equal(resolveOrderItemReview(fixture.db, { reviewId: review.id, actorId: 'owner', decision: 'RELEASE' }).idempotent, true);
 });
 
@@ -681,6 +940,21 @@ test('operational readiness fails closed when payment gates lack a receiver', as
   assert.equal(typeof health.workers.sqlite.lastHeartbeatAt, 'number');
 });
 
+test('malformed payment containment is degraded even while money gates are closed', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  fixture.db.prepare("UPDATE settings SET value_json='{}' WHERE key='payment_containment'").run();
+  const health = { startedAt: new Date().toISOString(), checks: {}, workers: {} };
+  refreshOperationalHealth({ db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret }, health });
+  assert.equal(health.checks.paymentContainment, 'DEGRADED');
+});
+
+test('missing payment containment setting is fail-closed', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  fixture.db.prepare("DELETE FROM settings WHERE key='payment_containment'").run();
+  assert.deepEqual([currentPaymentContainment(fixture.db).state, currentPaymentContainment(fixture.db).reasonCode],
+    ['OPEN', 'CONTAINMENT_SETTING_MISSING']);
+});
+
 test('notification renderers cover customer, payment, order, operations and admin projections', async (t) => {
   const fixture = await database(); t.after(() => fixture.close());
   const client = { users: { fetch: async (id) => ({ displayAvatarURL: () => `https://cdn.discordapp.com/${id}.png` }) } };
@@ -722,7 +996,7 @@ test('job checkpoints requeue safe reads and identify possibly sent mutations fo
   const fixture = await database(); t.after(() => fixture.close());
   const first = enqueueJob(fixture.db, { jobType: 'SAFE_READ', subjectType: 'TEST', subjectId: 'safe', operationKey: 'safe-read' });
   const claimed = claimDueJob(fixture.db);
-  assert.equal(completeJob(fixture.db, { jobId: claimed.id, leaseToken: claimed.lease_token, retryAt: 1, errorCode: 'RETRY' }).state, 'RETRY_WAIT');
+  assert.equal(completeJob(fixture.db, { jobId: claimed.id, leaseToken: claimed.lease_token, retryAt: 1, errorCode: 'RETRY' }).state, 'WAITING_RETRY');
   fixture.db.prepare('UPDATE jobs SET next_run_at=0 WHERE id=?').run(first.id);
   const retried = claimDueJob(fixture.db);
   assert.equal(completeJob(fixture.db, { jobId: retried.id, leaseToken: retried.lease_token }).state, 'COMPLETED');
@@ -758,7 +1032,7 @@ test('subject-aware recovery creates reviews and settles only durable redeemed c
   markJobPossiblySent(fixture.db, { jobId: uncertainJob.id, leaseToken: uncertainJob.lease_token });
   fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(uncertainJob.id);
   recoverInterruptedSubjects({ db: fixture.db });
-  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(uncertain.id).status, 'REVIEW');
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(uncertain.id).status, 'MANUAL_REVIEW');
   assert.equal(fixture.db.prepare("SELECT category FROM manual_reviews WHERE subject_type='TOPUP' AND subject_id=? AND state='OPEN'").get(uncertain.id).category, 'FINANCIAL');
   assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE id=?').get(uncertainJob.id).state, 'REVIEW');
 
@@ -804,7 +1078,7 @@ test('a stale payment lease cannot mutate its Top-up', async (t) => {
   fixture.db.prepare("UPDATE jobs SET lease_token='replacement-lease' WHERE id=?").run(job.id);
   assert.throws(() => markTopupProcessing(fixture.db, topup.id, { workerJob: { jobId: job.id, leaseToken: job.lease_token } }),
     (error) => error.code === 'JOB_LEASE_LOST');
-  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(topup.id).status, 'PENDING');
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(topup.id).status, 'PAYMENT_QUEUED');
 });
 
 test('Quest recovery settles a durable verified result without another mutation', async (t) => {
@@ -835,7 +1109,7 @@ test('Quest recovery settles a durable verified result without another mutation'
     result: { outcome: 'FAILED', reason: 'EXTERNAL_COMPLETED_RELEASED', evidence: { completedBeforeRun: true } } });
   fixture.db.prepare('UPDATE jobs SET lease_expires_at=0 WHERE id=?').run(releaseJob.id);
   recoverInterruptedSubjects({ db: fixture.db });
-  assert.equal(fixture.db.prepare('SELECT state FROM order_items WHERE id=?').get(releaseItem.id).state, 'FAILED');
+  assert.equal(fixture.db.prepare('SELECT state FROM order_items WHERE id=?').get(releaseItem.id).state, 'FAILED_RELEASED');
 
   const missingTopup = enqueueJob(fixture.db, { jobType: 'PAYMENT_SETTLE', subjectType: 'TOPUP', subjectId: 'missing-topup', operationKey: 'missing-topup-recovery' });
   const missingTopupJob = claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' });
@@ -866,7 +1140,7 @@ test('gates are closed by default and Notification recovery/defer preserves a du
   const notification = enqueueNotification(fixture.db, { notificationType: 'SYSTEM_LOG', aggregateType: 'SYSTEM', aggregateId: 'defer', destination: 'LOG_SYSTEM' });
   const sending = claimDueNotification(fixture.db);
   assert.equal(deferNotification(fixture.db, { notificationId: notification.id, leaseToken: sending.lease_token, retryAt: Date.now() + 10_000 }).state, 'RETRY_WAIT');
-  fixture.db.prepare("UPDATE notifications SET state='SENDING',lease_expires_at=0 WHERE id=?").run(notification.id);
+  fixture.db.prepare("UPDATE notifications SET state='SENDING',lease_token='expired-test-lease',lease_expires_at=0,sending_version=desired_version WHERE id=?").run(notification.id);
   assert.equal(recoverSendingNotifications(fixture.db) >= 1, true);
 });
 
@@ -934,6 +1208,27 @@ test('single-instance lock rejects a live process, reclaims a stale lease, and v
   await reclaimed.release();
   const backup = await createRotatedSqliteBackup(db, databasePath, { kind: 'daily', keep: 7 });
   closeSqliteDatabase(db);
+  await assert.rejects(() => replaceDatabaseFromBackup({ source: backup, destination: databasePath, secret: `${secret}-wrong` }),
+    (error) => error.code === 'SQLITE_SECRET_MISMATCH');
+  const corrupt = path.join(directory, 'corrupt.db');
+  await writeFile(corrupt, 'not a sqlite database');
+  await assert.rejects(() => replaceDatabaseFromBackup({ source: corrupt, destination: databasePath, secret }));
+  const beforeRestore = await openSqliteDatabase({ databasePath, secret });
+  assert.equal(fullIntegrityCheck(beforeRestore).ok, true);
+  closeSqliteDatabase(beforeRestore);
+  let failedInstall = false;
+  await assert.rejects(() => replaceDatabaseFromBackup({ source: backup, destination: databasePath, secret, fileOps: {
+    rename: async (from, to) => {
+      if (!failedInstall && from.includes('.restore-') && to === databasePath) {
+        failedInstall = true;
+        const error = new Error('injected install failure'); error.code = 'EIO'; throw error;
+      }
+      return rename(from, to);
+    },
+  } }));
+  const afterFailedInstall = await openSqliteDatabase({ databasePath, secret });
+  assert.equal(fullIntegrityCheck(afterFailedInstall).ok, true);
+  closeSqliteDatabase(afterFailedInstall);
   const restored = await replaceDatabaseFromBackup({ source: backup, destination: databasePath, secret });
   assert.equal(Boolean(restored.quarantine), true);
   const reopened = await openSqliteDatabase({ databasePath, secret });
@@ -947,8 +1242,8 @@ test('failure paths retain money safely and notification retries reach the finan
   const topup = submitTopup(fixture.db, { QUESTSHOP_SECRET_KEY: secret }, { discordUserId: 'review-user',
     voucherUrl: 'https://gift.truemoney.com/campaign/?v=1123456789abcdef0123456789abcdef01' }).topup;
   assert.equal(markTopupProcessing(fixture.db, topup.id).status, 'PROCESSING');
-  assert.equal(moveTopupToReview(fixture.db, { topupId: topup.id, reasonCode: 'AMBIGUOUS', safeReason: 'รอตรวจ' }).status, 'REVIEW');
-  assert.equal(failTopup(fixture.db, { topupId: topup.id, reasonCode: 'SHOULD_NOT_OVERWRITE_REVIEW' }).status, 'REVIEW');
+  assert.equal(moveTopupToReview(fixture.db, { topupId: topup.id, reasonCode: 'AMBIGUOUS', safeReason: 'รอตรวจ' }).status, 'MANUAL_REVIEW');
+  assert.equal(failTopup(fixture.db, { topupId: topup.id, reasonCode: 'SHOULD_NOT_OVERWRITE_REVIEW' }).status, 'MANUAL_REVIEW');
   const notification = enqueueNotification(fixture.db, { notificationType: 'TOPUP_STATUS_DM', aggregateType: 'TOPUP',
     aggregateId: 'retry', destination: 'DM:12345678901234567' });
   for (let attempt = 0; attempt < 7; attempt += 1) {
@@ -984,7 +1279,7 @@ test('payment worker distinguishes retry, terminal rejection, and definitely-uns
   const error = Object.assign(new Error('before dispatch'), { code: 'PROVIDER_NOT_SENT' });
   await processPaymentJob({ ...runtime(null), paymentProvider: async () => { throw error; } }, claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' }));
   assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(notSent.id).status, 'PROCESSING');
-  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE subject_id=?').get(notSent.id).state, 'RETRY_WAIT');
+  assert.equal(fixture.db.prepare('SELECT state FROM jobs WHERE subject_id=?').get(notSent.id).state, 'WAITING_RETRY');
 });
 
 test('Admin can queue private Monitor Scan + Test and retry a durable DLQ nonce', async (t) => {
@@ -1001,6 +1296,95 @@ test('Admin can queue private Monitor Scan + Test and retry a durable DLQ nonce'
   fixture.db.prepare("UPDATE notifications SET state='DEAD_LETTER',attempt_count=7 WHERE id=?").run(notification.id);
   assert.equal(retryNotificationDlq(fixture.db, { notificationId: notification.id, actorId: 'admin' }).state, 'PENDING');
   assert.throws(() => retryNotificationDlq(fixture.db, { notificationId: 'missing', actorId: 'admin' }), (error) => error.code === 'DLQ_NOT_FOUND');
+});
+
+test('Monitor-origin discovery records provenance and stays private before its Scan + Test result', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const now = Date.now();
+  const env = { QUESTSHOP_SECRET_KEY: secret, CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS: ['v1'] };
+  upsertMonitorAccount(fixture.db, env, { accountId: '9988776655443322', label: 'Discovery Monitor', token: 'monitor-discovery-token', actorId: 'admin' });
+  fixture.db.prepare("UPDATE monitor_accounts SET health_state='READY' WHERE account_id='9988776655443322'").run();
+  const queued = queueMonitorScanAndTest(fixture.db, { actorId: 'admin' });
+  assert.equal(queued.monitorQueued, 1);
+  const runtime = { db: fixture.db, env, abortController: new AbortController(), questApiFactory: ({ token }) => ({
+    fetchCurrentUser: async () => ({ id: token === 'monitor-discovery-token' ? '9988776655443322' : 'wrong' }),
+    fetchQuests: async () => [{ id: 'monitor-origin', name: 'พบจาก Monitor', eventName: 'WATCH_VIDEO',
+      url: 'https://discord.com/quests/monitor-origin', expiresAt: new Date(now + 60_000).toISOString() }],
+  }) };
+  await processNonPaymentJob(runtime, claimDueJob(fixture.db, { jobType: 'MONITOR_DISCOVERY' }));
+  const quest = fixture.db.prepare('SELECT source,discovered_by_customer,discovered_by_monitor,announcement_status FROM quests WHERE quest_id=?').get('monitor-origin');
+  assert.deepEqual([quest.source, Number(quest.discovered_by_customer), Number(quest.discovered_by_monitor), quest.announcement_status],
+    ['MONITOR', 0, 1, 'NOT_ANNOUNCED']);
+  assert.equal(fixture.db.prepare("SELECT count(*) AS count FROM jobs WHERE job_type='MONITOR_SEARCH' AND subject_id='monitor-origin'").get().count, 1);
+});
+
+test('retention removes only aged operational records and preserves detached operation evidence', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const old = Date.now() - 91 * 86_400_000;
+  const job = enqueueJob(fixture.db, { jobType: 'TEST_OPERATION', subjectType: 'TEST', subjectId: 'retention-subject', operationKey: 'retention-job', runAt: old });
+  const claimed = claimDueJob(fixture.db, { now: old + 1 });
+  withImmediateTransaction(fixture.db, () => appendExternalOperationEvidenceInTransaction(fixture.db, {
+    jobId: job.id, subjectType: 'TEST', subjectId: 'retention-subject', stage: 'INTENT', traceId: 'retention-trace', timestamp: old + 2,
+  }));
+  completeJob(fixture.db, { jobId: claimed.id, leaseToken: claimed.lease_token, now: old + 3 });
+  const oldNotice = enqueueNotification(fixture.db, { notificationType: 'SYSTEM_LOG', aggregateType: 'SYSTEM', aggregateId: 'old-projection', destination: 'LOG_SYSTEM', timestamp: old });
+  fixture.db.prepare("UPDATE notifications SET state='DELIVERED',delivered_version=desired_version,updated_at=? WHERE id=?").run(old, oldNotice.id);
+  const paymentNotice = enqueueNotification(fixture.db, { notificationType: 'PAYMENT_LOG', aggregateType: 'TOPUP', aggregateId: 'retention-payment', destination: 'LOG_PAYMENTS', timestamp: old });
+  fixture.db.prepare("UPDATE notifications SET state='DELIVERED',delivered_version=desired_version,updated_at=? WHERE id=?").run(old, paymentNotice.id);
+  const removed = runRetentionCleanup(fixture.db, { now: Date.now() });
+  assert.equal(removed.jobs, 1);
+  assert.equal(removed.notifications, 1);
+  assert.equal(fixture.db.prepare('SELECT 1 AS present FROM jobs WHERE id=?').get(job.id), undefined);
+  assert.ok(fixture.db.prepare('SELECT 1 AS present FROM external_operation_evidence WHERE job_id=?').get(job.id));
+  assert.ok(fixture.db.prepare('SELECT 1 AS present FROM notifications WHERE id=?').get(paymentNotice.id));
+});
+
+test('retention maintenance saves durable cleanup counters', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const result = runRetentionMaintenance({ db: fixture.db }, { now: Date.now() });
+  const saved = JSON.parse(fixture.db.prepare("SELECT value_json FROM settings WHERE key='retention_last_cleanup'").get().value_json);
+  assert.deepEqual(saved.removed, result);
+  assert.equal(typeof saved.at, 'number');
+});
+
+test('expired queued Quest announcement is discarded with a safe audit before Discord delivery', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const old = Date.now() - 1;
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,expires_at,source,announcement_status,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,'MONITOR','QUEUED',?,?,?)`).run('expired-announcement', 'หมดอายุ', 'WATCH_VIDEO', 'https://discord.com/quests/expired-announcement', old, old, old, old);
+  const notice = enqueueNotification(fixture.db, { notificationType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: 'expired-announcement', destination: 'QUEST_NEW' });
+  await deliverNotification({ db: fixture.db, logger: { warn() {} } }, claimDueNotification(fixture.db));
+  assert.equal(fixture.db.prepare('SELECT state FROM notifications WHERE id=?').get(notice.id).state, 'DISCARDED');
+  assert.equal(fixture.db.prepare('SELECT announcement_status FROM quests WHERE quest_id=?').get('expired-announcement').announcement_status, 'NOT_ANNOUNCED');
+  assert.ok(fixture.db.prepare("SELECT 1 AS present FROM admin_audit WHERE action='QUEST_ANNOUNCEMENT_DISCARDED'").get());
+});
+
+test('an interrupted Monitor Test review can be resolved into a fresh durable retry', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const now = Date.now();
+  fixture.db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,expires_at,source,first_seen_at,last_seen_at,updated_at)
+    VALUES(?,?,?,?,?,'MONITOR',?,?,?)`).run('reviewable-monitor-quest', 'รอทดสอบ', 'WATCH_VIDEO', 'https://discord.com/quests/reviewable-monitor-quest', now + 60_000, now, now, now);
+  const subjectId = 'reviewable-monitor-quest:monitor-account:batch-1';
+  enqueueJob(fixture.db, { jobType: 'MONITOR_TEST', subjectType: 'QUEST_CHECK', subjectId, operationKey: 'monitor-review-source', payload: {
+    questId: 'reviewable-monitor-quest', monitorAccountId: 'monitor-account', credentialId: 'credential-id', batchId: 'batch-1',
+  } });
+  fixture.db.prepare(`INSERT INTO manual_reviews(id,subject_type,subject_id,category,state,reason_code,created_at,updated_at)
+    VALUES(?,?,?,'OPERATIONAL','OPEN','RESTART_AFTER_POSSIBLY_SENT',?,?)`).run('quest-check-review', 'QUEST_CHECK', subjectId, now, now);
+  const result = resolveOperationalReview(fixture.db, { reviewId: 'quest-check-review', subjectType: 'QUEST_CHECK', actorId: 'owner', decision: 'RETRY' });
+  assert.equal(result.state, 'RESOLVED_SUCCESS');
+  assert.equal(fixture.db.prepare("SELECT state FROM manual_reviews WHERE id='quest-check-review'").get().state, 'RESOLVED_SUCCESS');
+  assert.equal(fixture.db.prepare("SELECT count(*) AS count FROM jobs WHERE job_type='MONITOR_TEST' AND operation_key LIKE 'monitor-test-retry:%'").get().count, 1);
+});
+
+test('an unknown recovered Job review has an auditable Owner close path', async (t) => {
+  const fixture = await database(); t.after(() => fixture.close());
+  const now = Date.now();
+  fixture.db.prepare(`INSERT INTO manual_reviews(id,subject_type,subject_id,category,state,reason_code,created_at,updated_at)
+    VALUES(?,?,?,'OPERATIONAL','OPEN',?,?,?)`).run('unknown-job-review', 'JOB', 'missing-job', 'RESTART_AFTER_POSSIBLY_SENT', now, now);
+  assert.throws(() => resolveOperationalReview(fixture.db, { reviewId: 'unknown-job-review', subjectType: 'JOB', actorId: 'owner', decision: 'RETRY' }),
+    (error) => error.code === 'REVIEW_DECISION_INVALID');
+  assert.equal(resolveOperationalReview(fixture.db, { reviewId: 'unknown-job-review', subjectType: 'JOB', actorId: 'owner', decision: 'CLOSE' }).state, 'RESOLVED_FAILURE');
+  assert.equal(fixture.db.prepare("SELECT count(*) AS count FROM admin_audit WHERE target_type='JOB' AND target_id='missing-job'").get().count, 1);
 });
 
 test('payload normalization bounds embeds, components, URLs, options, and explicit mentions', () => {
@@ -1101,7 +1485,7 @@ test('payment worker moves missing settlement credentials to review without exte
     voucherUrl: 'https://gift.truemoney.com/campaign/?v=e23456789abcdef0123456789abcdef01' }).topup;
   await processPaymentJob({ db: fixture.db, env: { QUESTSHOP_SECRET_KEY: secret }, abortController: new AbortController() },
     claimDueJob(fixture.db, { jobType: 'PAYMENT_SETTLE' }));
-  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(topup.id).status, 'REVIEW');
+  assert.equal(fixture.db.prepare('SELECT status FROM topups WHERE id=?').get(topup.id).status, 'MANUAL_REVIEW');
   assert.equal(fixture.db.prepare("SELECT state FROM manual_reviews WHERE subject_id=? AND subject_type='TOPUP'").get(topup.id).state, 'OPEN');
 });
 

@@ -9,6 +9,7 @@ import { refundReadyOrderItem, resolveOrderItemReview } from './orders.js';
 import { supportedTaskTypes } from './pricing.js';
 import { appendWalletTransactionInTransaction } from './wallet.js';
 import { enqueueJobInTransaction } from './jobs.js';
+import { resolveQuestCheckReview } from './quest-workflow.js';
 
 export const ADMIN_AUDIT_ALLOWED_FIELDS = Object.freeze({
   FEATURE_GATE_CHANGE: ['gate', 'enabled'],
@@ -130,7 +131,7 @@ export function configureReceiverPhone(db, env, { phone, actorId, reason = '', e
 }
 
 export function upsertMonitorAccount(db, env, { accountId, label, token, actorId, state = 'ACTIVE', reason = '', expectedStateVersion = null }) {
-  if (!/^\d{1,32}$/.test(String(accountId ?? '')) || !String(label ?? '').trim() || !String(token ?? '').trim()
+  if (!/^\d{1,32}$/.test(String(accountId ?? '')) || !String(label ?? '').trim()
     || !['ACTIVE', 'COOLDOWN', 'DISABLED'].includes(state)) throw new QuestshopError('MONITOR_INVALID', 'ข้อมูลบัญชีทดสอบไม่ถูกต้อง');
   const timestamp = nowMs();
   return withImmediateTransaction(db, () => {
@@ -138,13 +139,17 @@ export function upsertMonitorAccount(db, env, { accountId, label, token, actorId
     if (before && expectedStateVersion != null && Number(expectedStateVersion) !== Number(before.state_version)) {
       throw new QuestshopError('MONITOR_CONFLICT', 'ข้อมูล Monitor ถูกเปลี่ยนแล้ว กรุณาเปิดใหม่');
     }
+    const hasNewToken = Boolean(String(token ?? '').trim());
+    if (!before && !hasNewToken) throw new QuestshopError('MONITOR_TOKEN_REQUIRED', 'ต้องกรอก Token เมื่อเพิ่ม Monitor ใหม่');
     const credentialId = before?.credential_id ?? randomUUID();
-    const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, token, { keyVersion: env.CREDENTIAL_ENCRYPTION_ACTIVE_VERSION });
-    db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,key_version,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
-      VALUES(?,?,?,'MONITOR_TOKEN',?,'PERSISTENT',?,?,?,?,?)
-      ON CONFLICT(subject_type,subject_id,credential_type) DO UPDATE SET key_version=excluded.key_version,ciphertext=excluded.ciphertext,nonce=excluded.nonce,
-        auth_tag=excluded.auth_tag,updated_at=excluded.updated_at`).run(credentialId, 'MONITOR', accountId, encrypted.keyVersion,
-      encrypted.ciphertext, encrypted.nonce, encrypted.authTag, timestamp, timestamp);
+    if (hasNewToken) {
+      const encrypted = encryptCredential(env.QUESTSHOP_SECRET_KEY, token, { keyVersion: env.CREDENTIAL_ENCRYPTION_ACTIVE_VERSION });
+      db.prepare(`INSERT INTO credentials(id,subject_type,subject_id,credential_type,key_version,retention_class,ciphertext,nonce,auth_tag,created_at,updated_at)
+        VALUES(?,?,?,'MONITOR_TOKEN',?,'PERSISTENT',?,?,?,?,?)
+        ON CONFLICT(subject_type,subject_id,credential_type) DO UPDATE SET key_version=excluded.key_version,ciphertext=excluded.ciphertext,nonce=excluded.nonce,
+          auth_tag=excluded.auth_tag,updated_at=excluded.updated_at`).run(credentialId, 'MONITOR', accountId, encrypted.keyVersion,
+        encrypted.ciphertext, encrypted.nonce, encrypted.authTag, timestamp, timestamp);
+    }
     if (!before) {
       db.prepare(`INSERT INTO monitor_accounts(account_id,label,state,credential_id,cooldown_until,last_checked_at,updated_at)
         VALUES(?,?,?,?,NULL,NULL,?)`).run(accountId, String(label).trim().slice(0, 100), state, credentialId, timestamp);
@@ -235,15 +240,27 @@ export function queueMonitorScanAndTest(db, { actorId, questId = null }) {
     if (questId && !quests.length) throw new QuestshopError('QUEST_NOT_FOUND', 'ไม่พบ Quest ที่ต้องการตรวจ');
     let queued = 0;
     for (const quest of quests) {
-      const active = db.prepare("SELECT id FROM jobs WHERE job_type='MONITOR_SEARCH' AND subject_id=? AND state IN ('PENDING','RUNNING','RETRY_WAIT')").get(quest.quest_id);
+      const active = db.prepare("SELECT id FROM jobs WHERE job_type='MONITOR_SEARCH' AND subject_id=? AND state IN ('PENDING','RUNNING','WAITING_RETRY','WAITING_RATE_LIMIT')").get(quest.quest_id);
       if (active) continue;
       enqueueJobInTransaction(db, { jobType: 'MONITOR_SEARCH', subjectType: 'QUEST', subjectId: quest.quest_id,
         operationKey: `monitor-search:${quest.quest_id}:${timestamp}`, payload: { questId: quest.quest_id, requestedBy: actorId }, runAt: timestamp });
       queued += 1;
     }
+    let monitorQueued = 0;
+    if (!questId) {
+      const monitors = db.prepare("SELECT account_id FROM monitor_accounts WHERE state='ACTIVE' AND health_state='READY' AND (cooldown_until IS NULL OR cooldown_until<=?) ORDER BY account_id").all(timestamp);
+      for (const monitor of monitors) {
+        const active = db.prepare(`SELECT id FROM jobs WHERE job_type='MONITOR_DISCOVERY' AND subject_id=?
+          AND state IN ('PENDING','RUNNING','WAITING_RETRY','WAITING_RATE_LIMIT')`).get(monitor.account_id);
+        if (active) continue;
+        enqueueJobInTransaction(db, { jobType: 'MONITOR_DISCOVERY', subjectType: 'MONITOR', subjectId: monitor.account_id,
+          operationKey: `monitor-discovery:${monitor.account_id}:${timestamp}`, payload: { monitorAccountId: monitor.account_id, requestedBy: actorId }, runAt: timestamp });
+        monitorQueued += 1;
+      }
+    }
     appendAdminAuditInTransaction(db, { actorId, action: 'MONITOR_SCAN_QUEUED', targetType: 'MONITOR', targetId: questId ?? 'PENDING_QUESTS',
       reason: 'สั่ง Scan + Test จากแผงผู้ดูแล', after: { queued }, timestamp });
-    return { queued };
+    return { queued, monitorQueued };
   });
 }
 
@@ -292,7 +309,7 @@ export function adminOverview(db) {
   try { backupAt = Number(JSON.parse(backup?.value_json ?? '{}').at) || null; } catch { /* no backup yet */ }
   return {
     openReviews: count("SELECT count(*) AS count FROM manual_reviews WHERE state='OPEN'"),
-    pendingJobs: count("SELECT count(*) AS count FROM jobs WHERE state IN ('PENDING','RUNNING','RETRY_WAIT')"),
+    pendingJobs: count("SELECT count(*) AS count FROM jobs WHERE state IN ('PENDING','RUNNING','WAITING_RETRY','WAITING_RATE_LIMIT')"),
     deadLetters: count("SELECT count(*) AS count FROM notifications WHERE state='DEAD_LETTER'"),
     activeMonitors: count("SELECT count(*) AS count FROM monitor_accounts WHERE state='ACTIVE'"),
     receiverConfigured: Boolean(receiver),
@@ -305,7 +322,26 @@ export function adminOverview(db) {
 }
 
 export function resolveOperationalReview(db, input) {
+  if (input?.subjectType === 'QUEST_CHECK') return resolveQuestCheckReview(db, input);
+  if (input?.subjectType === 'JOB') return resolveUnknownJobReview(db, input);
   return resolveOrderItemReview(db, input);
+}
+
+function resolveUnknownJobReview(db, { reviewId, actorId, decision, reason = '' }) {
+  if (decision !== 'CLOSE') throw new QuestshopError('REVIEW_DECISION_INVALID', 'งานที่ไม่รู้จักปิดเคสได้เท่านั้น');
+  const timestamp = nowMs();
+  return withImmediateTransaction(db, () => {
+    const review = db.prepare("SELECT * FROM manual_reviews WHERE id=? AND subject_type='JOB' AND category='OPERATIONAL'").get(reviewId);
+    if (!review) throw new QuestshopError('REVIEW_NOT_FOUND', 'ไม่พบรายการงานที่รอตรวจสอบ');
+    if (review.state !== 'OPEN') return { state: review.state, idempotent: true };
+    const job = db.prepare('SELECT operation_key FROM jobs WHERE id=?').get(review.subject_id);
+    const changed = db.prepare(`UPDATE manual_reviews SET state='RESOLVED_FAILURE',decision='CLOSE',resolved_by=?,resolved_at=?,
+      state_version=state_version+1,updated_at=? WHERE id=? AND state='OPEN' AND state_version=?`).run(actorId, timestamp, timestamp, review.id, review.state_version);
+    if (!changed.changes) throw new QuestshopError('REVIEW_CONFLICT', 'รายการถูกเปลี่ยนแล้ว กรุณาลองใหม่');
+    appendAdminAuditInTransaction(db, { actorId, action: 'MANUAL_REVIEW_DECISION', targetType: 'JOB', targetId: review.subject_id,
+      reason: reason || 'OWNER_CLOSED_UNKNOWN_JOB_REVIEW', before: { state: 'OPEN' }, after: { decision: 'CLOSE', status: 'RESOLVED_FAILURE' }, traceId: job?.operation_key ?? review.id, timestamp });
+    return { state: 'RESOLVED_FAILURE', idempotent: false, decision: 'CLOSE' };
+  });
 }
 
 export function adjustWallet(db, { discordUserId, availableDeltaCents, actorId, reason, expectedWalletVersion = null }) {
@@ -330,7 +366,7 @@ export function adjustWallet(db, { discordUserId, availableDeltaCents, actorId, 
 
 export function listAdminOrders(db, { offset = 0, limit = 25 } = {}) {
   return db.prepare(`SELECT o.id,o.discord_user_id,o.quest_account_id,o.state,o.created_at,o.updated_at,
-    count(i.id) AS item_count, sum(CASE WHEN i.state='REVIEW' THEN 1 ELSE 0 END) AS review_count
+    count(i.id) AS item_count, sum(CASE WHEN i.state='MANUAL_REVIEW' THEN 1 ELSE 0 END) AS review_count
     FROM orders o JOIN order_items i ON i.order_id=o.id GROUP BY o.id ORDER BY o.updated_at DESC LIMIT ? OFFSET ?`)
     .all(Math.max(1, Math.min(25, Number(limit) || 25)), Math.max(0, Number(offset) || 0));
 }
@@ -338,8 +374,8 @@ export function listAdminOrders(db, { offset = 0, limit = 25 } = {}) {
 export function orderDetail(db, orderId) {
   const order = db.prepare('SELECT id,discord_user_id,quest_account_id,state,created_at,updated_at FROM orders WHERE id=?').get(orderId);
   if (!order) throw new QuestshopError('ORDER_NOT_FOUND', 'ไม่พบ Order');
-  return { order, items: db.prepare(`SELECT id,quest_id,task_type,state,price_cents,progress_percent,claim_url,refund_cents,state_version
-    FROM order_items WHERE order_id=? ORDER BY created_at`).all(orderId) };
+  return { order, items: db.prepare(`SELECT i.id,i.quest_id,q.task_type,i.state,i.price_cents,i.progress_percent,i.claim_url,i.refund_cents,i.state_version
+    FROM order_items i JOIN quests q ON q.quest_id=i.quest_id WHERE i.order_id=? ORDER BY i.reserved_at,i.id`).all(orderId) };
 }
 
 export function refundOrderItem(db, input) {
@@ -360,9 +396,13 @@ export function upsertPromotion(db, { id = randomUUID(), name, state, minimumCen
   const minimum = Number(minimumCents); const rate = Number(basisPoints); const maximum = maximumBonusCents == null || maximumBonusCents === '' ? null : Number(maximumBonusCents);
   const maxUses = maxUsesPerUser == null || maxUsesPerUser === '' ? null : Number(maxUsesPerUser);
   const maxDaily = maxBonusPerDayCents == null || maxBonusPerDayCents === '' ? null : Number(maxBonusPerDayCents);
+  const starts = startsAt == null || startsAt === '' ? null : Number(startsAt);
+  const ends = endsAt == null || endsAt === '' ? null : Number(endsAt);
   if (!String(name ?? '').trim() || !['ACTIVE', 'INACTIVE'].includes(state) || !Number.isSafeInteger(minimum) || minimum < 0
     || !Number.isSafeInteger(rate) || rate < 0 || (maximum != null && (!Number.isSafeInteger(maximum) || maximum < 0))
-    || (maxUses != null && (!Number.isSafeInteger(maxUses) || maxUses < 0)) || (maxDaily != null && (!Number.isSafeInteger(maxDaily) || maxDaily < 0))) {
+    || (maxUses != null && (!Number.isSafeInteger(maxUses) || maxUses < 0)) || (maxDaily != null && (!Number.isSafeInteger(maxDaily) || maxDaily < 0))
+    || (starts != null && (!Number.isSafeInteger(starts) || starts <= 0)) || (ends != null && (!Number.isSafeInteger(ends) || ends <= 0))
+    || (starts != null && ends != null && starts >= ends)) {
     throw new QuestshopError('PROMOTION_INVALID', 'ข้อมูลโปรโมชั่นไม่ถูกต้อง');
   }
   const timestamp = nowMs();
@@ -378,11 +418,11 @@ export function upsertPromotion(db, { id = randomUUID(), name, state, minimumCen
     }
     if (!before) {
       db.prepare(`INSERT INTO promotions(id,name,state,rule_json,starts_at,ends_at,updated_at) VALUES(?,?,?,?,?,?,?)`)
-        .run(id, String(name).trim().slice(0, 100), state, JSON.stringify(rule), startsAt == null || startsAt === '' ? null : Number(startsAt), endsAt == null || endsAt === '' ? null : Number(endsAt), timestamp);
+        .run(id, String(name).trim().slice(0, 100), state, JSON.stringify(rule), starts, ends, timestamp);
     } else {
       const changed = db.prepare(`UPDATE promotions SET name=?,state=?,rule_json=?,starts_at=?,ends_at=?,state_version=state_version+1,updated_at=?
         WHERE id=? AND state_version=?`).run(String(name).trim().slice(0, 100), state, JSON.stringify(rule),
-        startsAt == null || startsAt === '' ? null : Number(startsAt), endsAt == null || endsAt === '' ? null : Number(endsAt), timestamp, id, before.state_version);
+        starts, ends, timestamp, id, before.state_version);
       if (!changed.changes) throw new QuestshopError('PROMOTION_CONFLICT', 'โปรโมชั่นถูกเปลี่ยนแล้ว กรุณาเปิดใหม่');
     }
     appendAdminAuditInTransaction(db, { actorId, action: 'PROMOTION_UPDATED', targetType: 'PROMOTION', targetId: id, reason,

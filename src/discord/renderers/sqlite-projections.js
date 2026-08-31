@@ -184,8 +184,8 @@ async function renderQuestOperation(db, client, notification) {
     JOIN orders o ON o.id=i.order_id JOIN quests q ON q.quest_id=i.quest_id WHERE i.id=?`).get(notification.aggregate_id);
   if (!item) throw Object.assign(new Error('Quest operation projection is missing'), { code: 'QUEST_OPERATION_PROJECTION_MISSING' });
   const done = item.state === 'READY_TO_CLAIM';
-  const embed = new EmbedBuilder().setColor(done ? COLORS.success : item.state === 'REVIEW' ? COLORS.warning : COLORS.info)
-    .setTitle(done ? '✅ ทำ Quest สำเร็จ' : item.state === 'REVIEW' ? '🟡 Quest รอผู้ดูแลตรวจ' : '🎮 สถานะการทำ Quest')
+  const embed = new EmbedBuilder().setColor(done ? COLORS.success : item.state === 'MANUAL_REVIEW' ? COLORS.warning : COLORS.info)
+    .setTitle(done ? '✅ ทำ Quest สำเร็จ' : item.state === 'MANUAL_REVIEW' ? '🟡 Quest รอผู้ดูแลตรวจ' : '🎮 สถานะการทำ Quest')
     .setDescription([
       `Quest: ${safeDiscordText(item.name)}`, `Order: \`${item.order_id}\``, `สถานะ: ${thaiItemState(item.state)}`,
       `ความคืบหน้า: ${Number(item.progress_percent)}%`, `ค่าบริการ: ${baht(item.price_cents)}`,

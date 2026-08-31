@@ -3,6 +3,7 @@ import { Events, PermissionFlagsBits } from 'discord.js';
 import { loadRuntimeEnvironment } from '../config/env.js';
 import { loadRuntimeConfig } from '../config/runtime-config.js';
 import { acquireSingleInstanceLock, closeSqliteDatabase, openSqliteDatabase, quickIntegrityCheck } from '../db/sqlite.js';
+import { assertRequiredSchema } from '../db/sqlite-migrations.js';
 import { createDiscordClient } from '../discord/client.js';
 import { routeInteraction } from '../discord/interactions/router.js';
 import { createLogger } from '../shared/logger.js';
@@ -54,6 +55,7 @@ export async function startup({ health = createHealthState(), server: existingSe
     } });
     db = await openSqliteDatabase({ databasePath: env.SQLITE_PATH, secret: env.QUESTSHOP_SECRET_KEY });
     assertIntegrity(db);
+    assertRequiredSchema(db, { secret: env.QUESTSHOP_SECRET_KEY });
     health.checks.database = 'OK';
     health.checks.schema = 'OK';
     health.checks.keyrings = 'OK';

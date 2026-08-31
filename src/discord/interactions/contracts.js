@@ -46,6 +46,7 @@ export const ROUTE_CONTRACTS = Object.freeze({
   admin_review_select: admin('STRING_SELECT'),
   admin_review_decide: admin('BUTTON', 'MODAL'),
   admin_review_submit: admin('MODAL_SUBMIT'),
+  admin_review_confirm: admin('BUTTON', 'UPDATE'),
   admin_dlq_select: admin('STRING_SELECT'),
   admin_dlq_retry: admin('BUTTON', 'UPDATE'),
   admin_dlq_discard: admin('BUTTON', 'UPDATE'),

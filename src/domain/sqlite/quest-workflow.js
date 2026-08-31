@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { decryptCredential } from './crypto.js';
-import { enqueueJobInTransaction, completeJob, markJobPossiblySent, recordQuestAmbiguity, recordQuestVerifiedResult, updateRunningJobPayload } from './jobs.js';
+import { assertActiveJobLeaseInTransaction, enqueueJobInTransaction, completeJob, markJobPossiblySent, recordQuestAmbiguity, recordQuestVerifiedResult, updateRunningJobPayload } from './jobs.js';
 import { enqueueNotificationInTransaction } from './notifications.js';
 import { markOrderItemRunning, settleOrderItem, updateOrderItemProgress } from './orders.js';
 import { nowMs, withImmediateTransaction } from '../../db/sqlite.js';
@@ -10,6 +10,16 @@ import { currentFeatureGates } from './gates.js';
 
 function json(value, fallback = {}) {
   try { return JSON.parse(value ?? ''); } catch { return fallback; }
+}
+
+export function questIsActiveForWork(quest, timestamp = nowMs()) {
+  if (!quest?.expires_at || Number(quest.expires_at) <= timestamp) return false;
+  return !quest.starts_at || Number(quest.starts_at) <= timestamp;
+}
+
+function assertWorkflowLease(db, job) {
+  return assertActiveJobLeaseInTransaction(db, { jobId: job.id, leaseToken: job.lease_token,
+    subjectType: job.subject_type, subjectId: job.subject_id });
 }
 
 function apiProfile(env) {
@@ -60,16 +70,42 @@ function upsertCustomerQuests(db, { quests, discordUserId = null, accountId = nu
     if (!sourceQuest?.id || !sourceQuest?.url?.startsWith('https://')) continue;
     const quest = safeQuestRecord(sourceQuest);
     const existing = db.prepare('SELECT * FROM quests WHERE quest_id=?').get(quest.id);
-    db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,artwork_url,thumbnail_url,starts_at,expires_at,target_value,orbs,orb_min,orb_max,contract_hash,source,first_discovered_by,last_discovered_by,first_account_id,last_account_id,first_seen_at,last_seen_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'CUSTOMER',?,?,?,?,?,?,?)
+    db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,artwork_url,thumbnail_url,starts_at,expires_at,target_value,orbs,orb_min,orb_max,contract_hash,source,discovered_by_customer,discovered_by_monitor,first_discovered_by,last_discovered_by,first_account_id,last_account_id,first_seen_at,last_seen_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'CUSTOMER',1,0,?,?,?,?,?,?,?)
       ON CONFLICT(quest_id) DO UPDATE SET name=excluded.name,task_type=excluded.task_type,url=excluded.url,
        artwork_url=excluded.artwork_url,thumbnail_url=excluded.thumbnail_url,starts_at=excluded.starts_at,expires_at=excluded.expires_at,
        target_value=excluded.target_value,orbs=excluded.orbs,orb_min=excluded.orb_min,orb_max=excluded.orb_max,contract_hash=excluded.contract_hash,
-       source='CUSTOMER',discovery_count=quests.discovery_count+1,last_discovered_by=excluded.last_discovered_by,
+       discovered_by_customer=1,discovery_count=quests.discovery_count+1,last_discovered_by=excluded.last_discovered_by,
        last_account_id=excluded.last_account_id,last_seen_at=excluded.last_seen_at,state_version=quests.state_version+1,updated_at=excluded.updated_at`)
       .run(quest.id, quest.name, quest.taskType, quest.url, quest.artworkUrl, quest.thumbnailUrl, quest.startsAt, quest.expiresAt,
         quest.targetValue, quest.orbs, quest.orbMin, quest.orbMax, quest.contractHash,
         discordUserId, discordUserId, accountId, accountId, timestamp, timestamp, timestamp);
+    discovered.push({ ...quest, isNew: !existing });
+  }
+  return discovered;
+}
+
+/** Monitor discovery is intentionally provenance-aware: a Quest first seen
+ * from a persistent Monitor remains private until the normal Scan + Test
+ * workflow produces verified evidence. */
+function upsertMonitorQuests(db, { quests, monitorAccountId, timestamp = nowMs() }) {
+  const discovered = [];
+  for (const sourceQuest of quests) {
+    if (!sourceQuest?.id || !sourceQuest?.url?.startsWith('https://')) continue;
+    const quest = safeQuestRecord(sourceQuest);
+    if (!questIsActiveForWork({ starts_at: quest.startsAt, expires_at: quest.expiresAt }, timestamp)) continue;
+    const existing = db.prepare('SELECT * FROM quests WHERE quest_id=?').get(quest.id);
+    db.prepare(`INSERT INTO quests(quest_id,name,task_type,url,artwork_url,thumbnail_url,starts_at,expires_at,target_value,orbs,orb_min,orb_max,contract_hash,source,discovered_by_customer,discovered_by_monitor,first_discovered_by,last_discovered_by,first_account_id,last_account_id,first_seen_at,last_seen_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'MONITOR',0,1,?,?,?,?,?,?,?)
+      ON CONFLICT(quest_id) DO UPDATE SET name=excluded.name,task_type=excluded.task_type,url=excluded.url,
+       artwork_url=excluded.artwork_url,thumbnail_url=excluded.thumbnail_url,starts_at=excluded.starts_at,expires_at=excluded.expires_at,
+       target_value=excluded.target_value,orbs=excluded.orbs,orb_min=excluded.orb_min,orb_max=excluded.orb_max,contract_hash=excluded.contract_hash,
+       source=CASE WHEN quests.discovered_by_customer=1 THEN 'CUSTOMER' ELSE 'MONITOR' END,
+       discovered_by_monitor=1,discovery_count=quests.discovery_count+1,last_discovered_by=excluded.last_discovered_by,
+       last_account_id=excluded.last_account_id,last_seen_at=excluded.last_seen_at,state_version=quests.state_version+1,updated_at=excluded.updated_at`)
+      .run(quest.id, quest.name, quest.taskType, quest.url, quest.artworkUrl, quest.thumbnailUrl, quest.startsAt, quest.expiresAt,
+        quest.targetValue, quest.orbs, quest.orbMin, quest.orbMax, quest.contractHash,
+        monitorAccountId, monitorAccountId, monitorAccountId, monitorAccountId, timestamp, timestamp, timestamp);
     discovered.push({ ...quest, isNew: !existing });
   }
   return discovered;
@@ -81,7 +117,7 @@ function logDiscovery(db, { checkoutId, discordUserId, accountId, discovered, ti
 }
 
 function queueMonitorSearches(db, discovered, checkoutId, { discordUserId = null, accountId = null, timestamp = nowMs() } = {}) {
-  for (const quest of discovered.filter((item) => item.isNew)) {
+  for (const quest of discovered.filter((item) => item.isNew && questIsActiveForWork({ starts_at: item.startsAt, expires_at: item.expiresAt }, timestamp))) {
     enqueueNotificationInTransaction(db, { notificationType: 'CUSTOMER_QUEST_DISCOVERY', aggregateType: 'QUEST', aggregateId: quest.id,
       destination: 'LOG_QUEST_OPERATIONS', payload: { questId: quest.id, discordUserId, accountId }, timestamp });
     enqueueJobInTransaction(db, { jobType: 'MONITOR_SEARCH', subjectType: 'QUEST', subjectId: quest.id,
@@ -102,12 +138,44 @@ export async function processCustomerDiscovery(runtime, job) {
   const timestamp = nowMs();
   let discovered;
   withImmediateTransaction(runtime.db, () => {
+    assertWorkflowLease(runtime.db, job);
     discovered = upsertCustomerQuests(runtime.db, { quests, discordUserId: payload.discordUserId, accountId, timestamp });
     const resultPayload = { ...payload, accountId, questIds: discovered.map((item) => item.id), completedAt: timestamp };
-    runtime.db.prepare(`UPDATE jobs SET payload_json=?,state_version=state_version+1,updated_at=? WHERE id=? AND state='RUNNING' AND lease_token=?`)
-      .run(JSON.stringify(resultPayload), timestamp, job.id, job.lease_token);
+    const changed = runtime.db.prepare(`UPDATE jobs SET payload_json=?,state_version=state_version+1,updated_at=?
+      WHERE id=? AND state='RUNNING' AND lease_token=? AND lease_expires_at>?`)
+      .run(JSON.stringify(resultPayload), timestamp, job.id, job.lease_token, timestamp);
+    if (!changed.changes) throw Object.assign(new Error('Worker lease is no longer authoritative'), { code: 'JOB_LEASE_LOST' });
     logDiscovery(runtime.db, { checkoutId: job.subject_id, discordUserId: payload.discordUserId, accountId, discovered, timestamp });
     queueMonitorSearches(runtime.db, discovered, job.subject_id, { discordUserId: payload.discordUserId, accountId, timestamp });
+  });
+  return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
+}
+
+export async function processMonitorDiscovery(runtime, job) {
+  const payload = json(job.payload_json);
+  const monitor = runtime.db.prepare("SELECT * FROM monitor_accounts WHERE account_id=? AND state='ACTIVE' AND health_state='READY' AND (cooldown_until IS NULL OR cooldown_until<=?)")
+    .get(payload.monitorAccountId ?? job.subject_id, nowMs());
+  if (!monitor) return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED', errorCode: 'MONITOR_NOT_ACTIVE' });
+  const credential = credentialFor(runtime.db, monitor.credential_id);
+  const api = await createApi(runtime, decryptCredential(runtime.env.QUESTSHOP_SECRET_KEY, credential,
+    { allowedVersions: runtime.env.CREDENTIAL_ENCRYPTION_ALLOWED_VERSIONS }));
+  const [profile, quests] = await Promise.all([
+    api.fetchCurrentUser(runtime.abortController.signal), api.fetchQuests(runtime.abortController.signal, { includeExpired: true }),
+  ]);
+  if (String(profile?.id ?? '') !== String(monitor.account_id)) throw new QuestshopError('MONITOR_ACCOUNT_MISMATCH', 'ข้อมูลบัญชีทดสอบไม่ตรงกับ Token');
+  const timestamp = nowMs();
+  withImmediateTransaction(runtime.db, () => {
+    assertWorkflowLease(runtime.db, job);
+    const discovered = upsertMonitorQuests(runtime.db, { quests, monitorAccountId: monitor.account_id, timestamp });
+    for (const quest of discovered.filter((entry) => entry.isNew)) {
+      enqueueJobInTransaction(runtime.db, { jobType: 'MONITOR_SEARCH', subjectType: 'QUEST', subjectId: quest.id,
+        operationKey: `monitor-search:${quest.id}:${timestamp}`, payload: { questId: quest.id, discoveredBy: 'MONITOR', monitorAccountId: monitor.account_id }, runAt: timestamp });
+    }
+    const changed = runtime.db.prepare(`UPDATE monitor_accounts SET last_checked_at=?,health_state='READY',last_health_error_code=NULL,last_health_quest_count=?,
+      state_version=state_version+1,updated_at=? WHERE account_id=? AND state_version=?`).run(
+      timestamp, Array.isArray(quests) ? quests.length : 0, timestamp, monitor.account_id, monitor.state_version,
+    );
+    if (!changed.changes) throw Object.assign(new Error('Monitor changed while discovery was running'), { code: 'MONITOR_STATE_CONFLICT' });
   });
   return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
 }
@@ -123,9 +191,12 @@ export async function processMonitorSearch(runtime, job) {
   const payload = json(job.payload_json);
   const quest = runtime.db.prepare('SELECT * FROM quests WHERE quest_id=?').get(payload.questId ?? job.subject_id);
   if (!quest) throw new QuestshopError('QUEST_NOT_FOUND', 'ไม่พบ Quest ที่จะตรวจ');
-  const monitors = runtime.db.prepare("SELECT * FROM monitor_accounts WHERE state='ACTIVE' ORDER BY account_id").all();
+  if (!questIsActiveForWork(quest)) return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token,
+    state: 'FAILED', errorCode: 'QUEST_EXPIRED' });
+  const monitors = runtime.db.prepare("SELECT * FROM monitor_accounts WHERE state='ACTIVE' AND health_state='READY' AND (cooldown_until IS NULL OR cooldown_until<=?) ORDER BY account_id").all(nowMs());
   const batchId = job.id;
   let foundReady = 0; let foundCompleted = 0; let unavailable = 0;
+  const readyMonitors = [];
   for (const monitor of monitors) {
     try {
       const credential = credentialFor(runtime.db, monitor.credential_id);
@@ -136,31 +207,52 @@ export async function processMonitorSearch(runtime, job) {
       const candidate = (await api.fetchQuests(runtime.abortController.signal, { includeExpired: true }))
         .find((item) => String(item.id) === String(quest.quest_id));
       const timestamp = nowMs();
+      let foundOnMonitor = false;
       withImmediateTransaction(runtime.db, () => {
+        assertWorkflowLease(runtime.db, job);
         if (!candidate) insertQuestCheck(runtime.db, { questId: quest.quest_id, monitorAccountId: monitor.account_id,
           batchId, type: 'SEARCH', state: 'NOT_FOUND', timestamp });
         else if (candidate.completed) { foundCompleted += 1; insertQuestCheck(runtime.db, { questId: quest.quest_id,
           monitorAccountId: monitor.account_id, batchId, type: 'SEARCH', state: 'COMPLETED', timestamp }); }
-        else { foundReady += 1; insertQuestCheck(runtime.db, { questId: quest.quest_id, monitorAccountId: monitor.account_id,
-          batchId, type: 'SEARCH', state: 'FOUND', timestamp });
-          enqueueJobInTransaction(runtime.db, { jobType: 'MONITOR_TEST', subjectType: 'QUEST_CHECK', subjectId: `${quest.quest_id}:${monitor.account_id}:${batchId}`,
-            operationKey: `monitor-test:${quest.quest_id}:${monitor.account_id}:${batchId}`, payload: {
-              questId: quest.quest_id, monitorAccountId: monitor.account_id, credentialId: monitor.credential_id, batchId,
-            }, runAt: timestamp }); }
+        else {
+          foundReady += 1;
+          foundOnMonitor = true;
+          insertQuestCheck(runtime.db, { questId: quest.quest_id, monitorAccountId: monitor.account_id,
+            batchId, type: 'SEARCH', state: 'FOUND', timestamp });
+        }
       });
+      if (foundOnMonitor) readyMonitors.push({ accountId: monitor.account_id, credentialId: monitor.credential_id });
     } catch (error) {
+      if (error?.code === 'JOB_LEASE_LOST') throw error;
       unavailable += 1;
-      withImmediateTransaction(runtime.db, () => insertQuestCheck(runtime.db, { questId: quest.quest_id,
-        monitorAccountId: monitor.account_id, batchId, type: 'SEARCH', state: 'UNAVAILABLE',
-        safeReason: error.code ?? 'MONITOR_CHECK_FAILED' }));
+      withImmediateTransaction(runtime.db, () => {
+        assertWorkflowLease(runtime.db, job);
+        insertQuestCheck(runtime.db, { questId: quest.quest_id, monitorAccountId: monitor.account_id, batchId, type: 'SEARCH', state: 'UNAVAILABLE',
+          safeReason: error.code ?? 'MONITOR_CHECK_FAILED' });
+      });
     }
   }
   const monitorStatus = foundReady ? 'FOUND_READY' : foundCompleted ? 'FOUND_COMPLETED'
     : unavailable ? 'INCOMPLETE' : 'NOT_FOUND';
   withImmediateTransaction(runtime.db, () => {
-    runtime.db.prepare(`UPDATE quests SET monitor_status=?,state_version=state_version+1,updated_at=?
-      WHERE quest_id=? AND state_version=?`).run(monitorStatus, nowMs(), quest.quest_id, quest.state_version);
-      enqueueNotificationInTransaction(runtime.db, { notificationType: 'CUSTOMER_QUEST_DISCOVERY', aggregateType: 'QUEST', aggregateId: quest.quest_id,
+    assertWorkflowLease(runtime.db, job);
+    const changed = runtime.db.prepare(`UPDATE quests SET monitor_status=CASE WHEN monitor_status='TEST_PASSED' THEN monitor_status ELSE ? END,
+      state_version=state_version+1,updated_at=? WHERE quest_id=? AND state_version=?`).run(monitorStatus, nowMs(), quest.quest_id, quest.state_version);
+    if (!changed.changes) throw Object.assign(new Error('Quest changed during Monitor Search'), { code: 'QUEST_CONFLICT' });
+    // Search is entirely read-only and completes across every eligible
+    // Monitor before a single deterministic mutation is admitted.  The
+    // partial unique index is the final concurrency guard for this rule.
+    const activeTest = runtime.db.prepare(`SELECT id FROM jobs WHERE job_type='MONITOR_TEST'
+      AND json_extract(payload_json,'$.questId')=? AND state IN ('PENDING','RUNNING','WAITING_RETRY','WAITING_RATE_LIMIT')`).get(quest.quest_id);
+    if (readyMonitors.length && !activeTest) {
+      const [first, ...fallbacks] = readyMonitors;
+      enqueueJobInTransaction(runtime.db, { jobType: 'MONITOR_TEST', subjectType: 'QUEST_CHECK', subjectId: `${quest.quest_id}:${first.accountId}:${batchId}`,
+        operationKey: `monitor-test:${quest.quest_id}:${first.accountId}:${batchId}`, payload: {
+          questId: quest.quest_id, monitorAccountId: first.accountId, credentialId: first.credentialId, batchId,
+          fallbackMonitors: fallbacks,
+        }, runAt: nowMs() });
+    }
+    enqueueNotificationInTransaction(runtime.db, { notificationType: 'CUSTOMER_QUEST_DISCOVERY', aggregateType: 'QUEST', aggregateId: quest.quest_id,
       destination: 'LOG_QUEST_OPERATIONS', payload: { questId: quest.quest_id, monitorStatus }, timestamp: nowMs() });
   });
   return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
@@ -225,7 +317,11 @@ export async function processQuestRun(runtime, job) {
   const item = runtime.db.prepare(`SELECT i.*,o.credential_id,o.trace_id,q.url FROM order_items i
     JOIN orders o ON o.id=i.order_id JOIN quests q ON q.quest_id=i.quest_id WHERE i.id=?`).get(job.subject_id);
   if (!item) return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'FAILED', errorCode: 'ORDER_ITEM_NOT_FOUND' });
-  markOrderItemRunning(runtime.db, { itemId: item.id, workerJob });
+  const running = markOrderItemRunning(runtime.db, { itemId: item.id, workerJob });
+  if (!running || !['QUEUED', 'RUNNING'].includes(running.state)) {
+    return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token,
+      state: ['FAILED_RELEASED', 'REFUNDED'].includes(item.state) ? 'FAILED' : 'COMPLETED', errorCode: 'ORDER_ITEM_ALREADY_TERMINAL' });
+  }
   try {
     const result = await runQuest(runtime, { credentialId: item.credential_id, questId: item.quest_id, job,
       onProgress: (fresh) => updateOrderItemProgress(runtime.db, { itemId: item.id, progressPercent: fresh.progress, workerJob }) });
@@ -272,9 +368,16 @@ export async function processQuestRun(runtime, job) {
 
 export async function processMonitorTest(runtime, job) {
   const payload = json(job.payload_json);
+  const initialQuest = runtime.db.prepare('SELECT * FROM quests WHERE quest_id=?').get(payload.questId);
+  if (!questIsActiveForWork(initialQuest)) return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token,
+    state: 'FAILED', errorCode: 'QUEST_EXPIRED' });
   try {
     const completed = await runQuest(runtime, { credentialId: payload.credentialId, questId: payload.questId, job });
+    if (completed.completedBeforeRun) {
+      return finishDefiniteMonitorTestFailure(runtime, job, payload, 'COMPLETED_BEFORE_MONITOR_TEST');
+    }
     withImmediateTransaction(runtime.db, () => {
+      assertWorkflowLease(runtime.db, job);
       // A Quest already completed before this test is evidence that this
       // account cannot verify *this run*.  It must never open the public
       // announcement gate as a successful monitor mutation.
@@ -284,9 +387,11 @@ export async function processMonitorTest(runtime, job) {
         safeReason: completed.completedBeforeRun ? 'COMPLETED_BEFORE_MONITOR_TEST' : null });
       const quest = runtime.db.prepare('SELECT * FROM quests WHERE quest_id=?').get(payload.questId);
       const announce = passed && currentFeatureGates(runtime.db).QUEST_ANNOUNCEMENT_ENABLED;
-      runtime.db.prepare(`UPDATE quests SET monitor_status=?,announcement_status=CASE WHEN ? AND announcement_status='NOT_ANNOUNCED' THEN 'QUEUED' ELSE announcement_status END,
+      const changed = runtime.db.prepare(`UPDATE quests SET monitor_status=CASE WHEN monitor_status='TEST_PASSED' THEN monitor_status ELSE ? END,
+        announcement_status=CASE WHEN ? AND announcement_status='NOT_ANNOUNCED' THEN 'QUEUED' ELSE announcement_status END,
         state_version=state_version+1,updated_at=? WHERE quest_id=? AND state_version=?`)
         .run(passed ? 'TEST_PASSED' : 'TEST_FAILED', announce ? 1 : 0, nowMs(), payload.questId, quest?.state_version);
+      if (!changed.changes) throw Object.assign(new Error('Quest changed during Monitor Test'), { code: 'QUEST_CONFLICT' });
       enqueueNotificationInTransaction(runtime.db, { notificationType: 'CUSTOMER_QUEST_DISCOVERY', aggregateType: 'QUEST', aggregateId: payload.questId,
         destination: 'LOG_QUEST_OPERATIONS', payload: { questId: payload.questId, result: passed ? 'PASSED' : 'FAILED' }, timestamp: nowMs() });
       if (announce) {
@@ -296,15 +401,113 @@ export async function processMonitorTest(runtime, job) {
     });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token });
   } catch (error) {
-    withImmediateTransaction(runtime.db, () => insertQuestCheck(runtime.db, { questId: payload.questId,
-      monitorAccountId: payload.monitorAccountId, batchId: payload.batchId, type: 'TEST', state: 'REVIEW', safeReason: error.code ?? 'TEST_RESULT_AMBIGUOUS' }));
+    if (error?.code === 'JOB_LEASE_LOST') throw error;
+    if (isDefiniteQuestFailure(error) && error?.questPossiblyMutated !== true) {
+      return finishDefiniteMonitorTestFailure(runtime, job, payload, error.code ?? 'MONITOR_TEST_DEFINITE_FAILURE');
+    }
+    withImmediateTransaction(runtime.db, () => {
+      assertWorkflowLease(runtime.db, job);
+      insertQuestCheck(runtime.db, { questId: payload.questId,
+        monitorAccountId: payload.monitorAccountId, batchId: payload.batchId, type: 'TEST', state: 'REVIEW', safeReason: error.code ?? 'TEST_RESULT_AMBIGUOUS' });
+    });
     return completeJob(runtime.db, { jobId: job.id, leaseToken: job.lease_token, state: 'REVIEW',
       errorCode: error.code ?? 'TEST_RESULT_AMBIGUOUS', checkpoint: 'POSSIBLY_SENT' });
   }
 }
 
+/** A fallback Monitor is admitted only after the previous account failed
+ * before any Quest mutation.  Finishing this Job and queuing its successor
+ * occur in the same lease-fenced transaction, so the unique active-test
+ * index can never observe two mutation candidates for one Quest. */
+function finishDefiniteMonitorTestFailure(runtime, job, payload, reasonCode) {
+  const timestamp = nowMs();
+  return withImmediateTransaction(runtime.db, () => {
+    assertWorkflowLease(runtime.db, job);
+    insertQuestCheck(runtime.db, { questId: payload.questId, monitorAccountId: payload.monitorAccountId,
+      batchId: payload.batchId, type: 'TEST', state: 'FAILED', safeReason: reasonCode, timestamp });
+    const quest = runtime.db.prepare('SELECT * FROM quests WHERE quest_id=?').get(payload.questId);
+    if (!quest) throw new QuestshopError('QUEST_NOT_FOUND', 'ไม่พบ Quest ที่จะบันทึกผลทดสอบ');
+    const updatedQuest = runtime.db.prepare(`UPDATE quests SET monitor_status=CASE WHEN monitor_status='TEST_PASSED' THEN monitor_status ELSE 'TEST_FAILED' END,
+      state_version=state_version+1,updated_at=? WHERE quest_id=? AND state_version=?`).run(timestamp, quest.quest_id, quest.state_version);
+    if (!updatedQuest.changes) throw new QuestshopError('QUEST_CONFLICT', 'Quest ถูกเปลี่ยนแล้ว กรุณาตรวจใหม่');
+    const completed = runtime.db.prepare(`UPDATE jobs SET state='FAILED',checkpoint='VERIFIED',last_error_code=?,lease_token=NULL,lease_expires_at=NULL,
+      completed_at=?,state_version=state_version+1,updated_at=? WHERE id=? AND state='RUNNING' AND lease_token=? AND lease_expires_at>?`).run(
+      reasonCode, timestamp, timestamp, job.id, job.lease_token, timestamp,
+    );
+    if (!completed.changes) throw Object.assign(new Error('Worker lease is no longer authoritative'), { code: 'JOB_LEASE_LOST' });
+    const fallback = Array.isArray(payload.fallbackMonitors) ? payload.fallbackMonitors.find((entry) =>
+      entry && typeof entry.accountId === 'string' && typeof entry.credentialId === 'string') : null;
+    if (fallback) {
+      const nextPayload = { ...payload, monitorAccountId: fallback.accountId, credentialId: fallback.credentialId,
+        fallbackMonitors: payload.fallbackMonitors.filter((entry) => entry?.accountId !== fallback.accountId) };
+      enqueueJobInTransaction(runtime.db, { jobType: 'MONITOR_TEST', subjectType: 'QUEST_CHECK',
+        subjectId: `${payload.questId}:${fallback.accountId}:${payload.batchId}`, operationKey: `monitor-test:${payload.questId}:${fallback.accountId}:${payload.batchId}`,
+        payload: nextPayload, runAt: timestamp });
+    }
+    enqueueNotificationInTransaction(runtime.db, { notificationType: 'CUSTOMER_QUEST_DISCOVERY', aggregateType: 'QUEST', aggregateId: payload.questId,
+      destination: 'LOG_QUEST_OPERATIONS', payload: { questId: payload.questId, result: 'FAILED', reasonCode, fallbackQueued: Boolean(fallback) }, timestamp });
+    return { state: 'FAILED', fallbackQueued: Boolean(fallback) };
+  });
+}
+
+/** Resolve the only non-financial review whose subject is a Monitor Test.
+ * Retrying creates a fresh durable test intent; failing records a terminal
+ * test outcome without attempting another Quest mutation. */
+export function resolveQuestCheckReview(db, { reviewId, actorId, decision, reason = '' }) {
+  const timestamp = nowMs();
+  return withImmediateTransaction(db, () => {
+    const review = db.prepare("SELECT * FROM manual_reviews WHERE id=? AND subject_type='QUEST_CHECK' AND category='OPERATIONAL'").get(reviewId);
+    if (!review) throw new QuestshopError('REVIEW_NOT_FOUND', 'ไม่พบรายการ Monitor Test ที่รอตรวจสอบ');
+    if (['RESOLVED_SUCCESS', 'RESOLVED_FAILURE'].includes(review.state)) return { state: review.state, idempotent: true };
+    if (review.state !== 'OPEN') throw new QuestshopError('REVIEW_NOT_OPEN', 'รายการนี้ไม่ได้รอตรวจสอบแล้ว');
+    const job = db.prepare("SELECT * FROM jobs WHERE job_type='MONITOR_TEST' AND subject_id=? ORDER BY created_at DESC LIMIT 1").get(review.subject_id);
+    let payload;
+    try { payload = JSON.parse(job?.payload_json ?? '{}'); } catch { payload = {}; }
+    if (!payload.questId || !payload.monitorAccountId || !payload.credentialId || !payload.batchId) {
+      throw new QuestshopError('QUEST_CHECK_RECOVERY_INVALID', 'ข้อมูล Monitor Test เดิมไม่ครบ จึงต้องตรวจสอบด้วยผู้ดูแล');
+    }
+    if (decision === 'RETRY') {
+      const quest = db.prepare('SELECT * FROM quests WHERE quest_id=?').get(payload.questId);
+      if (!questIsActiveForWork(quest, timestamp)) throw new QuestshopError('QUEST_EXPIRED', 'Quest หมดอายุแล้ว จึงไม่สามารถทดสอบซ้ำได้');
+      const active = db.prepare(`SELECT id FROM jobs WHERE job_type='MONITOR_TEST'
+        AND json_extract(payload_json,'$.questId')=? AND state IN ('PENDING','RUNNING','WAITING_RETRY','WAITING_RATE_LIMIT') AND id<>?`).get(payload.questId, job.id);
+      if (active) throw new QuestshopError('MONITOR_TEST_ALREADY_ACTIVE', 'Quest นี้มีงานทดสอบ Monitor ที่กำลังทำอยู่แล้ว');
+      // A recovered review normally already has a REVIEW Job.  Be defensive
+      // for older rows which opened a review before their queued job was
+      // finalized, so the unique active-test invariant remains true.
+      if (['PENDING', 'WAITING_RETRY', 'WAITING_RATE_LIMIT'].includes(job.state)) {
+        db.prepare(`UPDATE jobs SET state='REVIEW',state_version=state_version+1,last_error_code='OWNER_RETRY_SUPERSEDED',
+          completed_at=?,updated_at=? WHERE id=? AND state_version=?`).run(timestamp, timestamp, job.id, job.state_version);
+      }
+      enqueueJobInTransaction(db, { jobType: 'MONITOR_TEST', subjectType: 'QUEST_CHECK', subjectId: review.subject_id,
+        operationKey: `monitor-test-retry:${payload.questId}:${payload.monitorAccountId}:${timestamp}`, payload, runAt: timestamp });
+    } else if (decision === 'FAIL') {
+      insertQuestCheck(db, { questId: payload.questId, monitorAccountId: payload.monitorAccountId, batchId: payload.batchId,
+        type: 'TEST', state: 'FAILED', safeReason: reason || 'OWNER_CLOSED_MONITOR_TEST_REVIEW', timestamp });
+      const quest = db.prepare('SELECT * FROM quests WHERE quest_id=?').get(payload.questId);
+      const changed = db.prepare(`UPDATE quests SET monitor_status=CASE WHEN monitor_status='TEST_PASSED' THEN monitor_status ELSE 'TEST_FAILED' END,
+        state_version=state_version+1,updated_at=? WHERE quest_id=? AND state_version=?`).run(timestamp, payload.questId, quest?.state_version);
+      if (!changed.changes) throw new QuestshopError('QUEST_CONFLICT', 'Quest ถูกเปลี่ยนแล้ว กรุณาเปิดรายการใหม่');
+    } else {
+      throw new QuestshopError('REVIEW_DECISION_INVALID', 'Monitor Test เลือกได้เฉพาะ RETRY หรือ FAIL');
+    }
+    const nextState = decision === 'RETRY' ? 'RESOLVED_SUCCESS' : 'RESOLVED_FAILURE';
+    const resolved = db.prepare(`UPDATE manual_reviews SET state=?,decision=?,resolved_by=?,resolved_at=?,state_version=state_version+1,updated_at=?
+      WHERE id=? AND state='OPEN' AND state_version=?`).run(nextState, decision, actorId, timestamp, timestamp, review.id, review.state_version);
+    if (!resolved.changes) throw new QuestshopError('REVIEW_CONFLICT', 'รายการถูกเปลี่ยนพร้อมกัน กรุณาลองใหม่');
+    const auditId = randomUUID();
+    db.prepare(`INSERT INTO admin_audit(id,actor_id,action,target_type,target_id,reason,before_json,after_json,trace_id,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`).run(auditId, actorId, 'MANUAL_REVIEW_DECISION', 'QUEST_CHECK', review.subject_id, reason || null,
+      JSON.stringify({ state: 'OPEN' }), JSON.stringify({ decision, state: nextState }), job?.operation_key ?? review.id, timestamp);
+    enqueueNotificationInTransaction(db, { notificationType: 'ADMIN_LOG', aggregateType: 'ADMIN_AUDIT', aggregateId: auditId,
+      destination: 'LOG_ADMIN', payload: { auditId }, timestamp });
+    return { state: nextState, idempotent: false, decision };
+  });
+}
+
 export async function processQuestWorkflowJob(runtime, job) {
   if (job.job_type === 'CUSTOMER_QUEST_DISCOVERY') return processCustomerDiscovery(runtime, job);
+  if (job.job_type === 'MONITOR_DISCOVERY') return processMonitorDiscovery(runtime, job);
   if (job.job_type === 'MONITOR_SEARCH') return processMonitorSearch(runtime, job);
   if (job.job_type === 'MONITOR_TEST') return processMonitorTest(runtime, job);
   if (job.job_type === 'QUEST_RUN') return processQuestRun(runtime, job);

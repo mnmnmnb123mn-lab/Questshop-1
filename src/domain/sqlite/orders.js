@@ -10,9 +10,9 @@ function refreshOrderState(db, orderId, timestamp) {
   const items = db.prepare('SELECT state FROM order_items WHERE order_id=?').all(orderId);
   const states = items.map((item) => item.state);
   const state = states.every((value) => value === 'READY_TO_CLAIM') ? 'COMPLETED'
-    : states.every((value) => ['FAILED', 'REFUNDED'].includes(value)) ? 'CANCELLED'
-      : states.some((value) => value === 'REVIEW') ? 'REVIEW'
-        : states.some((value) => value === 'READY_TO_CLAIM') && states.some((value) => ['FAILED', 'REFUNDED'].includes(value)) ? 'PARTIAL'
+    : states.every((value) => ['FAILED_RELEASED', 'REFUNDED'].includes(value)) ? 'CANCELLED'
+      : states.some((value) => value === 'MANUAL_REVIEW') ? 'REVIEW'
+        : states.some((value) => value === 'READY_TO_CLAIM') && states.some((value) => ['FAILED_RELEASED', 'REFUNDED'].includes(value)) ? 'PARTIAL'
           : states.some((value) => value === 'RUNNING') ? 'RUNNING' : 'PENDING';
   if (order && order.state !== state) db.prepare('UPDATE orders SET state=?,state_version=state_version+1,updated_at=? WHERE id=? AND state_version=?')
     .run(state, timestamp, orderId, order.state_version);
@@ -86,25 +86,28 @@ function settleOrderItemInTransaction(db, { itemId, outcome, claimUrl = null, re
   const item = db.prepare(`SELECT i.*,o.discord_user_id,o.trace_id FROM order_items i JOIN orders o ON o.id=i.order_id
     WHERE i.id=?`).get(itemId);
     if (!item) throw new QuestshopError('ORDER_ITEM_NOT_FOUND', 'ไม่พบรายการ Quest');
-    if (!['QUEUED', 'RUNNING', 'REVIEW'].includes(item.state)) return item;
+    if (!['QUEUED', 'RUNNING', 'MANUAL_REVIEW'].includes(item.state)) return item;
     if (outcome === 'SUCCESS') {
       if (verified !== true) throw new QuestshopError('SETTLEMENT_VERIFICATION_REQUIRED', 'ยังยืนยันผล Quest ไม่ครบ จึงตัดเครดิตไม่ได้');
+      if (typeof claimUrl !== 'string' || !claimUrl.startsWith('https://')) {
+        throw new QuestshopError('CLAIM_URL_INVALID', 'ต้องมีลิงก์รับรางวัล HTTPS ที่ตรวจสอบได้ก่อนตัดเครดิต');
+      }
       appendWalletTransactionInTransaction(db, { discordUserId: item.discord_user_id, transactionType: 'CAPTURE',
         reservedDeltaCents: -Number(item.price_cents), referenceType: 'ORDER_ITEM', referenceId: item.id,
         idempotencyKey: `capture:${item.id}`, traceId: item.trace_id, timestamp });
+      recordSettlementEvidenceInTransaction(db, { item, outcome, reason, evidence: { verifiedCompleted: true, claimUrl, ...evidence }, timestamp });
       db.prepare(`UPDATE order_items SET state='READY_TO_CLAIM',progress_percent=100,claim_url=?,completed_at=?,state_version=state_version+1,updated_at=?
         WHERE id=? AND state_version=?`).run(claimUrl, timestamp, timestamp, item.id, item.state_version);
-      recordSettlementEvidenceInTransaction(db, { item, outcome, reason, evidence: { verifiedCompleted: true, claimUrl, ...evidence }, timestamp });
     } else if (outcome === 'FAILED') {
       appendWalletTransactionInTransaction(db, { discordUserId: item.discord_user_id, transactionType: 'RELEASE',
         availableDeltaCents: Number(item.price_cents), reservedDeltaCents: -Number(item.price_cents),
         referenceType: 'ORDER_ITEM', referenceId: item.id, idempotencyKey: `release:${item.id}`,
         traceId: item.trace_id, reason, timestamp });
-      db.prepare(`UPDATE order_items SET state='FAILED',state_version=state_version+1,updated_at=? WHERE id=? AND state_version=?`)
-        .run(timestamp, item.id, item.state_version);
       recordSettlementEvidenceInTransaction(db, { item, outcome, reason, evidence, timestamp });
+      db.prepare(`UPDATE order_items SET state='FAILED_RELEASED',state_version=state_version+1,updated_at=? WHERE id=? AND state_version=?`)
+        .run(timestamp, item.id, item.state_version);
     } else {
-      db.prepare(`UPDATE order_items SET state='REVIEW',state_version=state_version+1,updated_at=? WHERE id=? AND state_version=?`)
+      db.prepare(`UPDATE order_items SET state='MANUAL_REVIEW',state_version=state_version+1,updated_at=? WHERE id=? AND state_version=?`)
         .run(timestamp, item.id, item.state_version);
       db.prepare(`INSERT INTO manual_reviews(id,subject_type,subject_id,category,state,reason_code,safe_reason,created_at,updated_at)
         VALUES(?,?,?,'OPERATIONAL','OPEN',?,?,?,?) ON CONFLICT(subject_type,subject_id) WHERE state='OPEN'
@@ -155,6 +158,13 @@ export function resolveOrderItemReview(db, { reviewId, actorId, decision, reason
     const changed = db.prepare(`UPDATE manual_reviews SET state=?,decision=?,resolved_by=?,resolved_at=?,state_version=state_version+1,updated_at=?
       WHERE id=? AND state='OPEN' AND state_version=?`).run(resolvedState, decision, actorId, timestamp, timestamp, review.id, review.state_version);
     if (!changed.changes) throw new QuestshopError('REVIEW_CONFLICT', 'รายการถูกแก้ไขพร้อมกัน กรุณาลองใหม่');
+    const auditId = randomUUID();
+    const orderTrace = db.prepare('SELECT trace_id FROM orders WHERE id=?').get(item.order_id)?.trace_id;
+    db.prepare(`INSERT INTO admin_audit(id,actor_id,action,target_type,target_id,reason,before_json,after_json,trace_id,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`).run(auditId, actorId, 'MANUAL_REVIEW_DECISION', 'ORDER_ITEM', review.subject_id, reason || null,
+      JSON.stringify({ state: 'OPEN' }), JSON.stringify({ decision, state: resolvedState }), orderTrace, timestamp);
+    enqueueNotificationInTransaction(db, { notificationType: 'ADMIN_LOG', aggregateType: 'ADMIN_AUDIT', aggregateId: auditId,
+      destination: 'LOG_ADMIN', payload: { auditId }, timestamp });
     return { state: resolvedState, idempotent: false, decision, item };
   });
 }
@@ -181,9 +191,19 @@ export function updateOrderItemProgress(db, { itemId, progressPercent, workerJob
     const item = db.prepare('SELECT * FROM order_items WHERE id=?').get(itemId);
     if (!item || !['QUEUED', 'RUNNING'].includes(item.state)) return item ?? null;
     const progress = Math.max(0, Math.min(100, Math.round(Number(progressPercent) || 0)));
+    const previousBucket = Math.floor(Number(item.progress_percent) / 25);
+    const nextBucket = Math.floor(progress / 25);
+    if (previousBucket === nextBucket) return item;
     const changed = db.prepare(`UPDATE order_items SET progress_percent=?,state_version=state_version+1,updated_at=?
       WHERE id=? AND state_version=?`).run(progress, timestamp, itemId, item.state_version);
-    return changed.changes ? db.prepare('SELECT * FROM order_items WHERE id=?').get(itemId) : null;
+    if (!changed.changes) return null;
+    const updated = db.prepare('SELECT * FROM order_items WHERE id=?').get(itemId);
+    const order = db.prepare('SELECT * FROM orders WHERE id=?').get(item.order_id);
+    enqueueNotificationInTransaction(db, { notificationType: 'QUEST_HISTORY', aggregateType: 'ORDER', aggregateId: order.id,
+      destination: 'QUEST_HISTORY', payload: { orderId: order.id }, timestamp });
+    enqueueNotificationInTransaction(db, { notificationType: 'ORDER_STATUS_DM', aggregateType: 'ORDER', aggregateId: order.id,
+      destination: `DM:${order.discord_user_id}`, payload: { orderId: order.id }, timestamp });
+    return updated;
   });
 }
 
