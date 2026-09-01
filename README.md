@@ -6,6 +6,8 @@ Questshop คือบอท Discord สำหรับรับทำ Discord Q
 ส่ง Discord Token แบบ Ephemeral, เลือก Quest, ยืนยัน Order และติดตามผลจนถึง `READY_TO_CLAIM`.
 ระบบ **ไม่มี Automatic Claim**; ลูกค้ากดรับรางวัลเองเสมอ.
 
+<!-- Last verified: 2026-09-01 -->
+
 ## Runtime และการติดตั้ง
 
 ```text
